@@ -181,6 +181,52 @@ PYTHONJITHUGEPAGES=0 UV_CACHE_DIR="$PWD/.uv-cache" PYTHONPATH=cinderx/PythonLib 
 
 但这条 deopt 并没有阻止本地近似结果达到目标线以下，因此当前优先级低于正式环境复核。
 
+### 6.7 规则影响范围
+
+这轮第一阶段的实现并不是 `regex_compile` 专属特判，而是一条收窄过的通用 auto-JIT 准入规则。
+
+它的实际生效条件是：
+
+1. 当前仍处于默认 `jit.auto()` 阈值口径
+   - 即默认 auto 阈值仍为 `1000`
+2. 目标函数字节码中存在 backedge
+   - 通常对应明显的 `for` / `while` 循环
+3. 目标函数不在 stdlib 中
+
+因此，这条规则不会只影响 `regex_compile`，而会影响一类更一般的函数形状：
+
+- 非 stdlib
+- 调用次数少
+- 但单次调用内部有明显循环
+
+典型潜在影响场景包括：
+
+- benchmark 主入口函数
+- 一次性批处理脚本中的主循环
+- 命令行工具里“调用不多但单次很重”的 Python 函数
+- 第三方纯 Python 库中的 loop-heavy helper
+
+它不会影响的场景包括：
+
+- stdlib 函数
+- 没有循环的函数
+- 显式调用 `compile_after_n_calls(...)` 的路径
+- `force_compile()` 等手工控制路径
+
+因此，这条规则的收益与风险也都具有一定通用性：
+
+- 正面：
+  - 能让“少调用但单次很重”的函数更早进入 JIT
+- 风险：
+  - 可能提前编译本来不一定值得编译的 loop-heavy 函数
+  - 会把 `site-packages` 中的纯 Python 第三方库也视为“非 stdlib”处理
+  - 可能暴露原先被“晚编译”掩盖的编译器问题
+
+这也是为什么第一轮最终要额外收窄到“非 stdlib”范围，并用独立测试验证：
+
+- 显式 `compile_after_n_calls(...)` 语义不被破坏
+- stdlib 调用链不会再次触发此前的崩溃路径
+
 ## 7. 当前结论
 
 第一轮已经确认：
