@@ -175,3 +175,7 @@ def __getitem__(self, index):
 `regex_compile` 还有继续优化的空间，但下一步已不再是“小而稳的 peephole 调整”。
 
 如果继续做，应视为一轮新的中等规模优化，而不是第一轮收益线的简单延伸。
+
+第三轮关于“是否继续投入”和“真正技术切入点”的收束，已经单独整理在：
+
+- `docs/superpowers/regex_compile/reports/2026-03-23-regex-compile-third-pass-report.md`
