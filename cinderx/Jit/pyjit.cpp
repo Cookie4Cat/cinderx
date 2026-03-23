@@ -70,6 +70,8 @@ using namespace jit;
 namespace {
 
 constexpr std::size_t kUnhandledSubscriptSuppressThreshold = 3;
+constexpr uint32_t kAutoJitDefaultThreshold = 1000;
+constexpr uint32_t kBackedgeAutoJitThreshold = 2;
 
 // RAII device for disabling GIL checking.
 class DisableGilCheck {
@@ -157,6 +159,42 @@ uint64_t countCalls(PyCodeObject* code) {
   auto extra = codeExtra(code);
   return extra != nullptr ? Ci_code_extra_get_calls(extra) : 0;
 #endif
+}
+
+bool codeHasBackedge(BorrowedRef<PyCodeObject> code) {
+  for (const auto& bc_instr : BytecodeInstructionBlock{code}) {
+    switch (bc_instr.opcode()) {
+      case JUMP_BACKWARD:
+      case JUMP_BACKWARD_NO_INTERRUPT:
+        return true;
+      default:
+        break;
+    }
+  }
+  return false;
+}
+
+bool codeIsInStdlib(BorrowedRef<PyCodeObject> code) {
+  if (code == nullptr || code->co_filename == nullptr ||
+      !PyUnicode_Check(code->co_filename)) {
+    return false;
+  }
+
+  const char* filename = PyUnicode_AsUTF8(code->co_filename);
+  if (filename == nullptr) {
+    PyErr_Clear();
+    return false;
+  }
+
+  std::string_view path = filename;
+  bool looks_like_stdlib = path.find("/lib/python") != std::string_view::npos ||
+      path.find("\\Lib\\") != std::string_view::npos;
+  if (!looks_like_stdlib) {
+    return false;
+  }
+
+  return path.find("site-packages") == std::string_view::npos &&
+      path.find("dist-packages") == std::string_view::npos;
 }
 
 // If functions in the cinderx module get compiled, they will somehow keep the
@@ -257,8 +295,14 @@ PyObject* jitVectorcall(
   // If there's a call count limit, interpret the function as usual until the
   // limit is reached.
   if (auto limit = getConfig().compile_after_n_calls; limit.has_value()) {
+    uint32_t effective_limit = *limit;
+    if (
+        *limit == kAutoJitDefaultThreshold && codeHasBackedge(code) &&
+        !codeIsInStdlib(code)) {
+      effective_limit = kBackedgeAutoJitThreshold;
+    }
     auto const calls = countCalls(code);
-    if (calls < *limit) {
+    if (calls < effective_limit) {
       incrementShadowcodeCall(code);
       auto entry = getInterpretedVectorcall(func);
       return entry(func_obj, stack, nargsf, kwnames);
