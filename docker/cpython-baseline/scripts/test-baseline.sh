@@ -43,11 +43,11 @@ print(f"JIT available: {hasattr(sys, '_jit') and sys._jit.is_available()}")
 print(f"JIT enabled: {hasattr(sys, '_jit') and sys._jit.is_enabled()}")
 
 sys.path.insert(0, "$SCRIPT_DIR")
-from benchmark_harness import load_benchmark, resolve_benchmark
+from benchmark_harness import benchmark_config_root, load_benchmark, load_benchmark_config, resolve_bench_args
 
-spec = resolve_benchmark("$BENCHMARK")
 module, bench = load_benchmark("/root/benchmarks", "$BENCHMARK")
-bench_args = spec.bench_args
+config = load_benchmark_config(benchmark_config_root(), "$BENCHMARK")
+bench_args = resolve_bench_args(module, config)
 
 # Warmup
 print(f"Warming up ({warmup} runs)...")

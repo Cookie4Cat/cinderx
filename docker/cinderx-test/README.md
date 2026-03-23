@@ -49,10 +49,11 @@ docker compose -p cinderx-exp exec cinderx-arm64 sh -lc \
 
 - `generators`
 - `mdp`
+- `regex_compile`
 
-benchmark 的元数据在：
+benchmark 的元数据不再写死在脚本里，而是来自：
 
-- `docker/cinderx-test/scripts/benchmark_harness.py`
+- `docker/cinderx-test/configs/<benchmark>/benchmark.toml`
 
 ## 配置文件驱动的优化开关
 
@@ -60,12 +61,13 @@ benchmark 的元数据在：
 
 - `docker/cinderx-test/configs/generators/`
 - `docker/cinderx-test/configs/mdp/`
+- `docker/cinderx-test/configs/regex_compile/`
 
 例如：
 
 - `docker/cinderx-test/configs/generators/stable.env`
 - `docker/cinderx-test/configs/mdp/stable.env`
-- `docker/cinderx-test/configs/mdp/experimental-round4.env`
+- `docker/cinderx-test/configs/regex_compile/stable.env`
 
 运行 `mdp stable`：
 
@@ -74,12 +76,33 @@ docker compose -p cinderx-exp exec cinderx-arm64 sh -lc \
   'BENCHMARK=mdp OPT_ENV_FILE=/scripts/configs/mdp/stable.env SAMPLES=5 WARMUP=1 /scripts/test-benchmark.sh'
 ```
 
-运行 `mdp experimental-round4`：
+## 新增 benchmark 的方式
 
-```bash
-docker compose -p cinderx-exp exec cinderx-arm64 sh -lc \
-  'BENCHMARK=mdp OPT_ENV_FILE=/scripts/configs/mdp/experimental-round4.env OPT_CONFIG_NAME=experimental-round4 SAMPLES=5 WARMUP=1 /scripts/test-benchmark.sh'
-```
+新增 benchmark 时，目标是只新增配置，不改脚本。
+
+最小改动集是：
+
+1. 新增：
+   - `docker/cinderx-test/configs/<benchmark>/benchmark.toml`
+   - `docker/cinderx-test/configs/<benchmark>/stable.env`
+2. 不修改：
+   - `setup.sh`
+   - `bench-benchmark.sh`
+   - `test-benchmark.sh`
+   - `benchmark_harness.py` 中的 benchmark 名单
+
+`benchmark.toml` 负责描述：
+
+- benchmark 模块目录
+- 入口文件
+- 入口函数
+- 下载清单
+- 参数构造模式
+
+例如现有 benchmark 已覆盖：
+
+- `fixed_tuple`
+- `regex_compile_capture`
 
 ## 并行项目隔离
 
@@ -141,5 +164,4 @@ docker compose -p cinderx-exp exec cinderx-arm64 bash
 ## 注意事项
 
 1. Docker ARM64 仿真依赖 QEMU，性能数据只适合做方向验证，不适合作为正式基线。
-2. `generators` 的路径仍要求包含 `bm_generators/run_benchmark.py`，当前 `setup.sh` 已按真实 benchmark 目录结构准备。
-3. 这套容器的基础镜像应该保持稳定复用；benchmark 脚本、配置、wheel 与结果都通过挂载提供，不应因为实验切换而重建镜像。
+2. 这套容器的基础镜像应该保持稳定复用；benchmark 脚本、配置、wheel 与结果都通过挂载提供，不应因为实验切换而重建镜像。

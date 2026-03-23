@@ -19,15 +19,15 @@ import sys
 import time
 
 sys.path.insert(0, os.environ["SCRIPT_DIR"])
-from benchmark_harness import benchmark_root, load_benchmark, resolve_benchmark
+from benchmark_harness import benchmark_config_root, benchmark_root, load_benchmark, load_benchmark_config, resolve_bench_args
 
 benchmark = os.environ["BENCHMARK"]
 samples = int(os.environ["SAMPLES"])
 warmup = int(os.environ["WARMUP"])
 
-spec = resolve_benchmark(benchmark)
-_, bench = load_benchmark(benchmark_root(), benchmark)
-bench_args = spec.bench_args
+config = load_benchmark_config(benchmark_config_root(), benchmark)
+module, bench = load_benchmark(benchmark_root(), benchmark)
+bench_args = resolve_bench_args(module, config)
 
 print(f"Warming up ({warmup} runs)...")
 for _ in range(warmup):

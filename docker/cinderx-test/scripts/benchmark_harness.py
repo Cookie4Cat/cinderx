@@ -5,60 +5,81 @@ from __future__ import annotations
 import importlib.util
 import os
 import sys
+import tomllib
 from pathlib import Path
-from typing import NamedTuple
+def benchmark_config_root() -> Path:
+    return Path(__file__).resolve().parent.parent / "configs"
 
 
-class BenchmarkSpec(NamedTuple):
-    name: str
-    module_dir: str
-    bench_func: str
-    bench_args: tuple[int, ...]
-    benchmark_url: str
+def load_benchmark_config(config_root: Path | str, benchmark_name: str) -> dict:
+    config_path = Path(config_root) / benchmark_name / "benchmark.toml"
+    with config_path.open("rb") as fp:
+        return tomllib.load(fp)
 
 
-BENCHMARK_SPECS: dict[str, BenchmarkSpec] = {
-    "generators": BenchmarkSpec(
-        name="generators",
-        module_dir="bm_generators",
-        bench_func="bench_generators",
-        bench_args=(1,),
-        benchmark_url="https://raw.githubusercontent.com/python/pyperformance/main/pyperformance/data-files/benchmarks/bm_generators/run_benchmark.py",
-    ),
-    "mdp": BenchmarkSpec(
-        name="mdp",
-        module_dir="bm_mdp",
-        bench_func="bench_mdp",
-        bench_args=(1,),
-        benchmark_url="https://raw.githubusercontent.com/python/pyperformance/main/pyperformance/data-files/benchmarks/bm_mdp/run_benchmark.py",
-    ),
-}
+def benchmark_downloads(
+    benchmark_name: str,
+    config_root: Path | str = benchmark_config_root(),
+) -> tuple[tuple[str, str], ...]:
+    config = load_benchmark_config(config_root, benchmark_name)
+    return tuple(
+        (entry["target"], entry["url"])
+        for entry in config.get("downloads", [])
+    )
 
 
-def resolve_benchmark(name: str) -> BenchmarkSpec:
-    try:
-        return BENCHMARK_SPECS[name]
-    except KeyError as exc:
-        raise KeyError(f"unsupported benchmark: {name}") from exc
+def resolve_bench_args(module, config: dict) -> tuple[object, ...]:
+    args_config = config.get("args", {})
+    mode = args_config.get("mode")
+
+    if mode == "fixed_tuple":
+        return tuple(args_config.get("values", []))
+
+    if mode == "regex_compile_capture":
+        capture_func_name = args_config["capture_func"]
+        capture_func = getattr(module, capture_func_name)
+        regexes = capture_func()
+        return (args_config["fixed_int"], regexes)
+
+    raise ValueError(f"unsupported args.mode: {mode!r}")
+
+
+def resolve_benchmark_metadata(
+    name: str,
+    config_root: Path | str = benchmark_config_root(),
+) -> dict:
+    return load_benchmark_config(config_root, name)
 
 
 def benchmark_root() -> Path:
     return Path(os.environ.get("BENCHMARK_ROOT", "/root/benchmarks"))
 
 
-def benchmark_module_path(root: Path | str, name: str) -> Path:
-    spec = resolve_benchmark(name)
-    return Path(root) / spec.module_dir / "run_benchmark.py"
+def benchmark_module_path(
+    root: Path | str,
+    name: str,
+    config_root: Path | str = benchmark_config_root(),
+) -> Path:
+    config = resolve_benchmark_metadata(name, config_root)
+    return Path(root) / config["module_dir"] / config["entry_file"]
 
 
-def benchmark_module_dir(root: Path | str, name: str) -> Path:
-    return benchmark_module_path(root, name).parent
+def benchmark_module_dir(
+    root: Path | str,
+    name: str,
+    config_root: Path | str = benchmark_config_root(),
+) -> Path:
+    return benchmark_module_path(root, name, config_root=config_root).parent
 
 
-def load_benchmark(root: Path | str, name: str):
-    spec = resolve_benchmark(name)
-    module_path = benchmark_module_path(root, name)
-    import_spec = importlib.util.spec_from_file_location(spec.module_dir, module_path)
+def load_benchmark(
+    root: Path | str,
+    name: str,
+    config_root: Path | str = benchmark_config_root(),
+):
+    config = resolve_benchmark_metadata(name, config_root)
+    module_path = benchmark_module_path(root, name, config_root=config_root)
+    import_spec = importlib.util.spec_from_file_location(config["module_dir"], module_path)
     if import_spec is None or import_spec.loader is None:
         raise RuntimeError(f"failed to load benchmark module from {module_path}")
     module = importlib.util.module_from_spec(import_spec)
@@ -70,7 +91,7 @@ def load_benchmark(root: Path | str, name: str):
             sys.path.remove(str(module_path.parent))
         except ValueError:
             pass
-    bench = getattr(module, spec.bench_func)
+    bench = getattr(module, config["bench_func"])
     return module, bench
 
 
@@ -89,7 +110,7 @@ def cinderx_wheel_glob() -> Path:
 
 
 def default_opt_env_file(name: str) -> Path:
-    resolve_benchmark(name)
+    resolve_benchmark_metadata(name)
     return Path("/scripts/configs") / name / "stable.env"
 
 

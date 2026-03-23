@@ -1,0 +1,23 @@
+name = "regex_compile"
+module_dir = "bm_regex_compile"
+entry_file = "run_benchmark.py"
+bench_func = "bench_regex_compile"
+
+support_files = ["bm_regex_effbot.py", "bm_regex_v8.py"]
+
+[[downloads]]
+target = "run_benchmark.py"
+url = "https://raw.githubusercontent.com/python/pyperformance/main/pyperformance/data-files/benchmarks/bm_regex_compile/run_benchmark.py"
+
+[[downloads]]
+target = "bm_regex_effbot.py"
+url = "https://raw.githubusercontent.com/python/pyperformance/main/pyperformance/data-files/benchmarks/bm_regex_compile/bm_regex_effbot.py"
+
+[[downloads]]
+target = "bm_regex_v8.py"
+url = "https://raw.githubusercontent.com/python/pyperformance/main/pyperformance/data-files/benchmarks/bm_regex_compile/bm_regex_v8.py"
+
+[args]
+mode = "regex_compile_capture"
+fixed_int = 1
+capture_func = "capture_regexes"

@@ -1,0 +1,14 @@
+name = "mdp"
+module_dir = "bm_mdp"
+entry_file = "run_benchmark.py"
+bench_func = "bench_mdp"
+
+support_files = []
+
+[[downloads]]
+target = "run_benchmark.py"
+url = "https://raw.githubusercontent.com/python/pyperformance/main/pyperformance/data-files/benchmarks/bm_mdp/run_benchmark.py"
+
+[args]
+mode = "fixed_tuple"
+values = [1]

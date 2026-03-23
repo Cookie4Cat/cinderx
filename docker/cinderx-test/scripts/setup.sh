@@ -19,16 +19,17 @@ import sys
 import os
 
 sys.path.insert(0, os.environ["SCRIPT_DIR"])
-from benchmark_harness import benchmark_module_path, benchmark_root, pyperf_shim_code, resolve_benchmark
+from benchmark_harness import benchmark_downloads, benchmark_module_path, benchmark_root, pyperf_shim_code
 
 benchmark = os.environ["BENCHMARK"]
-spec = resolve_benchmark(benchmark)
 output_path = benchmark_module_path(benchmark_root(), benchmark)
 output_path.parent.mkdir(parents=True, exist_ok=True)
 
-print(f"Downloading {spec.benchmark_url}...")
-urllib.request.urlretrieve(spec.benchmark_url, output_path)
-print(f"✓ Saved to {output_path}")
+for filename, url in benchmark_downloads(benchmark):
+    target = output_path.parent / filename
+    print(f"Downloading {url}...")
+    urllib.request.urlretrieve(url, target)
+    print(f"✓ Saved to {target}")
 
 pyperf_path = pathlib.Path("/root/benchmarks/pyperf.py")
 pyperf_path.write_text(pyperf_shim_code(), encoding="utf-8")

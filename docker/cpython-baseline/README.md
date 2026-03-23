@@ -66,18 +66,25 @@ RESULTS_DIR=./results-mdp-round3 docker compose -p mdp-round3 up -d
 这样可以避免不同正式对照任务共享同一个 compose project、容器实例与结果文件。
 不同 project 会复用同一个基础镜像 `cinderx-cpython-baseline:arm64`，不会因为 `-p` 不同而重新构建镜像。
 
-### 配置文件驱动的优化开关
+### 配置文件驱动的 benchmark 与优化开关
 
-稳定配置统一放在：
+benchmark 元数据与稳定配置统一放在：
 
 - `docker/cpython-baseline/configs/generators/`
 - `docker/cpython-baseline/configs/mdp/`
+- `docker/cpython-baseline/configs/regex_compile/`
+
+其中：
+
+- `benchmark.toml` 负责 benchmark 元数据
+- `stable.env` 负责优化开关
 
 例如：
 
 - `docker/cpython-baseline/configs/mdp/stable.env`
+- `docker/cpython-baseline/configs/regex_compile/stable.env`
 
-运行时通过 `OPT_ENV_FILE` 选择当前正式对照所用的稳定配置：
+运行时通过 `BENCHMARK` 选择 benchmark，通过 `OPT_ENV_FILE` 选择当前正式对照所用的稳定配置：
 
 ```bash
 docker compose -p mdp-round3 exec cpython-baseline sh -lc \
@@ -85,6 +92,34 @@ docker compose -p mdp-round3 exec cpython-baseline sh -lc \
 ```
 
 结果会按 `results/<benchmark>/<config-name>/comparison.json` 分层落盘，减少不同实验之间的覆盖与冲突。
+
+### 新增 benchmark 的方式
+
+新增 benchmark 时，目标是只新增配置，不改脚本。
+
+最小改动集是：
+
+1. 新增：
+   - `docker/cpython-baseline/configs/<benchmark>/benchmark.toml`
+   - `docker/cpython-baseline/configs/<benchmark>/stable.env`
+2. 不修改：
+   - `test-baseline.sh`
+   - `test-cinderx.sh`
+   - `test-comparison.sh`
+   - `benchmark_harness.py` 中的 benchmark 名单
+
+`benchmark.toml` 负责描述：
+
+- benchmark 模块目录
+- 入口文件
+- 入口函数
+- 下载清单
+- 参数构造模式
+
+当前已覆盖的参数模式包括：
+
+- `fixed_tuple`
+- `regex_compile_capture`
 
 ### 额外环境约定
 

@@ -30,19 +30,19 @@ import pathlib
 import sys
 
 sys.path.insert(0, "$SCRIPT_DIR")
-from benchmark_harness import benchmark_module_path, resolve_benchmark
+from benchmark_harness import benchmark_downloads, benchmark_module_path
 
-spec = resolve_benchmark("$BENCHMARK")
 output_path = benchmark_module_path(pathlib.Path("/root/benchmarks"), "$BENCHMARK")
 output_path.parent.mkdir(parents=True, exist_ok=True)
 
-if not output_path.exists():
-    url = spec.benchmark_url
-    print(f"Downloading {url}...")
-    urllib.request.urlretrieve(url, output_path)
-    print(f"✓ Saved to {output_path}")
-else:
-    print(f"✓ Benchmark already exists at {output_path}")
+for filename, url in benchmark_downloads("$BENCHMARK"):
+    target = output_path.parent / filename
+    if not target.exists():
+        print(f"Downloading {url}...")
+        urllib.request.urlretrieve(url, target)
+        print(f"✓ Saved to {target}")
+    else:
+        print(f"✓ Benchmark already exists at {target}")
 
 shim_path = output_path.parent / "pyperf.py"
 if not shim_path.exists():
