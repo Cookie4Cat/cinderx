@@ -82,6 +82,77 @@ uint64_t getAarch64HotCallTarget(const Instruction& instr) {
   return 0;
 }
 
+void patchAarch64ReachableDirectCalls(
+    Environ& env,
+    void* code_start,
+    const asmjit::CodeHolder& code) {
+#if defined(CINDER_AARCH64)
+  if (code_start == nullptr) {
+    return;
+  }
+
+  size_t patched_calls = 0;
+  size_t total_calls = 0;
+  auto* code_ptr = static_cast<uint8_t*>(code_start);
+
+  for (const auto& entry : env.call_target_literals) {
+    uint64_t target_addr = entry.first;
+    const auto& target = entry.second;
+    for (asmjit::Label callsite_label : target.indirect_callsites) {
+      total_calls++;
+      uint64_t callsite_addr =
+          code.baseAddress() + code.labelOffsetFromBase(callsite_label);
+      int64_t disp =
+          static_cast<int64_t>(target_addr) - static_cast<int64_t>(callsite_addr);
+
+      if ((disp & 0x3) != 0 || !fitsSignedInt<28>(disp)) {
+        continue;
+      }
+
+      size_t callsite_off = code.labelOffsetFromBase(callsite_label);
+      uint32_t* callsite = reinterpret_cast<uint32_t*>(code_ptr + callsite_off);
+
+      // We only rewrite the exact sequence emitted by emitIndirectCallThroughLiteral():
+      //   ldr x16, [literal]
+      //   blr x16
+      constexpr uint32_t kLdrLitX16Mask = 0xFF00001Fu;
+      constexpr uint32_t kLdrLitX16Base = 0x58000010u;
+      constexpr uint32_t kBlrX16 = 0xD63F0200u;
+      constexpr uint32_t kNop = 0xD503201Fu;
+      if ((callsite[0] & kLdrLitX16Mask) != kLdrLitX16Base ||
+          callsite[1] != kBlrX16) {
+        continue;
+      }
+
+      int64_t imm26 = disp >> 2;
+      callsite[0] =
+          0x94000000u | (static_cast<uint32_t>(imm26) & 0x03FFFFFFu);
+      callsite[1] = kNop;
+      patched_calls++;
+    }
+  }
+
+#if !defined(WIN32)
+  if (patched_calls != 0) {
+    size_t code_size = code.codeSize();
+    __builtin___clear_cache(
+        reinterpret_cast<char*>(code_start),
+        reinterpret_cast<char*>(code_start) + code_size);
+  }
+#endif
+
+  JIT_LOGIF(
+      getConfig().log.dump_asm && total_calls != 0,
+      "AArch64 callsite rewrite: patched {}/{} indirect calls to direct bl",
+      patched_calls,
+      total_calls);
+#else
+  (void)env;
+  (void)code_start;
+  (void)code;
+#endif
+}
+
 #define ASM_CHECK_THROW(exp)                         \
   {                                                  \
     auto err = (exp);                                \
@@ -2958,6 +3029,7 @@ void NativeGenerator::generateCode(CodeHolder& codeholder) {
   emitAarch64CallTargetLiteralPool();
 
   code_start_ = finalizeCode(*as_, GetFunction()->fullname);
+  patchAarch64ReachableDirectCalls(env_, code_start_, codeholder);
 
   // ------------- code_start_
   // ^
