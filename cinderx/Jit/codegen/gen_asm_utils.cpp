@@ -36,7 +36,10 @@ Environ::Aarch64CallTarget& getOrCreateCallTarget(Environ& env, uint64_t func) {
 
 void emitIndirectCallThroughLiteral(
     Environ& env,
-    const Environ::Aarch64CallTarget& target) {
+    Environ::Aarch64CallTarget& target) {
+  asmjit::Label callsite = env.as->newLabel();
+  env.as->bind(callsite);
+  target.indirect_callsites.push_back(callsite);
   env.as->ldr(arch::reg_scratch_br, asmjit::a64::ptr(target.literal));
   env.as->blr(arch::reg_scratch_br);
 }

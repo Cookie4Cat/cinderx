@@ -11,6 +11,7 @@
 #include <asmjit/asmjit.h>
 
 #include <cstdint>
+#include <vector>
 
 namespace jit::codegen {
 
@@ -79,6 +80,7 @@ struct Environ {
   struct Aarch64CallTarget {
     asmjit::Label literal{0};
     asmjit::Label stub{};
+    std::vector<asmjit::Label> indirect_callsites;
     bool has_shared_stub{false};
     uint32_t hot_call_count{0};
     bool use_shared_stub{false};
