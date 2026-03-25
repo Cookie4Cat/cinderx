@@ -1,4 +1,5 @@
 name = "generators"
+pyperformance_benchmark = "generators"
 module_dir = "bm_generators"
 entry_file = "run_benchmark.py"
 bench_func = "bench_generators"
@@ -12,3 +13,11 @@ url = "https://raw.githubusercontent.com/python/pyperformance/main/pyperformance
 [args]
 mode = "fixed_tuple"
 values = [1]
+
+[prepare]
+mode = "pyperformance_files"
+
+[run]
+default_excludes = []
+
+[run.extra_env]

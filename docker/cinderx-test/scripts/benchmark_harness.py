@@ -7,6 +7,8 @@ import os
 import sys
 import tomllib
 from pathlib import Path
+
+
 def benchmark_config_root() -> Path:
     return Path(__file__).resolve().parent.parent / "configs"
 
@@ -26,6 +28,38 @@ def benchmark_downloads(
         (entry["target"], entry["url"])
         for entry in config.get("downloads", [])
     )
+
+
+def pyperformance_benchmark_name(
+    benchmark_name: str,
+    config_root: Path | str = benchmark_config_root(),
+) -> str:
+    config = load_benchmark_config(config_root, benchmark_name)
+    return config["pyperformance_benchmark"]
+
+
+def benchmark_prepare_mode(
+    benchmark_name: str,
+    config_root: Path | str = benchmark_config_root(),
+) -> str:
+    config = load_benchmark_config(config_root, benchmark_name)
+    return config["prepare"]["mode"]
+
+
+def default_run_excludes(
+    benchmark_name: str,
+    config_root: Path | str = benchmark_config_root(),
+) -> tuple[str, ...]:
+    config = load_benchmark_config(config_root, benchmark_name)
+    return tuple(config.get("run", {}).get("default_excludes", []))
+
+
+def benchmark_extra_env(
+    benchmark_name: str,
+    config_root: Path | str = benchmark_config_root(),
+) -> dict[str, str]:
+    config = load_benchmark_config(config_root, benchmark_name)
+    return dict(config.get("run", {}).get("extra_env", {}))
 
 
 def resolve_bench_args(module, config: dict) -> tuple[object, ...]:
@@ -53,6 +87,36 @@ def resolve_benchmark_metadata(
 
 def benchmark_root() -> Path:
     return Path(os.environ.get("BENCHMARK_ROOT", "/root/benchmarks"))
+
+
+def pyperformance_source_root() -> Path:
+    return Path(os.environ.get("PYPERFORMANCE_ROOT", "/pyperformance"))
+
+
+def pyperformance_hook_root() -> Path:
+    return Path(os.environ.get("PYPERFORMANCE_HOOK_ROOT", "/pyperf_env_hook"))
+
+
+def pyperformance_benchmark_filter(
+    selection: str,
+    config_root: Path | str = benchmark_config_root(),
+) -> str:
+    tokens = [token.strip() for token in selection.split(",") if token.strip()]
+    mapped: list[str] = []
+
+    for token in tokens:
+        negative = token.startswith("-")
+        name = token[1:] if negative else token
+        if name in {"all", "<default>"}:
+            mapped_name = name
+        else:
+            try:
+                mapped_name = pyperformance_benchmark_name(name, config_root=config_root)
+            except FileNotFoundError:
+                mapped_name = name
+        mapped.append(f"-{mapped_name}" if negative else mapped_name)
+
+    return ",".join(mapped) if mapped else selection
 
 
 def benchmark_module_path(

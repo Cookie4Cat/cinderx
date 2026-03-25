@@ -1,73 +1,53 @@
 #!/bin/bash
-# Test CPython baseline performance (no CinderX)
-set -e
+# Test stock CPython JIT with pyperformance.
+set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
-SAMPLES=${SAMPLES:-10}
 WARMUP=${WARMUP:-3}
-BENCHMARK=${BENCHMARK:-generators}
+BENCHMARK=${BENCHMARK:-mdp}
+OUTPUT_FILE=${OUTPUT_FILE:-/tmp/pyperformance-baseline.json}
 
-echo "=== CPython Baseline Test (no CinderX) ==="
-echo "Benchmark: $BENCHMARK"
-echo "Samples: $SAMPLES, Warmup: $WARMUP"
-echo ""
+echo "=== CPython Baseline pyperformance ==="
+echo "Benchmark selector: $BENCHMARK"
+echo "Warmup: $WARMUP"
+echo "Output: $OUTPUT_FILE"
 
 /scripts/prepare-stock-cpython.sh
 
-export SCRIPT_DIR
+export SCRIPT_DIR BENCHMARK WARMUP OUTPUT_FILE
 eval "$(python3 <<'PY'
 import os
 import sys
 
 sys.path.insert(0, os.environ["SCRIPT_DIR"])
-from benchmark_harness import stock_cpython_python, stock_cpython_runtime_env
+from benchmark_harness import (
+    pyperformance_benchmark_filter,
+    pyperformance_source_root,
+    stock_cpython_python,
+    stock_cpython_runtime_env,
+)
 
 print(f'STOCK_CPYTHON_PYTHON="{stock_cpython_python()}"')
 print(f'export PYTHON_JIT="{stock_cpython_runtime_env()["PYTHON_JIT"]}"')
+print(f'export BENCHMARK_FILTER="{pyperformance_benchmark_filter(os.environ["BENCHMARK"])}"')
+print(f'export PYPERFORMANCE_ROOT_RESOLVED="{pyperformance_source_root()}"')
 PY
 )"
 
-# Run benchmark with stock CPython JIT enabled, without importing cinderx.
-export SAMPLES WARMUP
-"$STOCK_CPYTHON_PYTHON" << PY
+"$STOCK_CPYTHON_PYTHON" -m pip install --quiet -e "$PYPERFORMANCE_ROOT_RESOLVED" 2>&1 | grep -v notice | tail -1 || true
+
+PYTHON_JIT="$PYTHON_JIT" "$STOCK_CPYTHON_PYTHON" -m pyperformance run \
+  --debug-single-value \
+  --warmups "$WARMUP" \
+  -b "$BENCHMARK_FILTER" \
+  -o "$OUTPUT_FILE"
+
+PYTHON_JIT="$PYTHON_JIT" "$STOCK_CPYTHON_PYTHON" <<'PY'
 import os
-import sys
-import time
-import statistics
+import pyperf
 
-samples = int(os.environ["SAMPLES"])
-warmup = int(os.environ["WARMUP"])
-
-print(f"Stock CPython executable: {sys.executable}")
-print(f"JIT available: {hasattr(sys, '_jit') and sys._jit.is_available()}")
-print(f"JIT enabled: {hasattr(sys, '_jit') and sys._jit.is_enabled()}")
-
-sys.path.insert(0, "$SCRIPT_DIR")
-from benchmark_harness import benchmark_config_root, load_benchmark, load_benchmark_config, resolve_bench_args
-
-module, bench = load_benchmark("/root/benchmarks", "$BENCHMARK")
-config = load_benchmark_config(benchmark_config_root(), "$BENCHMARK")
-bench_args = resolve_bench_args(module, config)
-
-# Warmup
-print(f"Warming up ({warmup} runs)...")
-for _ in range(warmup):
-    bench(*bench_args)
-
-# Measure
-print(f"\nMeasuring ({samples} runs)...")
-times = []
-for i in range(samples):
-    start = time.perf_counter()
-    bench(*bench_args)
-    end = time.perf_counter()
-    elapsed = end - start
-    times.append(elapsed)
-    print(f"  Run {i+1:2d}: {elapsed:.6f}s")
-
-# Calculate statistics
-avg = statistics.mean(times)
-stdev = statistics.stdev(times) if len(times) > 1 else 0.0
-
-print(f"\nBaseline Result: {avg:.6f}s ± {stdev:.6f}s")
+suite = pyperf.BenchmarkSuite.load(os.environ["OUTPUT_FILE"])
+bench = suite.get_benchmarks()[0]
+print(f"\nBaseline Result ({bench.get_name()}): {bench.mean():.6f}s")
+print(f"Results saved to {os.environ['OUTPUT_FILE']}")
 PY

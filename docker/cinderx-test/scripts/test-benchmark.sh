@@ -1,34 +1,43 @@
 #!/bin/bash
-# Run full benchmark comparison: baseline vs optimized
-set -e
+# Run a CinderX pyperformance benchmark inside the container.
+set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
-BENCHMARK=${BENCHMARK:-generators}
-SAMPLES=${SAMPLES:-10}
+BENCHMARK=${BENCHMARK:-mdp}
 WARMUP=${WARMUP:-3}
+AUTOJIT=${PYTHONJITAUTO:-10}
 OPT_ENV_FILE=${OPT_ENV_FILE:-}
 OPT_CONFIG_NAME=${OPT_CONFIG_NAME:-}
+OUTPUT_FILE=${OUTPUT_FILE:-/tmp/pyperformance-cinderx.json}
 
-echo "========================================"
-echo "  Benchmark Comparison"
-echo "========================================"
-echo "Benchmark: $BENCHMARK"
-echo "Samples:   $SAMPLES"
-echo "Warmup:    $WARMUP"
-echo ""
+echo "=== CinderX pyperformance ==="
+echo "Benchmark selector: $BENCHMARK"
+echo "Warmup: $WARMUP"
+echo "AutoJIT: $AUTOJIT"
+echo "Output: $OUTPUT_FILE"
 
-export SCRIPT_DIR BENCHMARK OPT_ENV_FILE OPT_CONFIG_NAME
+export SCRIPT_DIR BENCHMARK OPT_ENV_FILE OPT_CONFIG_NAME AUTOJIT OUTPUT_FILE
 eval "$(python3 <<'PY'
 import os
 import sys
 
 sys.path.insert(0, os.environ["SCRIPT_DIR"])
-from benchmark_harness import default_opt_env_file, load_opt_env_file, opt_config_name
+from benchmark_harness import (
+    default_opt_env_file,
+    load_opt_env_file,
+    opt_config_name,
+    pyperformance_benchmark_filter,
+    pyperformance_hook_root,
+)
 
 path = os.environ.get("OPT_ENV_FILE") or str(default_opt_env_file(os.environ["BENCHMARK"]))
 config_name = os.environ.get("OPT_CONFIG_NAME") or opt_config_name(path, True)
 env = load_opt_env_file(path)
+benchmark_filter = pyperformance_benchmark_filter(os.environ["BENCHMARK"])
+hook_root = pyperformance_hook_root()
 
+print(f'export BENCHMARK_FILTER="{benchmark_filter}"')
+print(f'export PYPERF_HOOK_ROOT_RESOLVED="{hook_root}"')
 print(f'export OPT_ENV_FILE_RESOLVED="{path}"')
 print(f'export OPT_CONFIG_NAME_RESOLVED="{config_name}"')
 for key, value in env.items():
@@ -36,25 +45,13 @@ for key, value in env.items():
 PY
 )"
 
-echo "=== BASELINE (no optimization) ==="
-PYTHONJIT=1 \
-PYTHONJITAUTO=50 \
-BENCHMARK="$BENCHMARK" \
-SAMPLES="$SAMPLES" \
-WARMUP="$WARMUP" \
-/scripts/bench-benchmark.sh 2>&1 | tee /tmp/baseline.txt
+python3 -m pip install --quiet -e /pyperformance 2>&1 | grep -v notice | tail -1 || true
 
-echo ""
-
-echo "=== OPTIMIZED (${OPT_CONFIG_NAME_RESOLVED}) ==="
 env \
-  PYTHONJIT=1 \
-  PYTHONJITAUTO=50 \
-  BENCHMARK="$BENCHMARK" \
-  SAMPLES="$SAMPLES" \
-  WARMUP="$WARMUP" \
-  OPT_ENV_FILE="$OPT_ENV_FILE_RESOLVED" \
-  OPT_CONFIG_NAME="$OPT_CONFIG_NAME_RESOLVED" \
+  PYTHONJITDISABLE=1 \
+  CINDERX_WORKER_PYTHONJITAUTO="$AUTOJIT" \
+  PYTHONJITHUGEPAGES=0 \
+  PYTHONPATH="$PYPERF_HOOK_ROOT_RESOLVED${PYTHONPATH:+:$PYTHONPATH}" \
   $(python3 <<'PY'
 import os
 
@@ -63,65 +60,19 @@ for key, value in sorted(os.environ.items()):
         print(f"{key}={value}")
 PY
 ) \
-  /scripts/bench-benchmark.sh 2>&1 | tee /tmp/optimized.txt
+  python3 -m pyperformance run \
+    --debug-single-value \
+    --warmups "$WARMUP" \
+    -b "$BENCHMARK_FILTER" \
+    --inherit-environ PYTHONPATH,PYTHONJITDISABLE,CINDERX_WORKER_PYTHONJITAUTO,PYTHONJITHUGEPAGES \
+    -o "$OUTPUT_FILE"
 
-echo ""
-echo "========================================"
-echo "  COMPARISON"
-echo "========================================"
-
-export SAMPLES WARMUP BENCHMARK OPT_ENV_FILE OPT_CONFIG_NAME
-python3 << 'PY'
-import json
+python3 <<'PY'
 import os
-import re
-import sys
-from datetime import datetime
+import pyperf
 
-sys.path.insert(0, os.environ["SCRIPT_DIR"])
-from benchmark_harness import comparison_results_path, default_opt_env_file, opt_config_name, results_root
-
-
-def extract_time(filename):
-    with open(filename) as f:
-        content = f.read()
-    match = re.search(r"Result: ([\d.]+)s", content)
-    if match:
-        return float(match.group(1))
-    return None
-
-
-baseline = extract_time("/tmp/baseline.txt")
-optimized = extract_time("/tmp/optimized.txt")
-
-if baseline is None or optimized is None:
-    raise SystemExit("failed to extract timing data")
-
-speedup = baseline / optimized
-delta = (speedup - 1.0) * 100
-
-print(f"Baseline:  {baseline:.6f}s")
-print(f"Optimized: {optimized:.6f}s")
-print(f"Speedup:   {speedup:.4f}x")
-print(f"Delta:     {delta:+.2f}%")
-
-results = {
-    "timestamp": datetime.now().isoformat(),
-    "samples": int(os.environ["SAMPLES"]),
-    "warmup": int(os.environ["WARMUP"]),
-    "benchmark": os.environ["BENCHMARK"],
-    "baseline": baseline,
-    "optimized": optimized,
-    "speedup": speedup,
-    "delta_pct": delta,
-}
-
-opt_env_file = os.environ.get("OPT_ENV_FILE") or str(default_opt_env_file(os.environ["BENCHMARK"]))
-config_name = os.environ.get("OPT_CONFIG_NAME") or opt_config_name(opt_env_file, True)
-output_path = comparison_results_path(results_root(), os.environ["BENCHMARK"], config_name)
-output_path.parent.mkdir(parents=True, exist_ok=True)
-with open(output_path, "w") as f:
-    json.dump(results, f, indent=2)
-
-print(f"\nResults saved to {output_path}")
+suite = pyperf.BenchmarkSuite.load(os.environ["OUTPUT_FILE"])
+bench = suite.get_benchmarks()[0]
+print(f"\nCinderX Result ({bench.get_name()}): {bench.mean():.6f}s")
+print(f"Results saved to {os.environ['OUTPUT_FILE']}")
 PY

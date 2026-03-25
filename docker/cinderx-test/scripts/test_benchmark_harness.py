@@ -17,25 +17,69 @@ def _load_harness():
 
 
 class BenchmarkHarnessTests(unittest.TestCase):
+    def test_test_benchmark_script_uses_pyperformance_and_json_output(self) -> None:
+        script_text = (
+            pathlib.Path(__file__).resolve().parent / "test-benchmark.sh"
+        ).read_text(encoding="utf-8")
+        self.assertIn("python3 -m pyperformance run", script_text)
+        self.assertIn('--debug-single-value', script_text)
+        self.assertIn('-o "$OUTPUT_FILE"', script_text)
+        self.assertIn('CINDERX_WORKER_PYTHONJITAUTO="$AUTOJIT"', script_text)
+        self.assertIn("PYTHONPATH=\"$PYPERF_HOOK_ROOT_RESOLVED", script_text)
+
     def test_builtin_benchmarks_have_benchmark_toml(self) -> None:
         harness = _load_harness()
         config_root = pathlib.Path(__file__).resolve().parent.parent / "configs"
 
         generators = harness.load_benchmark_config(config_root, "generators")
         self.assertEqual(generators["bench_func"], "bench_generators")
+        self.assertEqual(generators["pyperformance_benchmark"], "generators")
         self.assertEqual(generators["args"]["mode"], "fixed_tuple")
+        self.assertEqual(generators["prepare"]["mode"], "pyperformance_files")
+        self.assertEqual(generators["run"]["default_excludes"], [])
+        self.assertEqual(generators["run"]["extra_env"], {})
 
         mdp = harness.load_benchmark_config(config_root, "mdp")
         self.assertEqual(mdp["bench_func"], "bench_mdp")
+        self.assertEqual(mdp["pyperformance_benchmark"], "mdp")
         self.assertEqual(mdp["args"]["mode"], "fixed_tuple")
+        self.assertEqual(mdp["prepare"]["mode"], "pyperformance_files")
 
         regex_compile = harness.load_benchmark_config(config_root, "regex_compile")
         self.assertEqual(regex_compile["bench_func"], "bench_regex_compile")
+        self.assertEqual(regex_compile["pyperformance_benchmark"], "regex_compile")
         self.assertEqual(regex_compile["args"]["mode"], "regex_compile_capture")
+        self.assertEqual(regex_compile["prepare"]["mode"], "pyperformance_files")
         self.assertEqual(
             regex_compile["support_files"],
             ["bm_regex_effbot.py", "bm_regex_v8.py"],
         )
+
+    def test_pyperformance_metadata_comes_from_config(self) -> None:
+        harness = _load_harness()
+        config_root = pathlib.Path(__file__).resolve().parent.parent / "configs"
+        self.assertEqual(
+            harness.pyperformance_benchmark_name("mdp", config_root=config_root),
+            "mdp",
+        )
+        self.assertEqual(
+            harness.benchmark_prepare_mode("regex_compile", config_root=config_root),
+            "pyperformance_files",
+        )
+        self.assertEqual(
+            harness.default_run_excludes("generators", config_root=config_root),
+            (),
+        )
+        self.assertEqual(
+            harness.benchmark_extra_env("mdp", config_root=config_root),
+            {},
+        )
+        self.assertEqual(
+            harness.pyperformance_benchmark_filter("mdp,-regex_compile", config_root=config_root),
+            "mdp,-regex_compile",
+        )
+        self.assertEqual(harness.pyperformance_source_root(), pathlib.Path("/pyperformance"))
+        self.assertEqual(harness.pyperformance_hook_root(), pathlib.Path("/pyperf_env_hook"))
 
     def test_benchmark_downloads_come_from_config(self) -> None:
         harness = _load_harness()
@@ -104,6 +148,7 @@ class BenchmarkHarnessTests(unittest.TestCase):
                 textwrap.dedent(
                     """
                     name = "custom"
+                    pyperformance_benchmark = "custom"
                     module_dir = "bm_custom"
                     entry_file = "entry.py"
                     bench_func = "bench_custom"
@@ -117,6 +162,15 @@ class BenchmarkHarnessTests(unittest.TestCase):
                     [args]
                     mode = "fixed_tuple"
                     values = [1]
+
+                    [prepare]
+                    mode = "pyperformance_files"
+
+                    [run]
+                    default_excludes = ["dask"]
+
+                    [run.extra_env]
+                    FOO = "BAR"
                     """
                 ),
                 encoding="utf-8",
@@ -124,6 +178,22 @@ class BenchmarkHarnessTests(unittest.TestCase):
             self.assertEqual(
                 harness.benchmark_module_path(bench_root, "custom", config_root=config_root),
                 bench_root / "bm_custom" / "entry.py",
+            )
+            self.assertEqual(
+                harness.pyperformance_benchmark_name("custom", config_root=config_root),
+                "custom",
+            )
+            self.assertEqual(
+                harness.benchmark_prepare_mode("custom", config_root=config_root),
+                "pyperformance_files",
+            )
+            self.assertEqual(
+                harness.default_run_excludes("custom", config_root=config_root),
+                ("dask",),
+            )
+            self.assertEqual(
+                harness.benchmark_extra_env("custom", config_root=config_root),
+                {"FOO": "BAR"},
             )
 
     def test_load_benchmark_uses_configured_entry_file(self) -> None:
@@ -137,6 +207,7 @@ class BenchmarkHarnessTests(unittest.TestCase):
                 textwrap.dedent(
                     """
                     name = "custom"
+                    pyperformance_benchmark = "custom"
                     module_dir = "bm_custom"
                     entry_file = "entry.py"
                     bench_func = "bench_custom"
@@ -150,6 +221,14 @@ class BenchmarkHarnessTests(unittest.TestCase):
                     [args]
                     mode = "fixed_tuple"
                     values = [1]
+
+                    [prepare]
+                    mode = "pyperformance_files"
+
+                    [run]
+                    default_excludes = []
+
+                    [run.extra_env]
                     """
                 ),
                 encoding="utf-8",
@@ -176,6 +255,7 @@ class BenchmarkHarnessTests(unittest.TestCase):
                 textwrap.dedent(
                     """
                     name = "regex_compile"
+                    pyperformance_benchmark = "regex_compile"
                     module_dir = "bm_regex_compile"
                     entry_file = "run_benchmark.py"
                     bench_func = "bench_regex_compile"
@@ -190,6 +270,14 @@ class BenchmarkHarnessTests(unittest.TestCase):
                     mode = "regex_compile_capture"
                     fixed_int = 1
                     capture_func = "capture_regexes"
+
+                    [prepare]
+                    mode = "pyperformance_files"
+
+                    [run]
+                    default_excludes = []
+
+                    [run.extra_env]
                     """
                 ),
                 encoding="utf-8",
