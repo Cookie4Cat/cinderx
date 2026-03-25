@@ -1,13 +1,39 @@
-# CinderX ARM64 Docker Test Environment
+# CinderX Docker Benchmark 环境
 
-这个目录用于日常实验型容器测试。它与 `docker/cpython-baseline` 的职责不同：
+这个目录用于在 Docker 中跑 **CinderX + pyperformance** 的真实验证入口。  
+和旧版直接 `import benchmark`、再调用 `bench(*args)` 的脚本不同，这套流程已经统一收敛到：
 
-- `docker/cinderx-test`：快速实验、频繁切换 benchmark 与优化开关
-- `docker/cpython-baseline`：正式对照 `stock CPython JIT vs CinderX JIT`
+```bash
+python -m pyperformance run ...
+```
+
+## 目标
+
+- 尽量贴近真实服务器环境
+  - `openEuler 24.03 LTS SP1`
+  - `gcc 14.2.0`
+  - 容器内代理默认走 `host.docker.internal:7890`
+- 使用真实 `pyperformance run` 路径暴露 JIT 正确性问题
+- benchmark 元数据仍然由 `configs/<benchmark>/benchmark.toml` 驱动
+
+## 基础约定
+
+容器会挂载以下宿主机目录：
+
+- `dist/`：CinderX wheel
+- `docker/cinderx-test/scripts/`：执行脚本
+- `docker/cinderx-test/configs/`：benchmark 配置
+- `${HOME}/Repo/pyperformance`：挂载到容器 `/pyperformance`
+- `scripts/arm/pyperf_env_hook`：挂载到容器 `/pyperf_env_hook`
+
+说明：
+
+- `pyperformance` 源码挂载是必须的，因为 `mdp` 等用例不属于标准发布包内置集合
+- `/pyperf_env_hook` 用于给 pyperformance worker 注入 CinderX JIT 启动逻辑
 
 ## 快速开始
 
-### 1. 构建 ARM64 wheel
+### 1. 构建 wheel
 
 ```bash
 REPO_ROOT="$(git rev-parse --show-toplevel)"
@@ -15,7 +41,7 @@ cd "$REPO_ROOT"
 ./docker/cinderx-test/scripts/build-wheel.sh
 ```
 
-### 2. 启动实验容器
+### 2. 启动容器
 
 ```bash
 REPO_ROOT="$(git rev-parse --show-toplevel)"
@@ -23,145 +49,125 @@ cd "$REPO_ROOT/docker/cinderx-test"
 docker compose -p cinderx-exp up -d
 ```
 
-### 3. 准备 benchmark 并安装 CinderX
+### 3. 安装 CinderX 与 pyperformance
+
+```bash
+docker compose -p cinderx-exp exec cinderx-arm64 /scripts/setup.sh
+```
+
+### 4. 跑单个 benchmark
 
 ```bash
 docker compose -p cinderx-exp exec cinderx-arm64 sh -lc \
-  'BENCHMARK=generators /scripts/setup.sh'
+  'BENCHMARK=mdp WARMUP=3 PYTHONJITAUTO=10 /scripts/test-benchmark.sh'
 ```
 
-### 4. 运行 smoke test
-
-```bash
-docker compose -p cinderx-exp exec cinderx-arm64 /scripts/smoke.sh
-```
-
-### 5. 跑 benchmark 对比
+也可以跑别的配置，例如：
 
 ```bash
 docker compose -p cinderx-exp exec cinderx-arm64 sh -lc \
-  'BENCHMARK=generators /scripts/test-benchmark.sh'
+  'BENCHMARK=regex_compile WARMUP=3 PYTHONJITAUTO=10 /scripts/test-benchmark.sh'
 ```
+
+## benchmark 选择方式
+
+`BENCHMARK` 现在传给 `pyperformance -b/--benchmarks`，支持三类形式：
+
+- 单 benchmark
+  - `BENCHMARK=mdp`
+- 指定子集
+  - `BENCHMARK=all,-dask`
+- 多项组合
+  - `BENCHMARK=mdp,regex_compile`
+
+其中简单名字会先经过 `benchmark.toml` 映射到对应的 `pyperformance_benchmark`。
 
 ## 支持的 benchmark
 
-当前已支持：
+当前已配置：
 
 - `generators`
 - `mdp`
 - `regex_compile`
 
-benchmark 的元数据不再写死在脚本里，而是来自：
-
-- `docker/cinderx-test/configs/<benchmark>/benchmark.toml`
-
-## 配置文件驱动的优化开关
-
-稳定与实验开关统一放在：
+配置目录：
 
 - `docker/cinderx-test/configs/generators/`
 - `docker/cinderx-test/configs/mdp/`
 - `docker/cinderx-test/configs/regex_compile/`
 
-例如：
+## 优化开关
 
-- `docker/cinderx-test/configs/generators/stable.env`
-- `docker/cinderx-test/configs/mdp/stable.env`
-- `docker/cinderx-test/configs/regex_compile/stable.env`
+如果某个 benchmark 有稳定优化配置，可以通过：
 
-运行 `mdp stable`：
+- `OPT_ENV_FILE`
+- `OPT_CONFIG_NAME`
 
-```bash
-docker compose -p cinderx-exp exec cinderx-arm64 sh -lc \
-  'BENCHMARK=mdp OPT_ENV_FILE=/scripts/configs/mdp/stable.env SAMPLES=5 WARMUP=1 /scripts/test-benchmark.sh'
-```
-
-## 新增 benchmark 的方式
-
-新增 benchmark 时，目标是只新增配置，不改脚本。
-
-最小改动集是：
-
-1. 新增：
-   - `docker/cinderx-test/configs/<benchmark>/benchmark.toml`
-   - `docker/cinderx-test/configs/<benchmark>/stable.env`
-2. 不修改：
-   - `setup.sh`
-   - `bench-benchmark.sh`
-   - `test-benchmark.sh`
-   - `benchmark_harness.py` 中的 benchmark 名单
-
-`benchmark.toml` 负责描述：
-
-- benchmark 模块目录
-- 入口文件
-- 入口函数
-- 下载清单
-- 参数构造模式
-
-例如现有 benchmark 已覆盖：
-
-- `fixed_tuple`
-- `regex_compile_capture`
-
-## 并行项目隔离
-
-隔离方式使用 compose project name 和结果目录，而不是固定容器名：
-
-```bash
-REPO_ROOT="$(git rev-parse --show-toplevel)"
-cd "$REPO_ROOT/docker/cinderx-test"
-RESULTS_DIR=./results-mdp docker compose -p mdp-exp up -d
-RESULTS_DIR=./results-generators docker compose -p generators-exp up -d
-```
-
-这样多组实验可以共享同一个基础镜像 `python:3.14-slim`，但实例、网络、缓存和结果目录彼此隔离。
-
-## 常用命令
-
-单次跑某个 benchmark：
-
-```bash
-docker compose -p cinderx-exp exec cinderx-arm64 sh -lc \
-  'BENCHMARK=mdp SAMPLES=10 WARMUP=3 /scripts/bench-benchmark.sh'
-```
-
-兼容旧入口：
-
-```bash
-docker compose -p cinderx-exp exec cinderx-arm64 /scripts/bench-generators.sh
-docker compose -p cinderx-exp exec cinderx-arm64 /scripts/test-generators.sh
-```
-
-交互式进入容器：
-
-```bash
-docker compose -p cinderx-exp exec cinderx-arm64 bash
-```
-
-## 结果路径
-
-对比结果会按 benchmark/config 分层落盘：
-
-- `/results/<benchmark>/<config-name>/comparison.json`
+来选择。
 
 例如：
 
-- `/results/generators/stable/comparison.json`
-- `/results/mdp/stable/comparison.json`
-- `/results/mdp/experimental-round4/comparison.json`
+```bash
+docker compose -p cinderx-exp exec cinderx-arm64 sh -lc \
+  'BENCHMARK=mdp OPT_ENV_FILE=/scripts/configs/mdp/stable.env PYTHONJITAUTO=10 /scripts/test-benchmark.sh'
+```
 
-## 环境变量
+## 关键环境变量
 
-- `BENCHMARK`：要运行的 benchmark，例如 `generators`、`mdp`
-- `OPT_ENV_FILE`：优化开关配置文件路径
-- `OPT_CONFIG_NAME`：结果标签；默认取 `.env` 文件名
-- `SAMPLES`：采样次数，默认 `10`
-- `WARMUP`：预热次数，默认 `3`
-- `RESULTS_DIR`：宿主机结果目录
-- `BASE_IMAGE`：公共基础镜像名，默认 `python:3.14-slim`
+- `BENCHMARK`
+  - pyperformance benchmark selector
+- `WARMUP`
+  - 传给 `pyperformance run --warmups`
+- `PYTHONJITAUTO`
+  - 这里作为 worker AutoJIT 阈值使用
+- `OPT_ENV_FILE`
+  - 优化开关配置文件
+- `OPT_CONFIG_NAME`
+  - 结果标签名
+- `OUTPUT_FILE`
+  - pyperformance JSON 输出路径
+- `RESULTS_DIR`
+  - 宿主机结果目录
+
+## 代理说明
+
+容器内代理默认是：
+
+- `http://host.docker.internal:7890`
+- `https://host.docker.internal:7890`
+
+不要再在容器里使用：
+
+- `127.0.0.1:7890`
+
+因为那会指向容器自身，不是宿主机代理。
+
+## 新增 benchmark
+
+目标仍然是“尽量只改配置”。
+
+通常只需要新增：
+
+1. `docker/cinderx-test/configs/<benchmark>/benchmark.toml`
+2. `docker/cinderx-test/configs/<benchmark>/stable.env`
+
+`benchmark.toml` 当前至少描述：
+
+- `pyperformance_benchmark`
+- `module_dir`
+- `entry_file`
+- `bench_func`
+- `downloads`
+- `args`
+- `prepare.mode`
+- `run.default_excludes`
+- `run.extra_env`
 
 ## 注意事项
 
-1. Docker ARM64 仿真依赖 QEMU，性能数据只适合做方向验证，不适合作为正式基线。
-2. 这套容器的基础镜像应该保持稳定复用；benchmark 脚本、配置、wheel 与结果都通过挂载提供，不应因为实验切换而重建镜像。
+1. 这套容器现在已经比旧脚本更接近真实环境，但仍然不是服务器的完全复制品。
+2. 如果 benchmark 在这里失败而在真实环境通过，优先检查：
+   - 代理
+   - pyperformance 源码挂载
+   - worker JIT hook 是否生效
+3. 如果要做正式对照，请优先使用 `docker/cpython-baseline/`。
