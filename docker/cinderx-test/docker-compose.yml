@@ -1,8 +1,13 @@
 services:
   cinderx-arm64:
-    image: ${BASE_IMAGE:-python:3.14-slim}
+    image: ${BASE_IMAGE:-cinderx-pyperf-realenv:arm64}
+    build:
+      context: ../cpython-baseline
+      dockerfile: Dockerfile
     platform: linux/arm64
     hostname: cinderx-arm64
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
 
     # Mounts
     volumes:
@@ -12,6 +17,10 @@ services:
       - ./scripts:/scripts:ro
       # Benchmark configs
       - ./configs:/scripts/configs:ro
+      # Pyperformance source tree
+      - ${PYPERFORMANCE_ROOT:-${HOME}/Repo/pyperformance}:/pyperformance:ro
+      # Worker startup hook for CinderX JIT
+      - ../../scripts/arm/pyperf_env_hook:/pyperf_env_hook:ro
       # Benchmark results
       - ${RESULTS_DIR:-./results}:/results
       # Cache for pyperformance
@@ -23,6 +32,12 @@ services:
       - PYTHONUNBUFFERED=1
       - PYTHONJIT=${PYTHONJIT:-1}
       - PYTHONJITAUTO=${PYTHONJITAUTO:-50}
+      - PYPERFORMANCE_ROOT=/pyperformance
+      - PYPERFORMANCE_HOOK_ROOT=/pyperf_env_hook
+      - http_proxy=${http_proxy:-http://host.docker.internal:7890}
+      - https_proxy=${https_proxy:-http://host.docker.internal:7890}
+      - HTTP_PROXY=${HTTP_PROXY:-http://host.docker.internal:7890}
+      - HTTPS_PROXY=${HTTPS_PROXY:-http://host.docker.internal:7890}
 
     # Keep container running
     stdin_open: true
