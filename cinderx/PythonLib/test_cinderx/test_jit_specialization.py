@@ -293,3 +293,40 @@ class SpecializationTests(unittest.TestCase):
 
         self.assertIn("CALL_BOUND_METHOD_EXACT_ARGS", opnames(f))
         self.assertEqual(f(2), 3)
+
+    @passIf(sys.version_info < (3, 14), "Requires Python 3.14 call specialization")
+    def test_call_isinstance(self) -> None:
+        def f(x: object, typ: type) -> bool:
+            return isinstance(x, typ)
+
+        specialize(f, lambda: f(1, int))
+
+        self.assertIn("CALL_ISINSTANCE", opnames(f))
+        self.assertTrue(f(1, int))
+        self.assertFalse(f("1", int))
+
+    @passIf(sys.version_info < (3, 14), "Requires Python 3.14 TO_BOOL specialization")
+    def test_to_bool_int(self) -> None:
+        def f(x: int) -> int:
+            if x:
+                return 1
+            return 0
+
+        specialize(f, lambda: f(1))
+
+        self.assertIn("TO_BOOL_INT", opnames(f))
+        self.assertEqual(f(1), 1)
+        self.assertEqual(f(0), 0)
+
+    @passIf(sys.version_info < (3, 14), "Requires Python 3.14 TO_BOOL specialization")
+    def test_to_bool_list(self) -> None:
+        def f(li: list[int]) -> int:
+            if li:
+                return 1
+            return 0
+
+        specialize(f, lambda: f([1]))
+
+        self.assertIn("TO_BOOL_LIST", opnames(f))
+        self.assertEqual(f([1]), 1)
+        self.assertEqual(f([]), 0)

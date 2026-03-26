@@ -95,11 +95,19 @@ int BytecodeInstruction::specializedOpcode() const {
     case COMPARE_OP_STR:
     case CALL_LIST_APPEND:
     case CALL_BOUND_METHOD_EXACT_ARGS:
+    case CALL_ISINSTANCE:
     case CALL_METHOD_DESCRIPTOR_FAST:
     case CALL_METHOD_DESCRIPTOR_FAST_WITH_KEYWORDS:
     case CALL_METHOD_DESCRIPTOR_NOARGS:
     case CALL_METHOD_DESCRIPTOR_O:
     case CALL_PY_EXACT_ARGS:
+#if PY_VERSION_HEX >= 0x030E0000
+    case TO_BOOL_BOOL:
+    case TO_BOOL_INT:
+    case TO_BOOL_LIST:
+    case TO_BOOL_NONE:
+    case TO_BOOL_STR:
+#endif
     case LOAD_ATTR_INSTANCE_VALUE:
     case LOAD_ATTR_METHOD_WITH_VALUES:
     case LOAD_ATTR_SLOT:
