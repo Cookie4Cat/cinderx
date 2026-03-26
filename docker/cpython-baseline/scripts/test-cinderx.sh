@@ -10,6 +10,9 @@ OPT_ENV_FILE=${OPT_ENV_FILE:-}
 OPT_CONFIG_NAME=${OPT_CONFIG_NAME:-}
 AUTOJIT=${PYTHONJITAUTO:-10}
 OUTPUT_FILE=${OUTPUT_FILE:-/tmp/pyperformance-cinderx.json}
+PYPERFORMANCE_TMP="$(mktemp -d /tmp/pyperformance.XXXXXX)"
+CINDERX_WHEEL_CACHE_DIR=${CINDERX_WHEEL_CACHE_DIR:-/opt/cinderx-wheel-cache}
+trap 'rm -rf "$PYPERFORMANCE_TMP"' EXIT
 
 echo "=== CPython + CinderX pyperformance ==="
 echo "Benchmark selector: $BENCHMARK"
@@ -20,13 +23,12 @@ echo "Output: $OUTPUT_FILE"
 
 export SCRIPT_DIR BENCHMARK ENABLE_OPTIMIZATION OPT_ENV_FILE OPT_CONFIG_NAME AUTOJIT OUTPUT_FILE
 eval "$(python3 <<'PY'
-import glob
 import os
 import sys
 
 sys.path.insert(0, os.environ["SCRIPT_DIR"])
 from benchmark_harness import (
-    cinderx_wheel_glob,
+    cinderx_source_root,
     default_opt_env_file,
     load_opt_env_file,
     opt_config_name,
@@ -35,16 +37,15 @@ from benchmark_harness import (
     pyperformance_source_root,
 )
 
-matches = sorted(glob.glob(str(cinderx_wheel_glob())))
-if not matches:
-    raise SystemExit("no CinderX wheel found under /dist")
+path = os.environ.get("OPT_ENV_FILE")
+if not path:
+    default_path = default_opt_env_file(os.environ["BENCHMARK"])
+    path = str(default_path) if default_path is not None else ""
+config_name = os.environ.get("OPT_CONFIG_NAME") or opt_config_name(path or None, True)
+env = load_opt_env_file(path or None) if os.environ["ENABLE_OPTIMIZATION"] not in ("", "0") else {}
 
-path = os.environ.get("OPT_ENV_FILE") or str(default_opt_env_file(os.environ["BENCHMARK"]))
-config_name = os.environ.get("OPT_CONFIG_NAME") or opt_config_name(path, True)
-env = load_opt_env_file(path) if os.environ["ENABLE_OPTIMIZATION"] not in ("", "0") else {}
-
-print(f'CINDERX_WHEEL="{matches[-1]}"')
 print(f'export BENCHMARK_FILTER="{pyperformance_benchmark_filter(os.environ["BENCHMARK"])}"')
+print(f'export CINDERX_SOURCE_ROOT_RESOLVED="{cinderx_source_root()}"')
 print(f'export PYPERF_HOOK_ROOT_RESOLVED="{pyperformance_hook_root()}"')
 print(f'export PYPERFORMANCE_ROOT_RESOLVED="{pyperformance_source_root()}"')
 print(f'export OPT_ENV_FILE_RESOLVED="{path}"')
@@ -54,18 +55,19 @@ for key, value in env.items():
 PY
 )"
 
-python3 - <<PY
-import importlib.util
-import subprocess
-import sys
+CINDERX_WHEEL_PATH=$(ls -t "$CINDERX_WHEEL_CACHE_DIR"/cinderx-*-linux_aarch64.whl 2>/dev/null | head -n1 || true)
+if [[ -z "$CINDERX_WHEEL_PATH" ]]; then
+  echo "missing cached cinderx wheel under $CINDERX_WHEEL_CACHE_DIR" >&2
+  echo "run the cinderx-test setup container first to build and cache the wheel" >&2
+  exit 1
+fi
+PYTHONJITDISABLE=1 python3 -m pip install --quiet --no-deps "$CINDERX_WHEEL_PATH" 2>&1 | grep -v notice | tail -1 || true
 
-if importlib.util.find_spec("cinderx") is None:
-    subprocess.check_call([sys.executable, "-m", "pip", "install", "$CINDERX_WHEEL"])
-PY
-
-python3 -m pip install --quiet -e "$PYPERFORMANCE_ROOT_RESOLVED" 2>&1 | grep -v notice | tail -1 || true
+cp -a "$PYPERFORMANCE_ROOT_RESOLVED"/. "$PYPERFORMANCE_TMP"/
+PYTHONJITDISABLE=1 python3 -m pip install --quiet "$PYPERFORMANCE_TMP" 2>&1 | grep -v notice | tail -1 || true
 
 env \
+  LD_LIBRARY_PATH="${LD_LIBRARY_PATH:-}" \
   PYTHONJITDISABLE=1 \
   CINDERX_WORKER_PYTHONJITAUTO="$AUTOJIT" \
   PYTHONJITHUGEPAGES=0 \
@@ -82,7 +84,7 @@ PY
     --debug-single-value \
     --warmups "$WARMUP" \
     -b "$BENCHMARK_FILTER" \
-    --inherit-environ PYTHONPATH,PYTHONJITDISABLE,CINDERX_WORKER_PYTHONJITAUTO,PYTHONJITHUGEPAGES \
+    --inherit-environ PYTHONPATH,LD_LIBRARY_PATH,PYTHONJITDISABLE,CINDERX_WORKER_PYTHONJITAUTO,PYTHONJITHUGEPAGES \
     -o "$OUTPUT_FILE"
 
 python3 <<'PY'

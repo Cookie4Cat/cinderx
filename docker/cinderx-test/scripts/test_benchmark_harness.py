@@ -26,6 +26,42 @@ class BenchmarkHarnessTests(unittest.TestCase):
         self.assertIn('-o "$OUTPUT_FILE"', script_text)
         self.assertIn('CINDERX_WORKER_PYTHONJITAUTO="$AUTOJIT"', script_text)
         self.assertIn("PYTHONPATH=\"$PYPERF_HOOK_ROOT_RESOLVED", script_text)
+        self.assertIn('LD_LIBRARY_PATH="${LD_LIBRARY_PATH:-}"', script_text)
+        self.assertIn(
+            "--inherit-environ PYTHONPATH,LD_LIBRARY_PATH,PYTHONJITDISABLE,CINDERX_WORKER_PYTHONJITAUTO,PYTHONJITHUGEPAGES",
+            script_text,
+        )
+
+    def test_test_benchmark_script_disables_jit_during_install(self) -> None:
+        script_text = (
+            pathlib.Path(__file__).resolve().parent / "test-benchmark.sh"
+        ).read_text(encoding="utf-8")
+        self.assertIn(
+            'PYTHONJITDISABLE=1 python3 -m pip install --quiet --no-deps "$CINDERX_WHEEL_PATH"',
+            script_text,
+        )
+        self.assertIn(
+            'PYTHONJITDISABLE=1 python3 -m pip install --quiet "$PYPERFORMANCE_TMP"',
+            script_text,
+        )
+
+    def test_setup_script_builds_persistent_cinderx_wheel_cache(self) -> None:
+        script_text = (
+            pathlib.Path(__file__).resolve().parent / "setup.sh"
+        ).read_text(encoding="utf-8")
+        self.assertIn('CINDERX_WHEEL_CACHE_DIR=${CINDERX_WHEEL_CACHE_DIR:-/opt/cinderx-wheel-cache}', script_text)
+        self.assertIn('mkdir -p "$CINDERX_WHEEL_CACHE_DIR"', script_text)
+        self.assertIn('cp "$CINDERX_WHEEL_TMP"/cinderx-*-linux_aarch64.whl "$CINDERX_WHEEL_CACHE_DIR"/', script_text)
+        self.assertIn('PYTHONJITDISABLE=1 pip3 install --quiet --no-deps "$CINDERX_WHEEL_CACHE_DIR"/cinderx-*-linux_aarch64.whl', script_text)
+
+    def test_test_benchmark_script_reuses_cached_wheel(self) -> None:
+        script_text = (
+            pathlib.Path(__file__).resolve().parent / "test-benchmark.sh"
+        ).read_text(encoding="utf-8")
+        self.assertIn('CINDERX_WHEEL_CACHE_DIR=${CINDERX_WHEEL_CACHE_DIR:-/opt/cinderx-wheel-cache}', script_text)
+        self.assertIn('CINDERX_WHEEL_PATH=$(ls -t "$CINDERX_WHEEL_CACHE_DIR"/cinderx-*-linux_aarch64.whl', script_text)
+        self.assertIn('PYTHONJITDISABLE=1 python3 -m pip install --quiet --no-deps "$CINDERX_WHEEL_PATH"', script_text)
+        self.assertNotIn("python3 -m build --wheel", script_text)
 
     def test_builtin_benchmarks_have_benchmark_toml(self) -> None:
         harness = _load_harness()
@@ -351,8 +387,12 @@ class BenchmarkHarnessTests(unittest.TestCase):
         harness = _load_harness()
         self.assertEqual(
             harness.default_opt_env_file("mdp"),
-            pathlib.Path("/scripts/configs/mdp/stable.env"),
+            harness.benchmark_config_root() / "mdp" / "stable.env",
         )
+
+    def test_default_opt_env_file_returns_none_for_composite_selection(self) -> None:
+        harness = _load_harness()
+        self.assertIsNone(harness.default_opt_env_file("all,-dask"))
 
     def test_comparison_results_path_nests_by_benchmark_and_config(self) -> None:
         harness = _load_harness()

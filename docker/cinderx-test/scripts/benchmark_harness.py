@@ -10,6 +10,9 @@ from pathlib import Path
 
 
 def benchmark_config_root() -> Path:
+    env_root = os.environ.get("BENCHMARK_CONFIG_ROOT")
+    if env_root:
+        return Path(env_root)
     return Path(__file__).resolve().parent.parent / "configs"
 
 
@@ -119,6 +122,25 @@ def pyperformance_benchmark_filter(
     return ",".join(mapped) if mapped else selection
 
 
+def config_backed_selection_name(
+    selection: str,
+    config_root: Path | str = benchmark_config_root(),
+) -> str | None:
+    tokens = [token.strip() for token in selection.split(",") if token.strip()]
+    if len(tokens) != 1:
+        return None
+
+    token = tokens[0]
+    if token.startswith("-") or token in {"all", "<default>"}:
+        return None
+
+    try:
+        resolve_benchmark_metadata(token, config_root)
+    except FileNotFoundError:
+        return None
+    return token
+
+
 def benchmark_module_path(
     root: Path | str,
     name: str,
@@ -173,9 +195,15 @@ def cinderx_wheel_glob() -> Path:
     return Path(os.environ.get("CINDERX_WHEEL_GLOB", "/dist/cinderx-*-linux_aarch64.whl"))
 
 
-def default_opt_env_file(name: str) -> Path:
-    resolve_benchmark_metadata(name)
-    return Path("/scripts/configs") / name / "stable.env"
+def cinderx_source_root() -> Path:
+    return Path(os.environ.get("CINDERX_SOURCE_ROOT", "/cinderx"))
+
+
+def default_opt_env_file(name: str) -> Path | None:
+    config_name = config_backed_selection_name(name)
+    if config_name is None:
+        return None
+    return benchmark_config_root() / config_name / "stable.env"
 
 
 def results_root() -> Path:

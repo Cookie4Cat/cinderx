@@ -6,6 +6,8 @@ SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 WARMUP=${WARMUP:-3}
 BENCHMARK=${BENCHMARK:-mdp}
 OUTPUT_FILE=${OUTPUT_FILE:-/tmp/pyperformance-baseline.json}
+PYPERFORMANCE_TMP="$(mktemp -d /tmp/pyperformance.XXXXXX)"
+trap 'rm -rf "$PYPERFORMANCE_TMP"' EXIT
 
 echo "=== CPython Baseline pyperformance ==="
 echo "Benchmark selector: $BENCHMARK"
@@ -34,7 +36,8 @@ print(f'export PYPERFORMANCE_ROOT_RESOLVED="{pyperformance_source_root()}"')
 PY
 )"
 
-"$STOCK_CPYTHON_PYTHON" -m pip install --quiet -e "$PYPERFORMANCE_ROOT_RESOLVED" 2>&1 | grep -v notice | tail -1 || true
+cp -a "$PYPERFORMANCE_ROOT_RESOLVED"/. "$PYPERFORMANCE_TMP"/
+"$STOCK_CPYTHON_PYTHON" -m pip install --quiet "$PYPERFORMANCE_TMP" 2>&1 | grep -v notice | tail -1 || true
 
 PYTHON_JIT="$PYTHON_JIT" "$STOCK_CPYTHON_PYTHON" -m pyperformance run \
   --debug-single-value \

@@ -97,8 +97,11 @@ results = {
 }
 
 benchmark = os.environ["BENCHMARK"]
-opt_env_file = os.environ.get("OPT_ENV_FILE") or str(default_opt_env_file(benchmark))
-config_name = os.environ.get("OPT_CONFIG_NAME") or opt_config_name(opt_env_file, True)
+opt_env_file = os.environ.get("OPT_ENV_FILE")
+if not opt_env_file:
+    default_opt = default_opt_env_file(benchmark)
+    opt_env_file = str(default_opt) if default_opt is not None else ""
+config_name = os.environ.get("OPT_CONFIG_NAME") or opt_config_name(opt_env_file or None, True)
 output_path = comparison_results_path(results_root(), benchmark, config_name)
 output_path.parent.mkdir(parents=True, exist_ok=True)
 with open(output_path, "w", encoding="utf-8") as f:
