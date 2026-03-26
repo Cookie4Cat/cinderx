@@ -2753,16 +2753,23 @@ void HIRBuilder::emitAnyCall(
         flags |= CallFlags::KwArgs;
       }
 
-      if (getConfig().specialized_opcodes &&
-          !(tc.frame.stack.peek(num_stack_inputs - 1)->type() <= TNullptr)) {
         Register* callable = tc.frame.stack.peek(num_stack_inputs);
-        switch (bc_instr.specializedOpcode()) {
+        Register* self_or_null = tc.frame.stack.peek(num_stack_inputs - 1);
+
+        if (getConfig().specialized_opcodes) {
+          switch (bc_instr.specializedOpcode()) {
+          case CALL_PY_EXACT_ARGS:
+          case CALL_BOUND_METHOD_EXACT_ARGS:
+            if (!(self_or_null->type() <= TNullptr)) {
+              tc.emit<GuardType>(callable, TFunc, callable, tc.frame);
+            }
+            goto generic_call;
           case CALL_LIST_APPEND:
           case CALL_METHOD_DESCRIPTOR_FAST:
           case CALL_METHOD_DESCRIPTOR_FAST_WITH_KEYWORDS:
           case CALL_METHOD_DESCRIPTOR_NOARGS:
           case CALL_METHOD_DESCRIPTOR_O:
-            if (isMethodDescr(callable)) {
+            if (!(self_or_null->type() <= TNullptr) && isMethodDescr(callable)) {
               Register* out = temps_.AllocateStack();
               auto call = tc.emit<VectorCall>(
                   num_operands, out, flags | CallFlags::Static);

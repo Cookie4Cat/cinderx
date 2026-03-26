@@ -260,3 +260,36 @@ class SpecializationTests(unittest.TestCase):
         self.assertNotIn("UNPACK_SEQUENCE", opnames(f))
         self.assertIn("UNPACK_SEQUENCE_TWO_TUPLE", opnames(f))
         self.assertEqual(f(("c", "d")), "c")
+
+    @passIf(sys.version_info < (3, 14), "Requires Python 3.14 call specialization")
+    def test_call_py_exact_args(self) -> None:
+        class C:
+            def m(self, x: int) -> int:
+                return x + 1
+
+        c = C()
+
+        def f(x: int) -> int:
+            return c.m(x)
+
+        specialize(f, lambda: f(1))
+
+        self.assertIn("CALL_PY_EXACT_ARGS", opnames(f))
+        self.assertEqual(f(2), 3)
+
+    @passIf(sys.version_info < (3, 14), "Requires Python 3.14 call specialization")
+    def test_call_bound_method_exact_args(self) -> None:
+        class C:
+            def m(self, x: int) -> int:
+                return x + 1
+
+        c = C()
+        bound = c.m
+
+        def f(x: int) -> int:
+            return bound(x)
+
+        specialize(f, lambda: f(1))
+
+        self.assertIn("CALL_BOUND_METHOD_EXACT_ARGS", opnames(f))
+        self.assertEqual(f(2), 3)
