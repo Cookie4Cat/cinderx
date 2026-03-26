@@ -31,13 +31,18 @@ class BenchmarkHarnessTests(unittest.TestCase):
         ).read_text(encoding="utf-8")
         self.assertIn("python3 -m pyperformance run", script_text)
         self.assertIn('-o "$OUTPUT_FILE"', script_text)
-        self.assertIn('CINDERX_WORKER_PYTHONJITAUTO="$AUTOJIT"', script_text)
-        self.assertIn("PYTHONPATH=\"$PYPERF_HOOK_ROOT_RESOLVED", script_text)
+        self.assertIn('PYTHONJIT="${PYTHONJIT:-1}"', script_text)
+        self.assertIn('PYTHONJITAUTO="$AUTOJIT"', script_text)
+        self.assertIn('DIAG=${DIAG:-0}', script_text)
+        self.assertIn('JIT_LOG_FILE=${JIT_LOG_FILE:-/tmp/cinderx-jit.log}', script_text)
         self.assertIn('LD_LIBRARY_PATH="${LD_LIBRARY_PATH:-}"', script_text)
         self.assertIn(
-            "--inherit-environ PYTHONPATH,LD_LIBRARY_PATH,PYTHONJITDISABLE,CINDERX_WORKER_PYTHONJITAUTO,PYTHONJITHUGEPAGES",
+            'base = ["LD_LIBRARY_PATH", "PYTHONJIT", "PYTHONJITAUTO", "PYTHONJITHUGEPAGES"]',
             script_text,
         )
+        self.assertIn('diag = ["PYTHONJITLOGFILE", "PYTHONJITDUMPFINALHIR", "PYTHONJITDUMPSTATS"]', script_text)
+        self.assertNotIn("CINDERX_WORKER_PYTHONJITAUTO", script_text)
+        self.assertNotIn("PYPERF_HOOK_ROOT_RESOLVED", script_text)
 
     def test_cinderx_script_disables_jit_during_install(self) -> None:
         script_text = (

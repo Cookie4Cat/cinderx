@@ -6,6 +6,8 @@ SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 BENCHMARK=${BENCHMARK:-mdp}
 WARMUP=${WARMUP:-3}
 AUTOJIT=${PYTHONJITAUTO:-10}
+DIAG=${DIAG:-0}
+JIT_LOG_FILE=${JIT_LOG_FILE:-/tmp/cinderx-jit.log}
 OPT_ENV_FILE=${OPT_ENV_FILE:-}
 OPT_CONFIG_NAME=${OPT_CONFIG_NAME:-}
 OUTPUT_FILE=${OUTPUT_FILE:-/tmp/pyperformance-cinderx.json}
@@ -17,6 +19,7 @@ echo "=== CinderX pyperformance ==="
 echo "Benchmark selector: $BENCHMARK"
 echo "Warmup: $WARMUP"
 echo "AutoJIT: $AUTOJIT"
+echo "Diag: $DIAG"
 echo "Output: $OUTPUT_FILE"
 
 export SCRIPT_DIR BENCHMARK OPT_ENV_FILE OPT_CONFIG_NAME AUTOJIT OUTPUT_FILE
@@ -31,7 +34,6 @@ from benchmark_harness import (
     load_opt_env_file,
     opt_config_name,
     pyperformance_benchmark_filter,
-    pyperformance_hook_root,
 )
 
 path = os.environ.get("OPT_ENV_FILE")
@@ -41,13 +43,15 @@ if not path:
 config_name = os.environ.get("OPT_CONFIG_NAME") or opt_config_name(path or None, True)
 env = load_opt_env_file(path or None)
 benchmark_filter = pyperformance_benchmark_filter(os.environ["BENCHMARK"])
-hook_root = pyperformance_hook_root()
+jit_arm_keys = ",".join(
+    key for key in sorted(os.environ) if key.startswith("PYTHONJIT_ARM_")
+)
 
 print(f'export BENCHMARK_FILTER="{benchmark_filter}"')
-print(f'export PYPERF_HOOK_ROOT_RESOLVED="{hook_root}"')
 print(f'export CINDERX_SOURCE_ROOT_RESOLVED="{cinderx_source_root()}"')
 print(f'export OPT_ENV_FILE_RESOLVED="{path}"')
 print(f'export OPT_CONFIG_NAME_RESOLVED="{config_name}"')
+print(f'export JIT_ARM_INHERIT_KEYS="{jit_arm_keys}"')
 for key, value in env.items():
     print(f'export {key}="{value}"')
 PY
@@ -65,10 +69,15 @@ PYTHONJITDISABLE=1 python3 -m pip install --quiet "$PYPERFORMANCE_TMP" 2>&1 | gr
 
 env \
   LD_LIBRARY_PATH="${LD_LIBRARY_PATH:-}" \
-  PYTHONJITDISABLE=1 \
-  CINDERX_WORKER_PYTHONJITAUTO="$AUTOJIT" \
+  PYTHONJIT="${PYTHONJIT:-1}" \
+  PYTHONJITAUTO="$AUTOJIT" \
   PYTHONJITHUGEPAGES=0 \
-  PYTHONPATH="$PYPERF_HOOK_ROOT_RESOLVED${PYTHONPATH:+:$PYTHONPATH}" \
+  $(if [[ "$DIAG" != "0" ]]; then
+      printf '%s\n' \
+        "PYTHONJITLOGFILE=$JIT_LOG_FILE" \
+        "PYTHONJITDUMPFINALHIR=1" \
+        "PYTHONJITDUMPSTATS=1"
+    fi) \
   $(python3 <<'PY'
 import os
 
@@ -81,7 +90,17 @@ PY
     --debug-single-value \
     --warmups "$WARMUP" \
     -b "$BENCHMARK_FILTER" \
-    --inherit-environ PYTHONPATH,LD_LIBRARY_PATH,PYTHONJITDISABLE,CINDERX_WORKER_PYTHONJITAUTO,PYTHONJITHUGEPAGES \
+    --inherit-environ "$(python3 <<'PY'
+import os
+
+base = ["LD_LIBRARY_PATH", "PYTHONJIT", "PYTHONJITAUTO", "PYTHONJITHUGEPAGES"]
+diag = ["PYTHONJITLOGFILE", "PYTHONJITDUMPFINALHIR", "PYTHONJITDUMPSTATS"]
+extra = [key for key in os.environ.get("JIT_ARM_INHERIT_KEYS", "").split(",") if key]
+if os.environ.get("DIAG", "0") != "0":
+    base.extend(diag)
+print(",".join(base + extra))
+PY
+)" \
     -o "$OUTPUT_FILE"
 
 python3 <<'PY'
