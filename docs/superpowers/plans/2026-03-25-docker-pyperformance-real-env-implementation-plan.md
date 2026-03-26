@@ -326,3 +326,11 @@ git commit -m "docs: document docker pyperformance validation workflow"
 ```
 
 Plan complete and saved to `docs/superpowers/plans/2026-03-25-docker-pyperformance-real-env-implementation-plan.md`. Ready to execute?
+
+## 后续代办
+
+- 方案 B：为 CinderX wheel cache 增加自动失效策略。
+- 候选方向：
+  - 基于 `/cinderx` 工作树的 commit hash 或源码摘要命名 wheel。
+  - 运行脚本在复用前校验 cache 是否与当前源码一致，不一致时提示重新执行 setup。
+  - setup 阶段生成 manifest，记录源码版本、Python 版本和构建参数，供运行脚本校验。
