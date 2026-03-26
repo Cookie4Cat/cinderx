@@ -55,18 +55,34 @@ docker compose -p cinderx-exp up -d
 docker compose -p cinderx-exp exec cinderx-arm64 /scripts/setup.sh
 ```
 
-### 4. 跑单个 benchmark
+### 4. 先做功能诊断，再做性能测试
+
+这是当前必须遵守的约束：
+
+1. 先开启 HIR dump，确认 benchmark 在当前 Docker 环境下功能正常
+2. 再关闭 HIR dump，重新跑性能测试
+
+不要直接拿开启 dump 的结果当性能数据。
+
+功能诊断示例：
 
 ```bash
 docker compose -p cinderx-exp exec cinderx-arm64 sh -lc \
-  'BENCHMARK=mdp WARMUP=3 PYTHONJITAUTO=10 /scripts/test-benchmark.sh'
+  'BENCHMARK=mdp WARMUP=3 PYTHONJITAUTO=2 DIAG=1 /scripts/test-benchmark.sh'
+```
+
+性能测试示例：
+
+```bash
+docker compose -p cinderx-exp exec cinderx-arm64 sh -lc \
+  'BENCHMARK=mdp WARMUP=3 PYTHONJITAUTO=2 /scripts/test-benchmark.sh'
 ```
 
 也可以跑别的配置，例如：
 
 ```bash
 docker compose -p cinderx-exp exec cinderx-arm64 sh -lc \
-  'BENCHMARK=regex_compile WARMUP=3 PYTHONJITAUTO=10 /scripts/test-benchmark.sh'
+  'BENCHMARK=regex_compile WARMUP=3 PYTHONJITAUTO=2 DIAG=1 /scripts/test-benchmark.sh'
 ```
 
 ## benchmark 选择方式
@@ -119,7 +135,11 @@ docker compose -p cinderx-exp exec cinderx-arm64 sh -lc \
 - `WARMUP`
   - 传给 `pyperformance run --warmups`
 - `PYTHONJITAUTO`
-  - 这里作为 worker AutoJIT 阈值使用
+  - 这里直接作为 CinderX AutoJIT 阈值使用，推荐先用 `2` 做功能诊断
+- `DIAG`
+  - 设为 `1` 时开启诊断模式
+- `JIT_LOG_FILE`
+  - 诊断模式下的 JIT 日志输出路径，默认 `/tmp/cinderx-jit.log`
 - `OPT_ENV_FILE`
   - 优化开关配置文件
 - `OPT_CONFIG_NAME`
@@ -166,8 +186,9 @@ docker compose -p cinderx-exp exec cinderx-arm64 sh -lc \
 ## 注意事项
 
 1. 这套容器现在已经比旧脚本更接近真实环境，但仍然不是服务器的完全复制品。
-2. 如果 benchmark 在这里失败而在真实环境通过，优先检查：
+2. 后续使用 Docker 进行功能测试时，必须先开 `DIAG=1` 确认 HIR dump 正常，再关闭 `DIAG` 跑性能。
+3. 如果 benchmark 在这里失败而在真实环境通过，优先检查：
    - 代理
    - pyperformance 源码挂载
-   - worker JIT hook 是否生效
-3. 如果要做正式对照，请优先使用 `docker/cpython-baseline/`。
+   - 真实环境与 Docker 是否都使用原生 `PYTHONJITAUTO`
+4. 如果要做正式对照，请优先使用 `docker/cpython-baseline/`。

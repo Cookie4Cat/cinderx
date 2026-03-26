@@ -68,11 +68,25 @@ docker compose exec cpython-baseline sh -lc \
   'BENCHMARK=mdp WARMUP=3 /scripts/test-baseline.sh'
 ```
 
-### 4. 跑 CinderX
+### 4. 先做功能诊断，再跑 CinderX 性能
+
+这是当前必须遵守的约束：
+
+1. 先开启 HIR dump，确认 benchmark 在当前 Docker 环境下功能正常
+2. 再关闭 HIR dump，重新跑性能测试
+
+功能诊断示例：
 
 ```bash
 docker compose exec cpython-baseline sh -lc \
-  'BENCHMARK=mdp WARMUP=3 PYTHONJITAUTO=10 /scripts/test-cinderx.sh'
+  'BENCHMARK=mdp WARMUP=3 PYTHONJITAUTO=2 DIAG=1 /scripts/test-cinderx.sh'
+```
+
+性能测试示例：
+
+```bash
+docker compose exec cpython-baseline sh -lc \
+  'BENCHMARK=mdp WARMUP=3 PYTHONJITAUTO=2 /scripts/test-cinderx.sh'
 ```
 
 ### 5. 跑正式对比
@@ -129,7 +143,11 @@ docker compose exec cpython-baseline sh -lc \
 - `WARMUP`
   - 对应 `pyperformance run --warmups`
 - `PYTHONJITAUTO`
-  - CinderX worker 的 AutoJIT 阈值
+  - CinderX AutoJIT 阈值，当前推荐先用 `2` 做功能诊断
+- `DIAG`
+  - 设为 `1` 时开启诊断模式
+- `JIT_LOG_FILE`
+  - 诊断模式下的 JIT 日志输出路径，默认 `/tmp/cinderx-jit.log`
 - `OPT_ENV_FILE`
   - 优化开关配置文件
 - `OPT_CONFIG_NAME`
@@ -174,7 +192,7 @@ docker compose exec cpython-baseline sh -lc \
 
 1. 这套环境比旧版 direct-bench 脚本更贴近真实环境，但仍然可能和真实服务器存在系统差异。
 2. `dask` 一类 benchmark 可能仍受网络/环境因素影响，不应和 JIT correctness 混为一谈。
-3. 如果出现 CinderX worker 没启 JIT，优先检查：
-   - `/pyperf_env_hook` 是否挂载成功
-   - `PYTHONPATH` 是否正确传给 worker
-   - `PYTHONJITAUTO` / `PYTHONJITDISABLE` 是否符合预期
+3. 后续使用 Docker 做功能测试时，必须先开 `DIAG=1` 验证 HIR dump，再关闭 `DIAG` 跑性能。
+4. 如果出现 CinderX JIT 行为异常，优先检查：
+   - `PYTHONJITAUTO` 是否与真实环境一致
+   - `PYTHONJITLOGFILE` / `PYTHONJITDUMPFINALHIR` 是否已在诊断模式打开

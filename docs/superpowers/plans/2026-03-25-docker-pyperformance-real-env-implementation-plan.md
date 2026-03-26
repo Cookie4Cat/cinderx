@@ -330,6 +330,10 @@ Plan complete and saved to `docs/superpowers/plans/2026-03-25-docker-pyperforman
 ## 后续代办
 
 - 方案 B：为 CinderX wheel cache 增加自动失效策略。
+- Docker 功能测试流程约束：
+  - 必须先开启 HIR dump 确认功能正常。
+  - 再关闭 HIR dump 跑正式性能测试。
+  - 不允许直接使用开启 dump 的结果做性能比较。
 - 候选方向：
   - 基于 `/cinderx` 工作树的 commit hash 或源码摘要命名 wheel。
   - 运行脚本在复用前校验 cache 是否与当前源码一致，不一致时提示重新执行 setup。
