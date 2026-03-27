@@ -8,6 +8,10 @@
 
 #if PY_VERSION_HEX >= 0x030C0000
 #include "internal/pycore_intrinsics.h"
+#if PY_VERSION_HEX >= 0x030E0000
+#include "internal/pycore_list.h"
+#include "internal/pycore_tuple.h"
+#endif
 #include "internal/pycore_long.h"
 #include "internal/pycore_runtime.h"
 #endif
@@ -2039,7 +2043,7 @@ void HIRBuilder::translate(
           break;
         }
         case FOR_ITER: {
-          emitForIter(tc, bc_instr);
+          emitForIter(irfunc.cfg, tc, bc_instr);
           break;
         }
         case LOAD_FIELD: {
@@ -5924,6 +5928,7 @@ void HIRBuilder::emitGetIter(TranslationContext& tc) {
 }
 
 void HIRBuilder::emitForIter(
+    CFG& cfg,
     TranslationContext& tc,
     const jit::BytecodeInstruction& bc_instr) {
   Register* iterator;
@@ -5933,33 +5938,118 @@ void HIRBuilder::emitForIter(
     iterator = tc.frame.stack.top();
   }
 
+  BasicBlock* footer = getBlockAtOff(bc_instr.getJumpTarget());
+  BasicBlock* body = getBlockAtOff(bc_instr.nextInstrOffset());
+
+#if PY_VERSION_HEX >= 0x030E0000
   if (getConfig().specialized_opcodes) {
+    auto emit_fast_for_iter = [&](
+                                  Type iter_type,
+                                  Type seq_type,
+                                  const char* seq_name,
+                                  std::size_t seq_offset,
+                                  const char* index_name,
+                                  std::size_t index_offset,
+                                  bool tuple_backing_array) {
+      tc.emit<GuardType>(iterator, iter_type, iterator, tc.frame);
+
+      Register* next_val = temps_.AllocateStack();
+      BasicBlock* maybe_in_bounds = cfg.AllocateBlock();
+      BasicBlock* fast_body = cfg.AllocateBlock();
+      BasicBlock* slow_path = cfg.AllocateBlock();
+      BasicBlock* merge_path = cfg.AllocateBlock();
+
+      Register* seq = temps_.AllocateStack();
+      tc.emit<LoadField>(seq, iterator, seq_name, seq_offset, TOptObject);
+      Register* null_obj = temps_.AllocateStack();
+      tc.emit<LoadConst>(null_obj, TNullptr);
+      Register* has_seq = temps_.AllocateStack();
+      tc.emit<PrimitiveCompare>(
+          has_seq, PrimitiveCompareOp::kNotEqual, seq, null_obj);
+      tc.emit<CondBranch>(has_seq, maybe_in_bounds, slow_path);
+
+      tc.block = maybe_in_bounds;
+      tc.emit<RefineType>(seq, seq_type, seq);
+
+      Register* idx = temps_.AllocateStack();
+      tc.emit<LoadField>(idx, iterator, index_name, index_offset, TCInt64);
+      Register* seq_size = temps_.AllocateStack();
+      tc.emit<LoadVarObjectSize>(seq_size, seq);
+      Register* in_bounds = temps_.AllocateStack();
+      tc.emit<PrimitiveCompare>(
+          in_bounds, PrimitiveCompareOp::kLessThanUnsigned, idx, seq_size);
+      tc.emit<CondBranch>(in_bounds, fast_body, slow_path);
+
+      tc.block = fast_body;
+      Register* data = temps_.AllocateStack();
+      if (tuple_backing_array) {
+        Register* data_offset = temps_.AllocateStack();
+        tc.emit<LoadConst>(
+            data_offset,
+            Type::fromCInt(offsetof(PyTupleObject, ob_item), TCInt64));
+        tc.emit<LoadFieldAddress>(data, seq, data_offset);
+      } else {
+        tc.emit<LoadField>(
+            data, seq, "ob_item", offsetof(PyListObject, ob_item), TCPtr);
+      }
+      Register* fast_item = temps_.AllocateStack();
+      tc.emit<LoadArrayItem>(fast_item, data, idx, seq, 0, TObject);
+      Register* one = temps_.AllocateStack();
+      tc.emit<LoadConst>(one, Type::fromCInt(1, TCInt64));
+      Register* next_idx = temps_.AllocateStack();
+      tc.emit<IntBinaryOp>(next_idx, BinaryOpKind::kAdd, idx, one);
+      Register* previous = temps_.AllocateStack();
+      tc.emit<LoadConst>(previous, TNullptr);
+      tc.emit<StoreField>(
+          iterator, index_name, index_offset, next_idx, TCInt64, previous);
+      tc.emit<Assign>(next_val, fast_item);
+      tc.emit<Branch>(merge_path);
+
+      tc.block = slow_path;
+      Register* slow_next = temps_.AllocateStack();
+      tc.emit<InvokeIterNext>(slow_next, iterator, tc.frame);
+      tc.emit<Assign>(next_val, slow_next);
+      tc.emit<Branch>(merge_path);
+
+      tc.block = merge_path;
+      tc.frame.stack.push(next_val);
+      tc.emit<CondBranchIterNotDone>(next_val, body, footer);
+    };
+
     switch (bc_instr.specializedOpcode()) {
 #ifdef FOR_ITER_LIST
       case FOR_ITER_LIST:
-        tc.emit<GuardType>(
-            iterator, Type::fromTypeExact(&PyListIter_Type), iterator, tc.frame);
-        break;
+        emit_fast_for_iter(
+            Type::fromTypeExact(&PyListIter_Type),
+            TListExact,
+            "it_seq",
+            offsetof(_PyListIterObject, it_seq),
+            "it_index",
+            offsetof(_PyListIterObject, it_index),
+            /*tuple_backing_array=*/false);
+        return;
 #endif
 #ifdef FOR_ITER_TUPLE
       case FOR_ITER_TUPLE:
-        tc.emit<GuardType>(
-            iterator,
+        emit_fast_for_iter(
             Type::fromTypeExact(&PyTupleIter_Type),
-            iterator,
-            tc.frame);
-        break;
+            TTupleExact,
+            "it_seq",
+            offsetof(_PyTupleIterObject, it_seq),
+            "it_index",
+            offsetof(_PyTupleIterObject, it_index),
+            /*tuple_backing_array=*/true);
+        return;
 #endif
       default:
         break;
     }
   }
+#endif
 
   Register* next_val = temps_.AllocateStack();
   tc.emit<InvokeIterNext>(next_val, iterator, tc.frame);
   tc.frame.stack.push(next_val);
-  BasicBlock* footer = getBlockAtOff(bc_instr.getJumpTarget());
-  BasicBlock* body = getBlockAtOff(bc_instr.nextInstrOffset());
   tc.emit<CondBranchIterNotDone>(next_val, body, footer);
 }
 

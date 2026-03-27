@@ -326,6 +326,7 @@ class HIRBuilder {
       const jit::BytecodeInstruction& bc_instr);
   void emitListToTuple(TranslationContext& tc);
   void emitForIter(
+      CFG& cfg,
       TranslationContext& tc,
       const jit::BytecodeInstruction& bc_instr);
   void emitInvokeMethodVectorCall(
