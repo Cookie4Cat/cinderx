@@ -98,6 +98,18 @@ int BytecodeInstruction::specializedOpcode() const {
     case CALL_METHOD_DESCRIPTOR_FAST_WITH_KEYWORDS:
     case CALL_METHOD_DESCRIPTOR_NOARGS:
     case CALL_METHOD_DESCRIPTOR_O:
+#ifdef FOR_ITER_GEN
+    case FOR_ITER_GEN:
+#endif
+#ifdef FOR_ITER_LIST
+    case FOR_ITER_LIST:
+#endif
+#ifdef FOR_ITER_RANGE
+    case FOR_ITER_RANGE:
+#endif
+#ifdef FOR_ITER_TUPLE
+    case FOR_ITER_TUPLE:
+#endif
     case LOAD_ATTR_INSTANCE_VALUE:
     case LOAD_ATTR_METHOD_WITH_VALUES:
     case LOAD_ATTR_SLOT:

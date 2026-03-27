@@ -2947,8 +2947,17 @@ LIRGenerator::TranslatedBlock LIRGenerator::TranslateOneBasicBlock(
       }
       case Opcode::kInvokeIterNext: {
         auto instr = static_cast<const InvokeIterNext*>(&i);
+        auto* helper = JITRT_InvokeIterNext;
+#if PY_VERSION_HEX >= 0x030E0000
+        if (auto* runtime_type = instr->GetOperand(0)->type().runtimePyType();
+            runtime_type == &PyListIter_Type) {
+          helper = JITRT_InvokeListIterNext;
+        } else if (runtime_type == &PyTupleIter_Type) {
+          helper = JITRT_InvokeTupleIterNext;
+        }
+#endif
         bbb.appendCallInstruction(
-            instr->output(), JITRT_InvokeIterNext, instr->GetOperand(0));
+            instr->output(), helper, instr->GetOperand(0));
         break;
       }
       case Opcode::kLoadEvalBreaker: {

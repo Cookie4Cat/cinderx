@@ -5932,6 +5932,29 @@ void HIRBuilder::emitForIter(
   } else {
     iterator = tc.frame.stack.top();
   }
+
+  if (getConfig().specialized_opcodes) {
+    switch (bc_instr.specializedOpcode()) {
+#ifdef FOR_ITER_LIST
+      case FOR_ITER_LIST:
+        tc.emit<GuardType>(
+            iterator, Type::fromTypeExact(&PyListIter_Type), iterator, tc.frame);
+        break;
+#endif
+#ifdef FOR_ITER_TUPLE
+      case FOR_ITER_TUPLE:
+        tc.emit<GuardType>(
+            iterator,
+            Type::fromTypeExact(&PyTupleIter_Type),
+            iterator,
+            tc.frame);
+        break;
+#endif
+      default:
+        break;
+    }
+  }
+
   Register* next_val = temps_.AllocateStack();
   tc.emit<InvokeIterNext>(next_val, iterator, tc.frame);
   tc.frame.stack.push(next_val);

@@ -698,3 +698,10 @@ extern PyObject JITRT_IterDoneSentinel;
  * Returns the next value, or JITRT_IterDoneSentinel if the iterator is done.
  */
 PyObject* JITRT_InvokeIterNext(PyObject* iterator);
+
+/*
+ * Specialized __next__ helpers for exact list/tuple iterators.
+ * Returns the next value, or JITRT_IterDoneSentinel if the iterator is done.
+ */
+PyObject* JITRT_InvokeListIterNext(PyObject* iterator);
+PyObject* JITRT_InvokeTupleIterNext(PyObject* iterator);

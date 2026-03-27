@@ -25,7 +25,9 @@
 #include "cinderx/UpstreamBorrow/borrowed.h"
 
 #if PY_VERSION_HEX >= 0x030E0000
+#include "internal/pycore_list.h"
 #include "internal/pycore_stackref.h"
+#include "internal/pycore_tuple.h"
 #include "internal/pycore_unicodeobject.h"
 #endif
 
@@ -2560,4 +2562,49 @@ PyObject* JITRT_InvokeIterNext(PyObject* iterator) {
   }
   Py_INCREF(&JITRT_IterDoneSentinel);
   return &JITRT_IterDoneSentinel;
+}
+
+PyObject* JITRT_InvokeListIterNext(PyObject* iterator) {
+#if PY_VERSION_HEX >= 0x030E0000 && !defined(Py_GIL_DISABLED)
+  JIT_DCHECK(
+      Py_TYPE(iterator) == &PyListIter_Type,
+      "JITRT_InvokeListIterNext called with wrong iterator type");
+  auto* it = reinterpret_cast<_PyListIterObject*>(iterator);
+  PyListObject* seq = it->it_seq;
+  if (seq == nullptr ||
+      static_cast<size_t>(it->it_index) >= static_cast<size_t>(PyList_GET_SIZE(seq))) {
+    it->it_index = -1;
+    if (seq != nullptr) {
+      it->it_seq = nullptr;
+      Py_DECREF(seq);
+    }
+    Py_INCREF(&JITRT_IterDoneSentinel);
+    return &JITRT_IterDoneSentinel;
+  }
+  return Py_NewRef(PyList_GET_ITEM(seq, it->it_index++));
+#else
+  return JITRT_InvokeIterNext(iterator);
+#endif
+}
+
+PyObject* JITRT_InvokeTupleIterNext(PyObject* iterator) {
+#if PY_VERSION_HEX >= 0x030E0000 && !defined(Py_GIL_DISABLED)
+  JIT_DCHECK(
+      Py_TYPE(iterator) == &PyTupleIter_Type,
+      "JITRT_InvokeTupleIterNext called with wrong iterator type");
+  auto* it = reinterpret_cast<_PyTupleIterObject*>(iterator);
+  PyTupleObject* seq = it->it_seq;
+  if (seq == nullptr ||
+      static_cast<size_t>(it->it_index) >= static_cast<size_t>(PyTuple_GET_SIZE(seq))) {
+    if (seq != nullptr) {
+      it->it_seq = nullptr;
+      Py_DECREF(seq);
+    }
+    Py_INCREF(&JITRT_IterDoneSentinel);
+    return &JITRT_IterDoneSentinel;
+  }
+  return Py_NewRef(PyTuple_GET_ITEM(seq, it->it_index++));
+#else
+  return JITRT_InvokeIterNext(iterator);
+#endif
 }
