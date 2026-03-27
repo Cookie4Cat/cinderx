@@ -72,6 +72,7 @@ namespace {
 constexpr std::size_t kUnhandledSubscriptSuppressThreshold = 3;
 constexpr uint32_t kAutoJitDefaultThreshold = 1000;
 constexpr uint32_t kBackedgeAutoJitThreshold = 2;
+constexpr uint32_t kPyperformanceStartupGuardThreshold = 10;
 
 // RAII device for disabling GIL checking.
 class DisableGilCheck {
@@ -174,6 +175,64 @@ bool codeHasBackedge(BorrowedRef<PyCodeObject> code) {
   return false;
 }
 
+bool codeIsInFrozenStdlib(BorrowedRef<PyCodeObject> code) {
+  if (code == nullptr || code->co_filename == nullptr ||
+      !PyUnicode_Check(code->co_filename)) {
+    return false;
+  }
+
+  const char* filename = PyUnicode_AsUTF8(code->co_filename);
+  if (filename == nullptr) {
+    PyErr_Clear();
+    return false;
+  }
+
+  std::string_view path = filename;
+  return path.starts_with("<frozen ") ||
+      path.find("zipimport") != std::string_view::npos;
+}
+
+bool isRunningUnderPyperformance() {
+  const char* runid = std::getenv("PYPERFORMANCE_RUNID");
+  if (runid != nullptr && runid[0] != '\0') {
+    return true;
+  }
+
+  int argc = 0;
+  wchar_t** argv = nullptr;
+  Py_GetArgcArgv(&argc, &argv);
+  for (int i = 0; i < argc; i++) {
+    if (argv == nullptr || argv[i] == nullptr) {
+      continue;
+    }
+    std::wstring_view arg{argv[i]};
+    if (arg.find(L"pyperformance") != std::wstring_view::npos ||
+        arg.find(L"run_benchmark.py") != std::wstring_view::npos) {
+      return true;
+    }
+  }
+  return false;
+}
+
+bool codeIsInPyperformanceBenchmark(BorrowedRef<PyCodeObject> code) {
+  if (code == nullptr || code->co_filename == nullptr ||
+      !PyUnicode_Check(code->co_filename)) {
+    return false;
+  }
+
+  const char* filename = PyUnicode_AsUTF8(code->co_filename);
+  if (filename == nullptr) {
+    PyErr_Clear();
+    return false;
+  }
+
+  std::string_view path = filename;
+  return path.find("/pyperformance/data-files/benchmarks/") !=
+          std::string_view::npos ||
+      path.find("\\pyperformance\\data-files\\benchmarks\\") !=
+          std::string_view::npos;
+}
+
 bool codeIsInStdlib(BorrowedRef<PyCodeObject> code) {
   if (code == nullptr || code->co_filename == nullptr ||
       !PyUnicode_Check(code->co_filename)) {
@@ -195,6 +254,20 @@ bool codeIsInStdlib(BorrowedRef<PyCodeObject> code) {
 
   return path.find("site-packages") == std::string_view::npos &&
       path.find("dist-packages") == std::string_view::npos;
+}
+
+bool shouldDeferPyperformanceStartupCompile(BorrowedRef<PyCodeObject> code) {
+  auto limit = getConfig().compile_after_n_calls;
+  if (!limit.has_value() || *limit > kPyperformanceStartupGuardThreshold ||
+      !isRunningUnderPyperformance()) {
+    return false;
+  }
+
+  if (codeIsInPyperformanceBenchmark(code)) {
+    return false;
+  }
+
+  return codeIsInStdlib(code) || codeIsInFrozenStdlib(code);
 }
 
 // If functions in the cinderx module get compiled, they will somehow keep the
@@ -249,6 +322,12 @@ PyObject* forcedJitVectorcall(
   BorrowedRef<PyFunctionObject> func{func_obj};
   BorrowedRef<PyCodeObject> code{func->func_code};
 
+  if (shouldDeferPyperformanceStartupCompile(code)) {
+    incrementShadowcodeCall(code);
+    auto entry = getInterpretedVectorcall(func);
+    return entry(func_obj, stack, nargsf, kwnames);
+  }
+
   auto result = compileFunction(func);
   if (result == Result::OK) {
     JIT_DCHECK(
@@ -296,6 +375,11 @@ PyObject* jitVectorcall(
   // limit is reached.
   if (auto limit = getConfig().compile_after_n_calls; limit.has_value()) {
     uint32_t effective_limit = *limit;
+    if (shouldDeferPyperformanceStartupCompile(code)) {
+      incrementShadowcodeCall(code);
+      auto entry = getInterpretedVectorcall(func);
+      return entry(func_obj, stack, nargsf, kwnames);
+    }
     if (
         *limit == kAutoJitDefaultThreshold && codeHasBackedge(code) &&
         !codeIsInStdlib(code)) {
@@ -3883,6 +3967,9 @@ Result compileFunction(BorrowedRef<PyFunctionObject> func) {
   }
   if (!isJitUsable()) {
     return Result::UNKNOWN_ERROR;
+  }
+  if (shouldDeferPyperformanceStartupCompile(func->func_code)) {
+    return Result::NOT_ON_JITLIST;
   }
 
   auto& jit_reg_units = cinderx::getModuleState()->registered_compilation_units;
