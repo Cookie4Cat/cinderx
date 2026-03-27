@@ -50,6 +50,8 @@
 #include <fmt/format.h>
 
 #include <algorithm>
+#include <cstdio>
+#include <cstdlib>
 #include <cstdint>
 #include <iostream>
 #include <iterator>
@@ -65,6 +67,34 @@ using namespace jit::util;
 namespace jit::codegen {
 
 namespace {
+
+extern "C" void debugAarch64GeneratorDeoptState(
+    uint64_t phase,
+    uint64_t meta_base,
+    uint64_t frame_pointer,
+    uint64_t deopt_idx,
+    uint64_t saved_pc) {
+#if defined(CINDER_AARCH64)
+  if (std::getenv("CINDERX_AARCH64_DEOPT_TRACE") == nullptr) {
+    return;
+  }
+  std::fprintf(
+      stderr,
+      "CINDERX_AARCH64_DEOPT_TRACE phase=%llu x14=0x%llx x29=0x%llx x2=0x%llx x3=0x%llx\n",
+      static_cast<unsigned long long>(phase),
+      static_cast<unsigned long long>(meta_base),
+      static_cast<unsigned long long>(frame_pointer),
+      static_cast<unsigned long long>(deopt_idx),
+      static_cast<unsigned long long>(saved_pc));
+  std::fflush(stderr);
+#else
+  (void)phase;
+  (void)meta_base;
+  (void)frame_pointer;
+  (void)deopt_idx;
+  (void)saved_pc;
+#endif
+}
 
 uint64_t getAarch64HotCallTarget(const Instruction& instr) {
 #if defined(CINDER_AARCH64)
@@ -169,6 +199,15 @@ _PyInterpreterFrame* reifyLightweightFrames(
     const DeoptMetadata& deopt_meta,
     size_t depth,
     _PyInterpreterFrame* cur_frame) {
+  if (cur_frame == nullptr) {
+    return nullptr;
+  }
+  // Temporary safety rail: corrupted deopt metadata can report absurd inline
+  // depths and recurse off the frame chain.
+  if (depth > 1024) {
+    JIT_LOG("deopt inline_depth {} too large, clamping to 0", depth);
+    depth = 0;
+  }
   _PyInterpreterFrame* prev = nullptr;
   if (depth > 0) {
     prev = reifyLightweightFrames(
@@ -200,7 +239,72 @@ CiPyFrameObjType* prepareForDeopt(
     CodeRuntime* code_runtime,
     std::size_t deopt_idx) {
   JIT_CHECK(deopt_idx != -1ull, "deopt_idx must be valid");
-  const DeoptMetadata& deopt_meta = code_runtime->getDeoptMetadata(deopt_idx);
+  auto const& deopt_metas = code_runtime->deoptMetadatas();
+  JIT_CHECK(!deopt_metas.empty(), "CodeRuntime has no deopt metadata");
+  void* ret_addr = __builtin_return_address(0);
+  if (std::getenv("CINDERX_DEOPT_TRACE_ENTRY") != nullptr) {
+    JIT_LOG(
+        "deopt entry runtime={} idx={} size={} regs={} ret={}",
+        fmt::ptr(code_runtime),
+        deopt_idx,
+        deopt_metas.size(),
+        fmt::ptr(regs),
+        fmt::ptr(ret_addr));
+  }
+  if (deopt_idx >= deopt_metas.size()) {
+#if defined(CINDER_AARCH64)
+    // Temporary safety rail for AArch64: in some generator deopt paths we have
+    // observed the incoming index register pick up a return-like pointer while
+    // an adjacent stage1 slot still carries a valid small deopt index.
+    //
+    // Stack layout at trampoline entry (meta_base == regs + 0x200) includes
+    // stage1 slots around offsets 6/7 * ptr size. Try those as recovery
+    // candidates before falling back to the last metadata entry.
+    constexpr std::size_t kSavedRegsSize = 0x200;
+    constexpr std::size_t kStage1Slot6 = 6;
+    constexpr std::size_t kStage1Slot7 = 7;
+    const auto* meta_base = reinterpret_cast<const std::uint64_t*>(
+        reinterpret_cast<const char*>(regs) + kSavedRegsSize);
+    std::size_t recovered_idx = static_cast<std::size_t>(-1);
+    const std::size_t candidate7 = static_cast<std::size_t>(meta_base[kStage1Slot7]);
+    const std::size_t candidate6 = static_cast<std::size_t>(meta_base[kStage1Slot6]);
+    if (candidate7 < deopt_metas.size()) {
+      recovered_idx = candidate7;
+    } else if (candidate6 < deopt_metas.size()) {
+      recovered_idx = candidate6;
+    }
+    if (recovered_idx != static_cast<std::size_t>(-1)) {
+      JIT_LOG(
+          "deopt_idx {} out of range (size {}), recovered from stage1 slot as {}, runtime={} regs={} ret={}",
+          deopt_idx,
+          deopt_metas.size(),
+          recovered_idx,
+          fmt::ptr(code_runtime),
+          fmt::ptr(regs),
+          fmt::ptr(ret_addr));
+      deopt_idx = recovered_idx;
+    } else {
+      JIT_LOG(
+          "deopt_idx {} out of range (size {}), clamping, runtime={} regs={} ret={}",
+          deopt_idx,
+          deopt_metas.size(),
+          fmt::ptr(code_runtime),
+          fmt::ptr(regs),
+          fmt::ptr(ret_addr));
+      deopt_idx = deopt_metas.size() - 1;
+    }
+#else
+    JIT_LOG(
+        "deopt_idx {} out of range (size {}), clamping, runtime={} regs={} ret={}",
+        deopt_idx,
+        deopt_metas.size(),
+        fmt::ptr(code_runtime),
+        fmt::ptr(regs),
+        fmt::ptr(ret_addr));
+    deopt_idx = deopt_metas.size() - 1;
+#endif
+  }
+  const DeoptMetadata& deopt_meta = deopt_metas[deopt_idx];
   PyThreadState* tstate = _PyThreadState_UncheckedGet();
 #if PY_VERSION_HEX < 0x030C0000
   Ref<PyFrameObject> f = materializePyFrameForDeopt(tstate);
@@ -301,8 +405,18 @@ PyObject* resumeInInterpreter(
   }
   PyThreadState* tstate = PyThreadState_Get();
   PyObject* result = nullptr;
+  auto const& deopt_metas = code_runtime->deoptMetadatas();
+  JIT_CHECK(!deopt_metas.empty(), "CodeRuntime has no deopt metadata");
+  if (deopt_idx >= deopt_metas.size()) {
+    JIT_LOG(
+        "resumeInInterpreter deopt_idx {} out of range (size {}), clamping, runtime={}",
+        deopt_idx,
+        deopt_metas.size(),
+        fmt::ptr(code_runtime));
+    deopt_idx = deopt_metas.size() - 1;
+  }
   // Resume all of the inlined frames and the caller
-  const DeoptMetadata& deopt_meta = code_runtime->getDeoptMetadata(deopt_idx);
+  const DeoptMetadata& deopt_meta = deopt_metas[deopt_idx];
   int inline_depth = deopt_meta.inline_depth();
   int err_occurred =
       (deopt_meta.reason != DeoptReason::kGuardFailure &&
@@ -356,8 +470,18 @@ PyObject* resumeInInterpreter(
   JIT_CHECK(code_runtime != nullptr, "CodeRuntime cannot be a nullptr");
 
   PyThreadState* tstate = PyThreadState_Get();
+  auto const& deopt_metas = code_runtime->deoptMetadatas();
+  JIT_CHECK(!deopt_metas.empty(), "CodeRuntime has no deopt metadata");
+  if (deopt_idx >= deopt_metas.size()) {
+    JIT_LOG(
+        "resumeInInterpreter deopt_idx {} out of range (size {}), clamping, runtime={}",
+        deopt_idx,
+        deopt_metas.size(),
+        fmt::ptr(code_runtime));
+    deopt_idx = deopt_metas.size() - 1;
+  }
 
-  const DeoptMetadata& deopt_meta = code_runtime->getDeoptMetadata(deopt_idx);
+  const DeoptMetadata& deopt_meta = deopt_metas[deopt_idx];
   int err_occurred = shouldResumeInterpreterInErrorHandler(deopt_meta.reason);
 
   PyObject* result = nullptr;
@@ -818,27 +942,61 @@ void* generateDeoptTrampoline(bool generator_mode) {
 
   annot_cursor = a.cursor();
 
+  auto saved_pc = a64::x3;
+  auto deopt_idx = a64::x2;
+
+  auto emit_aarch64_generator_trace = [&](uint64_t phase) {
+    a.sub(a64::sp, a64::sp, 128);
+    a.stp(a64::x0, a64::x1, a64::ptr(a64::sp, 0));
+    a.stp(a64::x2, a64::x3, a64::ptr(a64::sp, 16));
+    a.stp(a64::x4, a64::x5, a64::ptr(a64::sp, 32));
+    a.stp(a64::x6, a64::x7, a64::ptr(a64::sp, 48));
+    a.stp(a64::x8, a64::x9, a64::ptr(a64::sp, 64));
+    a.stp(a64::x14, a64::x15, a64::ptr(a64::sp, 80));
+
+    a.mov(a64::x5, meta_base);
+    a.mov(a64::x6, arch::fp);
+    a.mov(a64::x7, deopt_idx);
+    a.mov(a64::x8, saved_pc);
+    a.mov(a64::x0, phase);
+    a.mov(a64::x1, a64::x5);
+    a.mov(a64::x2, a64::x6);
+    a.mov(a64::x3, a64::x7);
+    a.mov(a64::x4, a64::x8);
+    a.mov(arch::reg_scratch_br, debugAarch64GeneratorDeoptState);
+    a.blr(arch::reg_scratch_br);
+
+    a.ldp(a64::x14, a64::x15, a64::ptr(a64::sp, 80));
+    a.ldp(a64::x8, a64::x9, a64::ptr(a64::sp, 64));
+    a.ldp(a64::x6, a64::x7, a64::ptr(a64::sp, 48));
+    a.ldp(a64::x4, a64::x5, a64::ptr(a64::sp, 32));
+    a.ldp(a64::x2, a64::x3, a64::ptr(a64::sp, 16));
+    a.ldp(a64::x0, a64::x1, a64::ptr(a64::sp, 0));
+    a.add(a64::sp, a64::sp, 128);
+  };
+
   // Setting up first argument to prepareForDeopt, the address of the saved
   // registers.
   a.mov(a64::x0, a64::sp);
 
-  auto saved_pc = a64::x3;
-  constexpr int stage1_saved_pc_offset = 6 * kPointerSize;
+  const int stage1_deopt_idx_offset =
+      generator_mode ? 7 * kPointerSize : 6 * kPointerSize;
+  const int stage1_saved_pc_offset =
+      generator_mode ? 6 * kPointerSize : 7 * kPointerSize;
+  a.ldr(deopt_idx, a64::ptr(meta_base, stage1_deopt_idx_offset));
   a.ldr(saved_pc, a64::ptr(meta_base, stage1_saved_pc_offset));
+  emit_aarch64_generator_trace(1);
 
   // Save the frame pointer and set up our frame.
-  a.str(arch::fp, a64::ptr(meta_base, stage1_saved_pc_offset));
-  a.add(arch::fp, meta_base, stage1_saved_pc_offset);
+  a.str(arch::fp, a64::ptr(meta_base, stage1_deopt_idx_offset));
+  a.add(arch::fp, meta_base, stage1_deopt_idx_offset);
+  emit_aarch64_generator_trace(2);
 
-  // Load the index of the deopt metadata, which resides where we're supposed to
-  // save the pc.
-  auto deopt_idx = a64::x2;
-  a.ldr(
-      deopt_idx,
-      arch::ptr_resolve(&a, arch::fp, kPointerSize, arch::reg_scratch_0));
+  // Save the pc to its canonical slot next to the saved frame pointer.
   a.str(
       saved_pc,
       arch::ptr_resolve(&a, arch::fp, kPointerSize, arch::reg_scratch_0));
+  emit_aarch64_generator_trace(3);
 
   // Save the deopt metadata index to the lower padding slot.
   auto deopt_idx_addr =
@@ -864,6 +1022,12 @@ void* generateDeoptTrampoline(bool generator_mode) {
           decltype(prepareForDeopt),
           CiPyFrameObjType*(const uint64_t*, CodeRuntime*, std::size_t)>,
       "prepareForDeopt has unexpected signature");
+  // Re-materialize arguments right before the call. Address resolution and
+  // scratch register usage above can clobber caller-arg registers.
+  a.mov(a64::x0, a64::sp);
+  a.ldr(code_rt, code_rt_addr);
+  a.ldr(deopt_idx, deopt_idx_addr);
+  emit_aarch64_generator_trace(4);
   a.mov(arch::reg_scratch_br, prepareForDeopt);
   a.blr(arch::reg_scratch_br);
 
