@@ -14,6 +14,7 @@ from cinderx.test_support import passIf
 
 
 TCallableRet = TypeVar("TCallableRet")
+_SPECIALIZATION_TEST_GLOBAL = 123
 
 
 _all_opnames: list[str] = dis.opname
@@ -214,6 +215,15 @@ class SpecializationTests(unittest.TestCase):
         self.assertNotIn("LOAD_ATTR", opnames(f))
         self.assertIn("LOAD_ATTR_MODULE", opnames(f))
         self.assertEqual(f(), sys.argv[0])
+
+    def test_load_global_module(self) -> None:
+        def f() -> int:
+            return _SPECIALIZATION_TEST_GLOBAL
+
+        specialize(f, f)
+
+        self.assertIn("LOAD_GLOBAL_MODULE", opnames(f))
+        self.assertEqual(f(), 123)
 
     def test_store_subscr_dict(self) -> None:
         def f(a: dict[str, str], b: str, c: str) -> None:

@@ -109,6 +109,7 @@ int BytecodeInstruction::specializedOpcode() const {
     case LOAD_ATTR_METHOD_WITH_VALUES:
     case LOAD_ATTR_SLOT:
     case LOAD_ATTR_MODULE:
+    case LOAD_GLOBAL_MODULE:
     case STORE_ATTR_INSTANCE_VALUE:
     case STORE_ATTR_SLOT:
     case STORE_SUBSCR_DICT:

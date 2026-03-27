@@ -5553,6 +5553,7 @@ void HIRBuilder::emitLoadGlobal(
     const jit::BytecodeInstruction& bc_instr) {
   int name_idx = loadGlobalIndex(bc_instr.oparg());
   Register* result = temps_.AllocateStack();
+  int spec_opcode = bc_instr.specializedOpcode();
 
   if constexpr (PY_VERSION_HEX >= 0x030B0000 && PY_VERSION_HEX < 0x030E0000) {
     if (bc_instr.oparg() & 1) {
@@ -5570,6 +5571,12 @@ void HIRBuilder::emitLoadGlobal(
     }
     tc.emit<LoadGlobalCached>(
         result, code_, preloader_.builtins(), preloader_.globals(), name_idx);
+    // CPython's LOAD_GLOBAL_MODULE specialization means the lookup is stable on
+    // module globals path. Keep this lowering lean and avoid an extra runtime
+    // guard on the loaded object itself.
+    if (spec_opcode == LOAD_GLOBAL_MODULE) {
+      return true;
+    }
     DeoptBase* guard = nullptr;
     if (auto guard_type = getLoadGlobalGuardType(value)) {
       guard = tc.emit<GuardType>(result, *guard_type, result, tc.frame);
