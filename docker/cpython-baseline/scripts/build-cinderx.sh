@@ -4,6 +4,15 @@ set -e
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 PROJECT_ROOT="$(cd "$SCRIPT_DIR/../../.." && pwd)"
+CPU_JOBS="$(getconf _NPROCESSORS_ONLN 2>/dev/null || nproc 2>/dev/null || echo 4)"
+MEM_JOBS="$(awk '/MemAvailable:/ {jobs = int($2 / 2097152); if (jobs < 1) jobs = 1; print jobs; exit}' /proc/meminfo 2>/dev/null || echo 1)"
+if (( MEM_JOBS < CPU_JOBS )); then
+  DEFAULT_BUILD_JOBS="$MEM_JOBS"
+else
+  DEFAULT_BUILD_JOBS="$CPU_JOBS"
+fi
+BUILD_JOBS="${CINDERX_BUILD_JOBS:-$DEFAULT_BUILD_JOBS}"
+PARALLEL_LEVEL="${CMAKE_BUILD_PARALLEL_LEVEL:-$BUILD_JOBS}"
 
 echo "=== Building CinderX ARM64 wheel ==="
 echo "Project root: $PROJECT_ROOT"
@@ -35,9 +44,9 @@ docker run --rm --platform linux/arm64 \
     pip install --quiet build 2>&1 | grep -v notice
 
     echo ""
-    echo "Building wheel (single-threaded to avoid OOM)..."
-    export CMAKE_BUILD_PARALLEL_LEVEL=1
-    export CINDERX_BUILD_JOBS=1
+    echo "Building wheel with '"$PARALLEL_LEVEL"' parallel jobs..."
+    export CMAKE_BUILD_PARALLEL_LEVEL='"$PARALLEL_LEVEL"'
+    export CINDERX_BUILD_JOBS='"$BUILD_JOBS"'
     python -m build --wheel 2>&1 | tail -5
 
     echo ""

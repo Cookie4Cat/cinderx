@@ -23,7 +23,7 @@ echo "Diag: $DIAG"
 echo "Output: $OUTPUT_FILE"
 
 export SCRIPT_DIR BENCHMARK OPT_ENV_FILE OPT_CONFIG_NAME AUTOJIT OUTPUT_FILE
-eval "$(python3 <<'PY'
+eval "$(PYTHONJITDISABLE=1 python3 <<'PY'
 import os
 import sys
 
@@ -78,7 +78,7 @@ env \
         "PYTHONJITDUMPFINALHIR=1" \
         "PYTHONJITDUMPSTATS=1"
     fi) \
-  $(python3 <<'PY'
+  $(PYTHONJITDISABLE=1 python3 <<'PY'
 import os
 
 for key, value in sorted(os.environ.items()):
@@ -90,7 +90,7 @@ PY
     --debug-single-value \
     --warmups "$WARMUP" \
     -b "$BENCHMARK_FILTER" \
-    --inherit-environ "$(python3 <<'PY'
+    --inherit-environ "$(PYTHONJITDISABLE=1 python3 <<'PY'
 import os
 
 base = ["LD_LIBRARY_PATH", "PYTHONJIT", "PYTHONJITAUTO", "PYTHONJITHUGEPAGES"]
@@ -103,7 +103,7 @@ PY
 )" \
     -o "$OUTPUT_FILE"
 
-python3 <<'PY'
+PYTHONJITDISABLE=1 python3 <<'PY'
 import os
 import pyperf
 
