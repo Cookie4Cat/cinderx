@@ -69,6 +69,22 @@ class TypeAnnotationTests(unittest.TestCase):
 
         self.assertEqual(f(42), 43)
 
+    def test_force_compile_without_annotations(self):
+        def f(x):
+            return x + 1
+
+        cinderx.jit.force_compile(f)
+
+        self.assertEqual(f(41), 42)
+
+    def test_force_compile_does_not_eagerly_evaluate_lazy_annotations(self):
+        def f(x: MissingType) -> int:
+            return x + 1
+
+        cinderx.jit.force_compile(f)
+
+        self.assertEqual(f(41), 42)
+
     def test_bad(self):
         def f(x: int) -> int:
             return x + 1
