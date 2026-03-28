@@ -263,8 +263,8 @@ CiPyFrameObjType* prepareForDeopt(
     constexpr std::size_t kSavedRegsSize = 0x200;
     constexpr std::size_t kStage1Slot6 = 6;
     constexpr std::size_t kStage1Slot7 = 7;
-    const auto* meta_base = reinterpret_cast<const std::uint64_t*>(
-        reinterpret_cast<const char*>(regs) + kSavedRegsSize);
+    auto* meta_base = const_cast<std::uint64_t*>(reinterpret_cast<const std::uint64_t*>(
+        reinterpret_cast<const char*>(regs) + kSavedRegsSize));
     std::size_t recovered_idx = static_cast<std::size_t>(-1);
     const std::size_t candidate7 = static_cast<std::size_t>(meta_base[kStage1Slot7]);
     const std::size_t candidate6 = static_cast<std::size_t>(meta_base[kStage1Slot6]);
@@ -274,6 +274,12 @@ CiPyFrameObjType* prepareForDeopt(
       recovered_idx = candidate6;
     }
     if (recovered_idx != static_cast<std::size_t>(-1)) {
+      // Keep stage2's follow-up resume call consistent with the recovered
+      // deopt index. On AArch64 this index is later reloaded from the
+      // meta_base+32 continuation slot into x2 before calling
+      // resumeInInterpreter().
+      constexpr std::size_t kResumeDeoptIdxSlot = 4; // meta_base + 32
+      meta_base[kResumeDeoptIdxSlot] = recovered_idx;
       JIT_LOG(
           "deopt_idx {} out of range (size {}), recovered from stage1 slot as {}, runtime={} regs={} ret={}",
           deopt_idx,
