@@ -74,6 +74,7 @@ struct ModuleState {
   // Original references to instrumentation functions that CinderX patches over.
   Ref<> orig_sys_monitoring_register_callback;
   Ref<> orig_sys_monitoring_free_tool_id;
+  Ref<> orig_sys_addaudithook;
   Ref<> orig_sys_setprofile;
   Ref<> orig_sys_settrace;
 

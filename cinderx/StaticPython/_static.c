@@ -1767,6 +1767,7 @@ static PyObject* install_sp_audit_hook(PyObject* mod) {
         PyExc_RuntimeError, "Could not install Static Python audit hook");
     return NULL;
   }
+  registerBuiltinIdIgnorableAuditHook(sp_audit_hook, kData);
   sp_audit_hook_installed = 1;
   Py_RETURN_NONE;
 }

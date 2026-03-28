@@ -1546,6 +1546,49 @@ PyObject* patched_sys_settrace(
   return result;
 }
 
+void invalidateCompiledFunctionsForAuditHooks() {
+  if (jitCtx() == nullptr) {
+    return;
+  }
+
+  std::vector<BorrowedRef<PyFunctionObject>> funcs;
+  for (BorrowedRef<PyFunctionObject> func : jitCtx()->compiledFuncs()) {
+    funcs.push_back(func);
+  }
+
+  size_t invalidated = 0;
+  for (BorrowedRef<PyFunctionObject> func : funcs) {
+    uncompile(func);
+    scheduleJitCompile(func);
+    invalidated++;
+  }
+
+  if (invalidated > 0) {
+    JIT_DLOG(
+        "Invalidated {} compiled functions after sys.addaudithook()",
+        invalidated);
+  }
+}
+
+PyObject* patched_sys_addaudithook(
+    PyObject* /* self */,
+    PyObject* const* args,
+    Py_ssize_t nargs) {
+  auto mod_state = cinderx::getModuleState();
+  BorrowedRef<> original = mod_state->orig_sys_addaudithook;
+  JIT_CHECK(
+      original != nullptr, "Expecting to have sys.addaudithook already saved");
+
+  PyObject* result =
+      PyObject_Vectorcall(original, args, nargs, nullptr /* kwnames */);
+  if (result == nullptr) {
+    return nullptr;
+  }
+
+  invalidateCompiledFunctionsForAuditHooks();
+  return result;
+}
+
 #endif // PY_VERSION_HEX >= 0x030C0000
 
 int compile_after_n_calls_impl(uint32_t calls) {
@@ -2747,6 +2790,9 @@ void patchSysSetProfileAndSetTrace(PyObject* cinderjit_module) {
   patchSysFunc("settrace", "patched_sys_settrace", [&](BorrowedRef<> func) {
     mod_state->orig_sys_settrace = Ref<>::create(func);
   });
+  patchSysFunc("addaudithook", "patched_sys_addaudithook", [&](BorrowedRef<> func) {
+    mod_state->orig_sys_addaudithook = Ref<>::create(func);
+  });
 
 #endif // PY_VERSION_HEX >= 0x030C0000
 }
@@ -2795,6 +2841,12 @@ void restoreSysSetProfileAndSetTrace() {
     }
   }
 
+  if (BorrowedRef<> original_addaudithook = mod_state->orig_sys_addaudithook) {
+    if (PySys_SetObject("addaudithook", original_addaudithook) < 0) {
+      PyErr_Clear();
+    }
+  }
+
 #endif // PY_VERSION_HEX >= 0x030C0000
 }
 
@@ -2836,6 +2888,12 @@ PyMethodDef jit_methods[] = {
      PyDoc_STR(
          "Patched version of sys.settrace that "
          "disables/enables the JIT when debuggers/profilers attach/detach.")},
+    {"patched_sys_addaudithook",
+     _PyCFunction_CAST(patched_sys_addaudithook),
+     METH_FASTCALL,
+     PyDoc_STR(
+         "Patched version of sys.addaudithook that invalidates compiled "
+         "functions so audit-sensitive JIT fast paths can safely recompile.")},
 #endif
     {"auto",
      auto_jit,
@@ -3285,6 +3343,7 @@ int install_jit_audit_hook() {
     PyErr_SetString(PyExc_RuntimeError, "Could not install JIT audit hook");
     return -1;
   }
+  registerBuiltinIdIgnorableAuditHook(jit_audit_hook, kData);
   return 0;
 }
 

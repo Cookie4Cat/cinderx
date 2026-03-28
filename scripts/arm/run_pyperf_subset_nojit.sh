@@ -5,9 +5,7 @@ DRIVER_VENV="${DRIVER_VENV:-/root/venv-cinderx314}"
 WORKDIR="${WORKDIR:-$(pwd)}"
 BENCHMARKS="${BENCHMARKS:-}"
 SAMPLES="${SAMPLES:-3}"
-AUTOJIT="${AUTOJIT:-50}"
-OUTPUT="${OUTPUT:-/root/work/arm-sync/pyperf_subset.json}"
-CINDERX_ENABLE_SPECIALIZED_OPCODES="${CINDERX_ENABLE_SPECIALIZED_OPCODES:-1}"
+OUTPUT="${OUTPUT:-/root/work/arm-sync/pyperf_subset_nojit.json}"
 
 if [[ -z "$BENCHMARKS" ]]; then
   echo "ERROR: BENCHMARKS must be set"
@@ -26,36 +24,25 @@ if [[ ! -f "$HOOK_DIR/sitecustomize.py" ]]; then
   exit 2
 fi
 
-TMPDIR="$(mktemp -d /tmp/pyperf_subset.XXXXXX)"
+TMPDIR="$(mktemp -d /tmp/pyperf_subset_nojit.XXXXXX)"
 trap 'rm -rf "$TMPDIR"' EXIT
 
-PYVENV_PATH="$(
-  PYTHONJIT=0 "$DRIVER_PY" -m pyperformance venv show | \
-    sed -n 's/^Virtual environment path: \([^ ]*\).*$/\1/p'
-)"
-if [[ -z "$PYVENV_PATH" || ! -x "$PYVENV_PATH/bin/python" ]]; then
-  echo "ERROR: failed to resolve pyperformance venv path"
-  exit 2
-fi
-
-echo "pyperf_subset_benchmarks=$BENCHMARKS"
-echo "pyperf_subset_samples=$SAMPLES"
-echo "pyperf_subset_output=$OUTPUT"
+echo "pyperf_subset_nojit_benchmarks=$BENCHMARKS"
+echo "pyperf_subset_nojit_samples=$SAMPLES"
+echo "pyperf_subset_nojit_output=$OUTPUT"
 
 for ((i = 1; i <= SAMPLES; i++)); do
   out="$TMPDIR/run_${i}.json"
-  echo ">> pyperformance subset sample $i/$SAMPLES"
+  echo ">> pyperformance subset nojit sample $i/$SAMPLES"
   env \
     PYTHONJITDISABLE=1 \
-    CINDERX_WORKER_PYTHONJITAUTO="$AUTOJIT" \
     PYTHONPATH="$HOOK_DIR${PYTHONPATH:+:$PYTHONPATH}" \
-    CINDERX_ENABLE_SPECIALIZED_OPCODES="$CINDERX_ENABLE_SPECIALIZED_OPCODES" \
     "$DRIVER_PY" -m pyperformance run --debug-single-value -b "$BENCHMARKS" \
-      --inherit-environ PYTHONPATH,CINDERX_WORKER_PYTHONJITAUTO,CINDERX_ENABLE_SPECIALIZED_OPCODES \
+      --inherit-environ PYTHONPATH,PYTHONJITDISABLE \
       -o "$out"
 done
 
-"$DRIVER_PY" - <<'PY' "$TMPDIR" "$OUTPUT" "$BENCHMARKS" "$SAMPLES" "$AUTOJIT"
+"$DRIVER_PY" - <<'PY' "$TMPDIR" "$OUTPUT" "$BENCHMARKS" "$SAMPLES"
 import json
 import statistics
 import sys
@@ -65,7 +52,6 @@ tmpdir = Path(sys.argv[1])
 output = Path(sys.argv[2])
 benchmarks = sys.argv[3].split(",")
 samples = int(sys.argv[4])
-autojit = int(sys.argv[5])
 
 rows = {}
 for path in sorted(tmpdir.glob("run_*.json")):
@@ -82,7 +68,7 @@ summary = {
     "benchmarks": [],
     "benchmark_filter": benchmarks,
     "samples": samples,
-    "autojit": autojit,
+    "mode": "nojit",
 }
 
 for name in sorted(rows):

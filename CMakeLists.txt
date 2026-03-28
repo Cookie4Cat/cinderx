@@ -381,7 +381,7 @@ target_link_libraries(
   ${PROJECT_NAME}
   PRIVATE
   Python::Module
-  borrowed cached-properties common immortalize interpreter jit parallel-gc static-python
+  cached-properties jit static-python interpreter parallel-gc borrowed common immortalize
   asmjit::asmjit fmt::fmt)
 
 # macOS doesn't allow depending on other shared libraries by default.

@@ -28,6 +28,7 @@ POST_PYPERF_CMD="${POST_PYPERF_CMD:-}"
 PYPERF_REQUIRE_SYSTEM_SITE_PACKAGES="${PYPERF_REQUIRE_SYSTEM_SITE_PACKAGES:-1}"
 CINDERX_ENABLE_SPECIALIZED_OPCODES="${CINDERX_ENABLE_SPECIALIZED_OPCODES:-0}"
 CINDERX_JITLIST_ENTRIES="${CINDERX_JITLIST_ENTRIES:-}"
+SKIP_PYPERF_WORKER_PROBE="${SKIP_PYPERF_WORKER_PROBE:-0}"
 
 if ! [[ "$AUTOJIT_GATE" =~ ^[0-9]+$ ]]; then
   echo "ERROR: AUTOJIT_GATE must be a non-negative integer, got '$AUTOJIT_GATE'"
@@ -285,22 +286,26 @@ if [[ ! -f "$HOOK_DIR/sitecustomize.py" ]]; then
   exit 1
 fi
 
-echo ">> verify pyperformance venv worker startup"
-env PYTHONJITDISABLE=1 \
-  CINDERX_WORKER_PYTHONJITAUTO="$SMOKE_AUTOJIT" \
-  PYTHONPATH="$HOOK_DIR${PYTHONPATH:+:$PYTHONPATH}" \
-  CINDERX_ENABLE_SPECIALIZED_OPCODES="$CINDERX_ENABLE_SPECIALIZED_OPCODES" \
-  "$DRIVER_VENV/bin/python" scripts/arm/verify_pyperf_venv.py \
-    --venv "$PYVENV_PATH" \
-    --probe-worker \
-    --worker-argv-token=--debug-single-value \
-    --worker-env=PYPERFORMANCE_RUNID=pyperf-probe \
-    --require-sitecustomize \
-    --require-sitecustomize-prefix "$HOOK_DIR" \
-    --require-cinderx-initialized \
-    --require-jit-enabled \
-    "${PYPERF_VENV_CHECK_ARGS[@]}" \
-    --output "/root/work/arm-sync/pyperf_venv_${RUN_ID}_worker.json"
+if [[ "$SKIP_PYPERF_WORKER_PROBE" == "1" ]]; then
+  echo ">> skip pyperformance worker probe"
+else
+  echo ">> verify pyperformance venv worker startup"
+  env \
+    CINDERX_WORKER_PYTHONJITAUTO="$SMOKE_AUTOJIT" \
+    PYTHONPATH="$HOOK_DIR${PYTHONPATH:+:$PYTHONPATH}" \
+    CINDERX_ENABLE_SPECIALIZED_OPCODES="$CINDERX_ENABLE_SPECIALIZED_OPCODES" \
+    "$DRIVER_VENV/bin/python" scripts/arm/verify_pyperf_venv.py \
+      --venv "$PYVENV_PATH" \
+      --probe-worker \
+      --worker-argv-token=--debug-single-value \
+      --worker-env=PYPERFORMANCE_RUNID=pyperf-probe \
+      --require-sitecustomize \
+      --require-sitecustomize-prefix "$HOOK_DIR" \
+      --require-cinderx-initialized \
+      --require-jit-enabled \
+      "${PYPERF_VENV_CHECK_ARGS[@]}" \
+      --output "/root/work/arm-sync/pyperf_venv_${RUN_ID}_worker.json"
+fi
 
 echo ">> smoke: JIT init + generator + regex compile"
 # Keep startup smoke below known crash-prone aggressive thresholds while still
@@ -340,12 +345,12 @@ if [[ "$AUTOJIT_USE_JITLIST_FILTER" == "1" ]]; then
   env PYTHONJITDISABLE=1 CINDERX_WORKER_PYTHONJITAUTO="$AUTOJIT_GATE" PYTHONPATH="$HOOK_DIR${PYTHONPATH:+:$PYTHONPATH}" PYTHONJITDEBUG=1 PYTHONJITLOGFILE="$LOG" \
     CINDERX_JITLIST_ENTRIES="$AUTOJIT_JITLIST_ENTRIES" PYTHONJITENABLEJITLISTWILDCARDS=1 \
     python -m pyperformance run --debug-single-value -b "$BENCH" \
-      --inherit-environ PYTHONPATH,PYTHONJITDISABLE,CINDERX_WORKER_PYTHONJITAUTO,PYTHONJITDEBUG,PYTHONJITLOGFILE,CINDERX_JITLIST_ENTRIES,PYTHONJITENABLEJITLISTWILDCARDS,CINDERX_ENABLE_SPECIALIZED_OPCODES \
+      --inherit-environ PYTHONPATH,CINDERX_WORKER_PYTHONJITAUTO,PYTHONJITDEBUG,PYTHONJITLOGFILE,CINDERX_JITLIST_ENTRIES,PYTHONJITENABLEJITLISTWILDCARDS,CINDERX_ENABLE_SPECIALIZED_OPCODES \
       -o "/root/work/arm-sync/${BENCH}_autojit${AUTOJIT_GATE}_${RUN_ID}.json"
 else
   env PYTHONJITDISABLE=1 CINDERX_WORKER_PYTHONJITAUTO="$AUTOJIT_GATE" PYTHONPATH="$HOOK_DIR${PYTHONPATH:+:$PYTHONPATH}" PYTHONJITDEBUG=1 PYTHONJITLOGFILE="$LOG" \
     python -m pyperformance run --debug-single-value -b "$BENCH" \
-      --inherit-environ PYTHONPATH,PYTHONJITDISABLE,CINDERX_WORKER_PYTHONJITAUTO,PYTHONJITDEBUG,PYTHONJITLOGFILE,CINDERX_ENABLE_SPECIALIZED_OPCODES \
+      --inherit-environ PYTHONPATH,CINDERX_WORKER_PYTHONJITAUTO,PYTHONJITDEBUG,PYTHONJITLOGFILE,CINDERX_ENABLE_SPECIALIZED_OPCODES \
       -o "/root/work/arm-sync/${BENCH}_autojit${AUTOJIT_GATE}_${RUN_ID}.json"
 fi
 deactivate

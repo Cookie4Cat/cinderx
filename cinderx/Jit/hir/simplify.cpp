@@ -7,6 +7,7 @@
 #include "cinderx/Common/dict.h"
 #include "cinderx/Common/log.h"
 #include "cinderx/Common/property.h"
+#include "cinderx/Common/audit.h"
 #include "cinderx/Common/py-portability.h"
 #include "cinderx/Common/code.h"
 #include "cinderx/Common/type.h"
@@ -2736,6 +2737,60 @@ static Register* simplifyVectorCallBuiltinAbs(
   env.emit<UseType>(target, target->type());
   Register* result = env.emit<DoubleAbs>(double_arg);
   return env.emit<PrimitiveBox>(result, TCDouble, *instr->frameState());
+}
+
+static Register* simplifyVectorCallBuiltinId(
+    Env& env,
+    const VectorCall* instr) {
+  if (instr->numArgs() != 1) {
+    return nullptr;
+  }
+
+  Register* target = modelReg(instr->func());
+  bool is_id = false;
+  if (target->instr()->IsGuardIs()) {
+    auto* guard = static_cast<const GuardIs*>(target->instr());
+    is_id = isBuiltin(guard->target(), "id");
+  } else {
+    is_id = isBuiltin(target, "id");
+  }
+  if (!is_id) {
+    return nullptr;
+  }
+
+  Register* arg = instr->arg(0);
+  if (!arg->type().couldBe(TObject)) {
+    return nullptr;
+  }
+
+  env.emit<UseType>(target, target->type());
+
+  if (canBypassBuiltinIdAudit()) {
+    auto* audit_ok_call = env.emitRawInstr<CallStatic>(
+        0,
+        env.func.env.AllocateRegister(),
+        reinterpret_cast<void*>(canBypassBuiltinIdAudit),
+        TCInt32);
+    env.emit<Snapshot>(*instr->frameState());
+    auto* audit_guard = env.emitInstr<Guard>(audit_ok_call->output());
+    audit_guard->setGuiltyReg(arg);
+    audit_guard->setDescr("builtin id audit bypass");
+
+    Register* zero = env.emit<LoadConst>(Type::fromCInt(0, TCInt64));
+    Register* obj_ptr = env.emit<LoadFieldAddress>(arg, zero);
+    Register* id_i64 = env.emit<IntConvert>(obj_ptr, TCInt64);
+    return env.emit<PrimitiveBox>(id_i64, TCInt64, *instr->frameState());
+  }
+
+  auto* slow_call = env.emitRawInstr<CallStatic>(
+      1,
+      env.func.env.AllocateRegister(),
+      reinterpret_cast<void*>(builtinIdAsInt64),
+      TCInt64);
+  slow_call->SetOperand(0, arg);
+  Register* slow_i64 = slow_call->output();
+  env.emit<CheckNeg>(slow_i64, *instr->frameState());
+  return env.emit<PrimitiveBox>(slow_i64, TCInt64, *instr->frameState());
 }
 
 static Register* emitGenericVectorCallClone(
