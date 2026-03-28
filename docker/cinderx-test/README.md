@@ -149,6 +149,17 @@ docker compose -p cinderx-exp exec cinderx-arm64 sh -lc \
 - `RESULTS_DIR`
   - 宿主机结果目录
 
+## Native crash 调试
+
+遇到 Docker 下的 native auto-JIT crash 时，统一使用容器内固定入口：
+
+```bash
+docker compose -p cinderx-exp exec cinderx-arm64 sh -lc \
+  'BENCHMARK=mdp WARMUP=1 PYTHONJITAUTO=2 JIT_LOG_FILE=/results/mdp-native-jit.log /scripts/run-native-gdb.sh'
+```
+
+不要再临时手写长串 `gdb --args ...`，这样可以保证每次调试命令一致。
+
 ## 代理说明
 
 容器内代理默认是：
