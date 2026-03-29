@@ -123,6 +123,13 @@ void Compiler::runPasses(
   runPassIf(
       hir::BuiltinLoadMethodElimination{}, PassConfig::kBuiltinLoadMethodElim);
   runSimplifyPassesIfEnabled();
+  if (config & PassConfig::kInliner) {
+    runPass(jit::hir::InlineFunctionCalls{true}, irfunc, callback);
+    runSimplifyPassesIfEnabled();
+    runPassIf(
+        hir::BeginInlinedFunctionElimination{},
+        PassConfig::kBeginInlinedFunctionElim);
+  }
   runPass(jit::hir::LongLoopUnboxing{}, irfunc, callback);
   runPassIf(hir::GuardedLoadElimination{}, PassConfig::kGuardedLoadElim);
   runPassIf(hir::CleanCFG{}, PassConfig::kCleanCFG);

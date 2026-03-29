@@ -5,11 +5,13 @@
 #include "internal/pycore_code.h"
 
 #include "cinderx/Common/extra-py-flags.h"
+#include "cinderx/Jit/frame.h"
 #include "cinderx/Jit/hir/builder.h"
 #include "cinderx/Jit/hir/clean_cfg.h"
 #include "cinderx/Jit/hir/copy_propagation.h"
 #include "cinderx/Jit/hir/instr_effects.h"
 #include "cinderx/Jit/hir/preload.h"
+#include "cinderx/Jit/threaded_compile.h"
 
 namespace jit::hir {
 
@@ -191,9 +193,24 @@ bool canInlineWithPreloader(
   return true;
 }
 
-void inlineFunctionCall(Function& caller, AbstractCall* call_instr) {
+std::unique_ptr<Preloader> makeOnDemandPreloader(AbstractCall* call_instr) {
+  if (
+      getThreadedCompileContext().compileRunning() ||
+      !call_instr->instr->IsVectorCall() || call_instr->target == nullptr) {
+    return nullptr;
+  }
+
+  auto preloader = Preloader::makePreloader(
+      call_instr->func, makeFrameReifier(call_instr->func->func_code));
+  if (preloader == nullptr && PyErr_Occurred()) {
+    PyErr_Clear();
+  }
+  return preloader;
+}
+
+bool inlineFunctionCall(Function& caller, AbstractCall* call_instr) {
   if (!canInline(caller, call_instr)) {
-    return;
+    return false;
   }
 
   auto caller_frame_state =
@@ -208,15 +225,20 @@ void inlineFunctionCall(Function& caller, AbstractCall* call_instr) {
   // globals, or statically invoked. See `preloadFuncAndDeps` for what
   // dependencies we will preload. In batch-compile mode we can inline anything
   // that is part of the batch.
+  std::unique_ptr<Preloader> owned_preloader;
   Preloader* preloader = preloaderManager().find(callee);
+  if (preloader == nullptr) {
+    owned_preloader = makeOnDemandPreloader(call_instr);
+    preloader = owned_preloader.get();
+  }
   if (!preloader) {
     dlogAndCollectFailureStats(
         caller, call_instr, InlineFailureType::kNeedsPreload);
-    return;
+    return false;
   }
 
   if (!canInlineWithPreloader(caller, call_instr, *preloader)) {
-    return;
+    return false;
   }
 
   HIRBuilder hir_builder(*preloader);
@@ -231,7 +253,7 @@ void inlineFunctionCall(Function& caller, AbstractCall* call_instr) {
         callee_name,
         caller.fullname,
         exn.what());
-    return;
+    return false;
   }
 
   // This logging is parsed by jitlist_bisect.py to find inlined functions.
@@ -297,6 +319,7 @@ void inlineFunctionCall(Function& caller, AbstractCall* call_instr) {
 
   delete call_instr->instr;
   caller.inline_function_stats.num_inlined_functions++;
+  return true;
 }
 
 void tryEliminateBeginEnd(EndInlinedFunction* end) {
@@ -356,6 +379,11 @@ void InlineFunctionCalls::Run(Function& irfunc) {
     for (auto& instr : block) {
       if (instr.IsVectorCall()) {
         auto call = static_cast<VectorCall*>(&instr);
+        if (
+            only_no_specialize_calls_ &&
+            !(call->flags() & CallFlags::NoSpecialize)) {
+          continue;
+        }
         Register* target = call->func();
         const std::string& caller_name = irfunc.fullname;
         if (!target->isA(TFunc)) {
@@ -386,6 +414,9 @@ void InlineFunctionCalls::Run(Function& irfunc) {
         BorrowedRef<PyFunctionObject> callee{target->type().objectSpec()};
         to_inline.emplace_back(callee, call->numArgs(), call, target);
       } else if (instr.IsInvokeStaticFunction()) {
+        if (only_no_specialize_calls_) {
+          continue;
+        }
         auto call = static_cast<InvokeStaticFunction*>(&instr);
         to_inline.emplace_back(call->func(), call->NumArgs() - 1, call);
       }

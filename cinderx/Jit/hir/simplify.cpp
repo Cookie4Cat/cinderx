@@ -2296,6 +2296,90 @@ static std::optional<TinyMethodResult> classifyTinyInstanceMethod(
   return std::nullopt;
 }
 
+static bool isSmallSelfOnlyPythonMethod(BorrowedRef<PyFunctionObject> func) {
+  BorrowedRef<PyCodeObject> code{func->func_code};
+  if (
+      code->co_argcount != 1 || code->co_kwonlyargcount != 0 ||
+      (code->co_flags & (CO_VARARGS | CO_VARKEYWORDS)) != 0) {
+    return false;
+  }
+
+  size_t num_opcodes = 0;
+  for (auto bc_instr : BytecodeInstructionBlock{code}) {
+    int opcode = bc_instr.opcode();
+    if (opcode == RESUME) {
+      continue;
+    }
+    switch (opcode) {
+      case CALL:
+      case CALL_FUNCTION_EX:
+      case CALL_INTRINSIC_1:
+      case CALL_INTRINSIC_2:
+      case CALL_KW:
+      case DELETE_ATTR:
+      case DELETE_FAST:
+      case DELETE_SUBSCR:
+      case STORE_ATTR:
+      case STORE_DEREF:
+      case STORE_FAST:
+      case STORE_FAST_LOAD_FAST:
+      case STORE_FAST_STORE_FAST:
+      case STORE_GLOBAL:
+      case STORE_SUBSCR:
+        return false;
+      default:
+        break;
+    }
+    num_opcodes++;
+    if (num_opcodes > 16) {
+      return false;
+    }
+  }
+
+  return true;
+}
+
+static BorrowedRef<PyFunctionObject> resolveExactPythonMethodForCall(
+    Env& env,
+    const CallMethod* instr) {
+  if (instr->NumArgs() != 0 || instr->self()->type() <= TNullptr) {
+    return nullptr;
+  }
+
+  Register* target = modelReg(instr->func());
+  if (!isLoadMethodBase(*target->instr()) || target->instr()->IsLoadMethodSuper()) {
+    return nullptr;
+  }
+
+  auto* load_method = static_cast<const LoadMethodBase*>(target->instr());
+  Register* receiver = load_method->receiver();
+  if (!receiver->type().hasTypeExactSpec()) {
+    return nullptr;
+  }
+
+  BorrowedRef<PyCodeObject> code = env.func.codeFor(*load_method);
+  if (code == nullptr) {
+    return nullptr;
+  }
+  BorrowedRef<PyUnicodeObject> method_name{
+      PyTuple_GET_ITEM(code->co_names, load_method->name_idx())};
+  BorrowedRef<PyTypeObject> receiver_type{receiver->type().runtimePyType()};
+  if (receiver_type == nullptr) {
+    return nullptr;
+  }
+
+  BorrowedRef<> method = typeLookupSafe(receiver_type, method_name);
+  if (method == nullptr || !PyFunction_Check(method)) {
+    return nullptr;
+  }
+
+  auto func = reinterpret_cast<PyFunctionObject*>(method.get());
+  if (!isSmallSelfOnlyPythonMethod(func)) {
+    return nullptr;
+  }
+  return func;
+}
+
 static std::vector<TinyMethodCandidate> findTinyMethodCandidates(
     BorrowedRef<PyDictObject> globals,
     BorrowedRef<PyUnicodeObject> method_name) {
@@ -3116,6 +3200,22 @@ static Register* resolveArgs(
 Register* simplifyCallMethod(Env& env, const CallMethod* instr) {
   if (Register* result = simplifyCallMethodTinyReturnSelf(env, instr)) {
     return result;
+  }
+
+  if (BorrowedRef<PyFunctionObject> func =
+          resolveExactPythonMethodForCall(env, instr)) {
+    Register* guarded_func = env.emit<GuardIs>(func, instr->func());
+    auto call = env.emitRawInstr<VectorCall>(
+        instr->NumOperands(),
+        env.func.env.AllocateRegister(),
+        instr->flags() | CallFlags::NoSpecialize,
+        *instr->frameState());
+    call->SetOperand(0, guarded_func);
+    for (size_t i = 1; i < instr->NumOperands(); ++i) {
+      call->SetOperand(i, instr->GetOperand(i));
+    }
+    call->output()->set_type(instr->output()->type());
+    return call->output();
   }
 
   if (instr->func()->type().hasValueSpec(TFunc) &&

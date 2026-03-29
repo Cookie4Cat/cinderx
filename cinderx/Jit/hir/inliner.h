@@ -10,13 +10,18 @@ namespace jit::hir {
 // instructions.
 class InlineFunctionCalls : public Pass {
  public:
-  InlineFunctionCalls() : Pass("InlineFunctionCalls") {}
+  explicit InlineFunctionCalls(bool only_no_specialize_calls = false)
+      : Pass("InlineFunctionCalls"),
+        only_no_specialize_calls_(only_no_specialize_calls) {}
 
   void Run(Function& irfunc) override;
 
   static std::unique_ptr<InlineFunctionCalls> Factory() {
     return std::make_unique<InlineFunctionCalls>();
   }
+
+ private:
+  bool only_no_specialize_calls_;
 };
 
 // Try to elide {Begin,End}InlinedFunction instructions for simple functions
