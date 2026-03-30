@@ -61,7 +61,11 @@ if worker and not skip and os.environ.get("CINDERX_DISABLE") in (None, "", "0"):
     worker_autojit = os.environ.get("CINDERX_WORKER_PYTHONJITAUTO")
     if worker_autojit not in (None, ""):
         os.environ["PYTHONJITAUTO"] = worker_autojit
+        # os.environ may be replaced by a plain dict above; keep the process
+        # environment in sync for C++ flag parsing (getenv).
+        os.putenv("PYTHONJITAUTO", worker_autojit)
         os.environ.pop("PYTHONJITDISABLE", None)
+        os.unsetenv("PYTHONJITDISABLE")
 
     try:
         if os.environ.get("PYPERFORMANCE_RUNID"):
@@ -75,6 +79,13 @@ if worker and not skip and os.environ.get("CINDERX_DISABLE") in (None, "", "0"):
 
         if os.environ.get("PYTHONJITDISABLE") in (None, "", "0"):
             jit.enable()
+            autojit_env = os.environ.get("PYTHONJITAUTO")
+            if autojit_env not in (None, ""):
+                jit.auto()
+                try:
+                    jit.compile_after_n_calls(int(autojit_env))
+                except Exception:
+                    pass
             if _is_truthy(os.environ.get("CINDERX_ENABLE_SPECIALIZED_OPCODES")):
                 jit.enable_specialized_opcodes()
             entries = os.environ.get("CINDERX_JITLIST_ENTRIES", "")

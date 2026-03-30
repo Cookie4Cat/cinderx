@@ -97,7 +97,19 @@ def pyperformance_source_root() -> Path:
 
 
 def pyperformance_hook_root() -> Path:
-    return Path(os.environ.get("PYPERFORMANCE_HOOK_ROOT", "/pyperf_env_hook"))
+    env_root = os.environ.get("PYPERFORMANCE_HOOK_ROOT")
+    if env_root:
+        return Path(env_root)
+
+    container_path = Path("/pyperf_env_hook")
+    if container_path.exists():
+        return container_path
+
+    host_repo_path = cinderx_source_root() / "scripts" / "arm" / "pyperf_env_hook"
+    if host_repo_path.exists():
+        return host_repo_path
+
+    return container_path
 
 
 def pyperformance_benchmark_filter(

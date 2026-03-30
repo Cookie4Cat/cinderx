@@ -18,6 +18,9 @@
 #include "cinderx/Jit/jit_rt.h"
 #include "cinderx/Jit/threaded_compile.h"
 
+#include <cstdlib>
+#include <cstring>
+
 #if PY_VERSION_HEX < 0x030C0000
 #include "cinder/exports.h"
 #include "internal/pycore_shadow_frame.h"
@@ -60,6 +63,14 @@ CINDER_UNSUPPORTED
 bool tstate_offset_inited;
 int32_t tstate_offset = -1;
 
+bool shouldLogThreadStateOffsetProbe() {
+  static int enabled = []() {
+    const char* env = std::getenv("PYTHONJITLOGTSTATEOFFSET");
+    return env != nullptr && std::strcmp(env, "0") != 0;
+  }();
+  return enabled != 0;
+}
+
 void initThreadStateOffset() {
   if (tstate_offset_inited) {
     return;
@@ -80,10 +91,23 @@ void initThreadStateOffset() {
       ts_func[7] == 0x04 && ts_func[8] == 0x25) { // movq   %fs:OFFSET, %rax
     // movq   %fs:-0x18, %rax
     tstate_offset = *reinterpret_cast<int32_t*>(ts_func + 9);
-  } else {
-#ifndef Py_DEBUG
-    assert(false);
-#endif
+  }
+  if (shouldLogThreadStateOffsetProbe()) {
+    JIT_LOG(
+        "tstate probe x86_64: offset={} bytes=[{:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x}]",
+        tstate_offset,
+        ts_func[0],
+        ts_func[1],
+        ts_func[2],
+        ts_func[3],
+        ts_func[4],
+        ts_func[5],
+        ts_func[6],
+        ts_func[7],
+        ts_func[8],
+        ts_func[9],
+        ts_func[10],
+        ts_func[11]);
   }
 #elif defined(CINDER_AARCH64)
   // PyThreadState_GetCurrent just accesses the thread local value, and
@@ -146,11 +170,23 @@ void initThreadStateOffset() {
 
     tstate_offset = current_offset;
   }
-#ifndef Py_DEBUG
-  if (tstate_offset == -1) {
-    assert(false);
+  if (shouldLogThreadStateOffsetProbe()) {
+    JIT_LOG(
+        "tstate probe aarch64: matched={} scan_start={} reg={} offset={} words=[0x{:08x} 0x{:08x} 0x{:08x} 0x{:08x} 0x{:08x} 0x{:08x}]",
+        matched,
+        scan_start,
+        reg,
+        tstate_offset,
+        ts_func[0],
+        ts_func[1],
+        ts_func[2],
+        ts_func[3],
+        ts_func[4],
+        ts_func[5]);
   }
-#endif
+  // If we fail to decode the fast TLS offset, keep tstate_offset == -1.
+  // loadTState() will transparently fall back to calling
+  // _PyThreadState_GetCurrent().
 #else
   CINDER_UNSUPPORTED
 #endif

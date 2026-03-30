@@ -26,6 +26,7 @@ export SCRIPT_DIR BENCHMARK OPT_ENV_FILE OPT_CONFIG_NAME AUTOJIT OUTPUT_FILE
 eval "$(PYTHONJITDISABLE=1 python3 <<'PY'
 import os
 import sys
+import sysconfig
 
 sys.path.insert(0, os.environ["SCRIPT_DIR"])
 from benchmark_harness import (
@@ -33,6 +34,7 @@ from benchmark_harness import (
     default_opt_env_file,
     load_opt_env_file,
     opt_config_name,
+    pyperformance_hook_root,
     pyperformance_benchmark_filter,
 )
 
@@ -49,6 +51,8 @@ jit_arm_keys = ",".join(
 
 print(f'export BENCHMARK_FILTER="{benchmark_filter}"')
 print(f'export CINDERX_SOURCE_ROOT_RESOLVED="{cinderx_source_root()}"')
+print(f'export PYPERFORMANCE_HOOK_ROOT_RESOLVED="{pyperformance_hook_root()}"')
+print(f'export PYTHON_BASE_SITE_PACKAGES="{sysconfig.get_paths()["purelib"]}"')
 print(f'export OPT_ENV_FILE_RESOLVED="{path}"')
 print(f'export OPT_CONFIG_NAME_RESOLVED="{config_name}"')
 print(f'export JIT_ARM_INHERIT_KEYS="{jit_arm_keys}"')
@@ -69,8 +73,11 @@ PYTHONJITDISABLE=1 python3 -m pip install --quiet "$PYPERFORMANCE_TMP" 2>&1 | gr
 
 env \
   LD_LIBRARY_PATH="${LD_LIBRARY_PATH:-}" \
-  PYTHONJIT="${PYTHONJIT:-1}" \
+  PYTHONJITDISABLE=1 \
   PYTHONJITAUTO="$AUTOJIT" \
+  PYTHONPATH="${PYPERFORMANCE_HOOK_ROOT_RESOLVED}:${PYTHON_BASE_SITE_PACKAGES}${PYTHONPATH:+:${PYTHONPATH}}" \
+  CINDERX_WORKER_PYTHONJITAUTO="$AUTOJIT" \
+  CINDERX_ENABLE_SPECIALIZED_OPCODES="${CINDERX_ENABLE_SPECIALIZED_OPCODES:-1}" \
   PYTHONJITHUGEPAGES=0 \
   $(if [[ "$DIAG" != "0" ]]; then
       printf '%s\n' \
@@ -93,7 +100,14 @@ PY
     --inherit-environ "$(PYTHONJITDISABLE=1 python3 <<'PY'
 import os
 
-base = ["LD_LIBRARY_PATH", "PYTHONJIT", "PYTHONJITAUTO", "PYTHONJITHUGEPAGES"]
+base = [
+    "LD_LIBRARY_PATH",
+    "PYTHONJITAUTO",
+    "PYTHONPATH",
+    "CINDERX_WORKER_PYTHONJITAUTO",
+    "CINDERX_ENABLE_SPECIALIZED_OPCODES",
+    "PYTHONJITHUGEPAGES",
+]
 diag = ["PYTHONJITLOGFILE", "PYTHONJITDUMPFINALHIR", "PYTHONJITDUMPSTATS"]
 extra = [key for key in os.environ.get("JIT_ARM_INHERIT_KEYS", "").split(",") if key]
 if os.environ.get("DIAG", "0") != "0":
