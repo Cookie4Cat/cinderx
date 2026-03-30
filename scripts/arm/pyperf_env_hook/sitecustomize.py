@@ -1,6 +1,8 @@
 import os
 import sys
+import site
 import importlib.util
+import sysconfig
 
 
 def _spec_summary(name: str) -> str:
@@ -56,6 +58,61 @@ def _debug(msg: str) -> None:
             f.write(msg + "\n")
     except Exception:
         pass
+
+
+def _candidate_site_packages() -> list[str]:
+    version = f"{sys.version_info.major}.{sys.version_info.minor}"
+    base_prefix = getattr(sys, "base_prefix", None) or sys.prefix
+    prefixes = [base_prefix]
+    if sys.prefix not in prefixes:
+        prefixes.append(sys.prefix)
+
+    candidates: list[str] = []
+    for prefix in prefixes:
+        libdir = os.path.join(prefix, "lib", f"python{version}", "site-packages")
+        platstdlib = os.path.join(
+            prefix, "lib", f"python{version}", "lib-dynload", "site-packages"
+        )
+        for path in (libdir, platstdlib):
+            if path not in candidates:
+                candidates.append(path)
+
+    for key in ("purelib", "platlib"):
+        try:
+            path = sysconfig.get_path(
+                key,
+                vars={
+                    "base": base_prefix,
+                    "platbase": base_prefix,
+                    "installed_base": base_prefix,
+                    "installed_platbase": base_prefix,
+                },
+            )
+        except Exception:
+            path = None
+        if path and path not in candidates:
+            candidates.append(path)
+
+    return [path for path in candidates if path and os.path.isdir(path)]
+
+
+def _ensure_cinderx_import_path() -> None:
+    if importlib.util.find_spec("cinderx") is not None:
+        return
+
+    added = []
+    for path in _candidate_site_packages():
+        before = set(sys.path)
+        site.addsitedir(path)
+        if path not in before or set(sys.path) != before:
+            added.append(path)
+
+    _debug(
+        "path_fixup"
+        f" pid={os.getpid()}"
+        f" added={added!r}"
+        f" cinderx_spec={_spec_summary('cinderx')}"
+    )
 
 
 skip = (
@@ -115,6 +172,7 @@ if worker and not skip and os.environ.get("CINDERX_DISABLE") in (None, "", "0"):
         os.putenv("PYTHONJITAUTO", worker_autojit)
 
     try:
+        _ensure_cinderx_import_path()
         if os.environ.get("PYPERFORMANCE_RUNID"):
             import platform
 
