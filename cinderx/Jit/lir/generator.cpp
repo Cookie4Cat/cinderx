@@ -405,6 +405,19 @@ bool LIRGenerator::TranslateSpecializedCall(
     return false;
   }
 
+  if (type == &PyFunction_Type) {
+    Instruction* instr = bbb.appendInstr(
+        hir_instr.output(),
+        Instruction::kVectorCall,
+        Imm{reinterpret_cast<uint64_t>(JITRT_VectorcallExactPyFunc)},
+        Imm{0});
+    for (hir::Register* arg : hir_instr.GetOperands()) {
+      instr->addOperands(VReg{bbb.getDefInstr(arg)});
+    }
+    instr->addOperands(Imm{0});
+    return true;
+  }
+
   if (type != &PyCFunction_Type) {
     return false;
   }

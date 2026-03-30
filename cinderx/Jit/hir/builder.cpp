@@ -460,6 +460,26 @@ struct TupleGenexprPattern {
   bool returns_directly{false};
 };
 
+struct AnyGenexprPattern {
+  bool returns_directly{false};
+};
+
+BytecodeInstruction skipInlinePatternNoops(BytecodeInstruction instr) {
+  for (;;) {
+    if (instr.opcode() == NOP) {
+      instr = instr.nextInstr();
+      continue;
+    }
+#if PY_VERSION_HEX >= 0x030E0000 && PY_VERSION_HEX < 0x030F0000
+    if (instr.opcode() == NOT_TAKEN) {
+      instr = instr.nextInstr();
+      continue;
+    }
+#endif
+    return instr;
+  }
+}
+
 std::optional<TupleGenexprPattern> matchInlineableTupleGenexprPattern(
     BorrowedRef<PyCodeObject> code,
     const BytecodeInstruction& call_instr) {
@@ -511,6 +531,65 @@ std::optional<TupleGenexprPattern> matchInlineableTupleGenexprPattern(
   }
 
   return std::nullopt;
+}
+
+std::optional<AnyGenexprPattern> matchInlineableAnyGenexprPattern(
+    BorrowedRef<PyCodeObject> code,
+    const BytecodeInstruction& call_instr) {
+  if (call_instr.opcode() != CALL || call_instr.oparg() != 0) {
+    return std::nullopt;
+  }
+
+  BytecodeInstruction loop_header = call_instr.nextInstr();
+  if (loop_header.opcode() != FOR_ITER) {
+    return std::nullopt;
+  }
+
+  BytecodeInstruction to_bool = loop_header.nextInstr();
+  if (to_bool.opcode() != TO_BOOL) {
+    return std::nullopt;
+  }
+
+  BytecodeInstruction branch_true = to_bool.nextInstr();
+  if (branch_true.opcode() != POP_JUMP_IF_TRUE) {
+    return std::nullopt;
+  }
+
+  BytecodeInstruction loop_jump = skipInlinePatternNoops(branch_true.nextInstr());
+  if (!isJumpTo(loop_jump, loop_header.baseOffset())) {
+    return std::nullopt;
+  }
+
+  BytecodeInstruction success{code, branch_true.getJumpTarget()};
+  if (success.opcode() != POP_ITER) {
+    return std::nullopt;
+  }
+  BytecodeInstruction success_load = success.nextInstr();
+  if (success_load.opcode() != LOAD_CONST ||
+      PyTuple_GET_ITEM(code->co_consts, success_load.oparg()) != Py_True) {
+    return std::nullopt;
+  }
+  if (success_load.nextInstr().opcode() != RETURN_VALUE) {
+    return std::nullopt;
+  }
+
+  BytecodeInstruction cleanup{code, loop_header.getJumpTarget()};
+  if (cleanup.opcode() == END_FOR) {
+    cleanup = cleanup.nextInstr();
+  }
+  if (cleanup.opcode() != POP_ITER) {
+    return std::nullopt;
+  }
+  BytecodeInstruction false_load = cleanup.nextInstr();
+  if (false_load.opcode() != LOAD_CONST ||
+      PyTuple_GET_ITEM(code->co_consts, false_load.oparg()) != Py_False) {
+    return std::nullopt;
+  }
+  if (false_load.nextInstr().opcode() != RETURN_VALUE) {
+    return std::nullopt;
+  }
+
+  return AnyGenexprPattern{/*returns_directly=*/true};
 }
 
 bool isKnownCoroutineFunction(BorrowedRef<> obj) {
@@ -672,12 +751,32 @@ struct DeepcopyDictSubscrPattern {
   BCOffset store_subscr_off{-1};
 };
 
+struct SendNoneLoopPattern {
+  BCOffset inner_loop_off{-1};
+  BCOffset outer_loop_off{-1};
+};
+
 bool isCopyKeepAliveFunction(BorrowedRef<PyCodeObject> code) {
   return nameEquals(code->co_name, "_keep_alive") && code->co_argcount == 2;
 }
 
 bool isCopyDeepcopyTupleFunction(BorrowedRef<PyCodeObject> code) {
   return nameEquals(code->co_name, "_deepcopy_tuple") && code->co_argcount == 3;
+}
+
+bool isPickleUnpicklerLoadFunction(BorrowedRef<PyCodeObject> code) {
+  if (code == nullptr || code->co_argcount != 1 ||
+      !PyUnicode_Check(code->co_qualname) || !PyUnicode_Check(code->co_filename)) {
+    return false;
+  }
+  const char* qualname = PyUnicode_AsUTF8(code->co_qualname);
+  const char* filename = PyUnicode_AsUTF8(code->co_filename);
+  if (qualname == nullptr || filename == nullptr) {
+    PyErr_Clear();
+    return false;
+  }
+  return std::strcmp(qualname, "_Unpickler.load") == 0 &&
+      std::strstr(filename, "pickle.py") != nullptr;
 }
 
 int findLocalIndexByName(BorrowedRef<PyCodeObject> code, const char* name) {
@@ -796,6 +895,104 @@ std::optional<DeepcopyDictSubscrPattern> matchDeepcopyDictSubscrPattern(
   }
 
   return std::nullopt;
+}
+
+std::optional<SendNoneLoopPattern> matchSendNoneLoopPattern(
+    BorrowedRef<PyCodeObject> code,
+    const BytecodeInstruction& call_instr) {
+  if (call_instr.opcode() != CALL || call_instr.oparg() != 1) {
+    return std::nullopt;
+  }
+
+  std::optional<BytecodeInstruction> prev_load_const;
+  std::optional<BytecodeInstruction> prev_load_attr;
+  bool found_call = false;
+  for (auto instr : BytecodeInstructionBlock{code}) {
+    if (instr == call_instr) {
+      found_call = true;
+      break;
+    }
+    prev_load_attr = prev_load_const;
+    prev_load_const = instr;
+  }
+  if (!found_call || !prev_load_const.has_value() || !prev_load_attr.has_value()) {
+    return std::nullopt;
+  }
+
+  if (prev_load_const->opcode() != LOAD_CONST ||
+      prev_load_attr->opcode() != LOAD_ATTR ||
+      !nameEquals(loadAttrName(code, *prev_load_attr), "send")) {
+    return std::nullopt;
+  }
+
+  BorrowedRef<> const_obj =
+      PyTuple_GET_ITEM(code->co_consts, prev_load_const->oparg());
+  if (const_obj != Py_None) {
+    return std::nullopt;
+  }
+
+  BytecodeInstruction pop_top = call_instr.nextInstr();
+  if (pop_top.opcode() != POP_TOP) {
+    return std::nullopt;
+  }
+
+  BytecodeInstruction backedge = pop_top.nextInstr();
+  if (backedge.opcode() != JUMP_BACKWARD) {
+    return std::nullopt;
+  }
+
+  SendNoneLoopPattern pattern;
+  pattern.inner_loop_off = backedge.getJumpTarget();
+
+  BytecodeInstruction handler_instr = backedge.nextInstr();
+  int max_scan = static_cast<int>(countIndices(code));
+  while (
+      max_scan-- > 0 &&
+      static_cast<size_t>(handler_instr.baseIndex().value()) <
+          countIndices(code) &&
+      handler_instr.opcode() != PUSH_EXC_INFO) {
+    handler_instr = handler_instr.nextInstr();
+  }
+  if (handler_instr.opcode() != PUSH_EXC_INFO) {
+    return std::nullopt;
+  }
+
+  handler_instr = handler_instr.nextInstr();
+  if (!nameEquals(loadGlobalName(code, handler_instr), "StopIteration")) {
+    return std::nullopt;
+  }
+
+  handler_instr = handler_instr.nextInstr();
+  if (handler_instr.opcode() != CHECK_EXC_MATCH) {
+    return std::nullopt;
+  }
+
+  handler_instr = handler_instr.nextInstr();
+  if (handler_instr.opcode() != POP_JUMP_IF_FALSE) {
+    return std::nullopt;
+  }
+
+  handler_instr = skipHandlerNoops(handler_instr.nextInstr());
+  if (handler_instr.opcode() != POP_TOP) {
+    return std::nullopt;
+  }
+
+  handler_instr = skipHandlerNoops(handler_instr.nextInstr());
+  if (handler_instr.opcode() != POP_EXCEPT) {
+    return std::nullopt;
+  }
+
+  BytecodeInstruction outer_jump = skipHandlerNoops(handler_instr.nextInstr());
+  if (outer_jump.opcode() != JUMP_BACKWARD) {
+    return std::nullopt;
+  }
+
+  pattern.outer_loop_off = outer_jump.getJumpTarget();
+  if (BytecodeInstruction{code, pattern.outer_loop_off}.opcode() != FOR_ITER) {
+    return std::nullopt;
+  }
+
+  return pattern;
 }
 
 #endif
@@ -1368,6 +1565,7 @@ void HIRBuilder::translate(
     BytecodeInstruction prev_bc_instr{code_, BCOffset{-2}};
     for (auto bc_it = bc_block.begin(); bc_it != bc_block.end(); ++bc_it) {
       BytecodeInstruction bc_instr = *bc_it;
+      auto opcode = bc_instr.opcode();
 
       tc.frame.cur_instr_offs = bc_instr.baseOffset();
       Instr* prev_hir_instr = tc.block->GetTerminator();
@@ -1395,7 +1593,6 @@ void HIRBuilder::translate(
       }
       prev_bc_instr = bc_instr;
       // Translate instruction
-      auto opcode = bc_instr.opcode();
       switch (opcode) {
         case NOP:
         case NOT_TAKEN: {
@@ -1531,7 +1728,7 @@ void HIRBuilder::translate(
           break;
         }
         case TO_BOOL: {
-          emitToBool(tc);
+          emitToBool(tc, &bc_instr);
           break;
         }
         case COPY_DICT_WITHOUT_KEYS: {
@@ -2489,12 +2686,20 @@ void HIRBuilder::emitAnyCall(
     jit::BytecodeInstructionBlock::Iterator& bc_it,
     const jit::BytecodeInstructionBlock& bc_instrs) {
   BytecodeInstruction bc_instr = *bc_it;
+  if (tryInlineAnyGenexprCall(irfunc, cfg, tc, bc_it, bc_instrs)) {
+    return;
+  }
   if (tryInlineSetGenexprCall(irfunc, cfg, tc, bc_it, bc_instrs)) {
     return;
   }
   if (tryInlineTupleGenexprCall(irfunc, cfg, tc, bc_it, bc_instrs)) {
     return;
   }
+#if PY_VERSION_HEX >= 0x030E0000 && PY_VERSION_HEX < 0x030F0000
+  if (tryRewritePickleLoadStopCall(cfg, tc, bc_it, bc_instrs)) {
+    return;
+  }
+#endif
   bool is_awaited;
   if constexpr (PY_VERSION_HEX >= 0x030C0000) {
     is_awaited = false;
@@ -2509,6 +2714,10 @@ void HIRBuilder::emitAnyCall(
   }
   auto flags = is_awaited ? CallFlags::Awaited : CallFlags::None;
   bool call_used_is_awaited = true;
+
+  if (tryEmitProfiledMethodWithValuesCall(cfg, tc, bc_instr, flags)) {
+    return;
+  }
 
   auto opcode = bc_instr.opcode();
   switch (opcode) {
@@ -2578,6 +2787,11 @@ void HIRBuilder::emitAnyCall(
       }
 
 generic_call:
+#if PY_VERSION_HEX >= 0x030E0000 && PY_VERSION_HEX < 0x030F0000
+      if (tryEmitSendNoneLoopRewrite(cfg, tc, bc_instr)) {
+        break;
+      }
+#endif
       // Manually set up the instruction instead of using emitVariadic.
       // kwnames_ isn't on the stack, but it has to be part of the operand
       // count.
@@ -2647,6 +2861,225 @@ generic_call:
   }
 }
 
+bool HIRBuilder::tryEmitProfiledMethodWithValuesCall(
+    CFG& cfg,
+    TranslationContext& tc,
+    const jit::BytecodeInstruction& bc_instr,
+    CallFlags flags) {
+  if (!pending_method_with_values_call_.has_value()) {
+    return false;
+  }
+  if (kwnames_ != nullptr) {
+    JIT_DLOG("profiled-mwv call skipped: kwnames present");
+    return false;
+  }
+  if (bc_instr.opcode() != CALL && bc_instr.opcode() != CALL_METHOD) {
+    JIT_DLOG("profiled-mwv call skipped: opcode {}", bc_instr.opcode());
+    return false;
+  }
+
+  const PendingMethodWithValuesCall pending = *pending_method_with_values_call_;
+  auto stack_contains_pending_callable = [&]() {
+    for (std::size_t i = 0; i < tc.frame.stack.size(); i++) {
+      if (tc.frame.stack.peek(i) == pending.callable) {
+        return true;
+      }
+    }
+    return false;
+  };
+  std::size_t num_operands = static_cast<std::size_t>(bc_instr.oparg()) + 2;
+  if (tc.frame.stack.size() < num_operands) {
+    JIT_DLOG(
+        "profiled-mwv call skipped: stack too small {} < {}",
+        tc.frame.stack.size(),
+        num_operands);
+    if (!stack_contains_pending_callable()) {
+      pending_method_with_values_call_.reset();
+    }
+    return false;
+  }
+  Register* callable_reg = tc.frame.stack.peek(num_operands);
+  if (callable_reg != pending.callable) {
+    JIT_DLOG(
+        "profiled-mwv call skipped: callable mismatch {} != {}",
+        static_cast<void*>(callable_reg),
+        static_cast<void*>(pending.callable));
+    if (!stack_contains_pending_callable()) {
+      pending_method_with_values_call_.reset();
+    }
+    return false;
+  }
+
+  auto emit_generic_call = [&](TranslationContext& call_tc) {
+    call_tc.emitSnapshot();
+    Register* call_out = temps_.AllocateStack();
+    auto call = call_tc.emit<CallMethod>(num_operands, call_out, flags);
+    for (auto i = num_operands; i > 0; i--) {
+      Register* arg = call_tc.frame.stack.pop();
+      call->SetOperand(i - 1, arg);
+    }
+    call->setFrameState(call_tc.frame);
+    call_tc.frame.stack.push(call_out);
+    return call_out;
+  };
+
+  auto emit_fast_call = [&](TranslationContext& call_tc) {
+    call_tc.emitSnapshot();
+    std::vector<Register*> arg_regs(num_operands - 1, nullptr);
+    for (auto i = num_operands - 1; i > 1; i--) {
+      arg_regs[i - 1] = call_tc.frame.stack.pop();
+    }
+    Register* self = call_tc.frame.stack.pop();
+    call_tc.frame.stack.pop(); // discard generic callable from LoadMethod
+
+    Register* funcreg = temps_.AllocateStack();
+    call_tc.emit<LoadConst>(funcreg, Type::fromObject(pending.descr));
+
+    Register* call_out = temps_.AllocateStack();
+    auto vector_call = call_tc.emit<VectorCall>(num_operands, call_out, flags);
+    vector_call->SetOperand(0, funcreg);
+    vector_call->SetOperand(1, self);
+    for (std::size_t i = 2; i < num_operands; i++) {
+      vector_call->SetOperand(i, arg_regs[i - 1]);
+    }
+    vector_call->setFrameState(call_tc.frame);
+    call_tc.frame.stack.push(call_out);
+    return call_out;
+  };
+
+  auto emit_type_version_branch =
+      [&](TranslationContext& branch_tc,
+          BasicBlock* success,
+          BasicBlock* failure) -> Register* {
+    Register* obj_type = temps_.AllocateStack();
+    branch_tc.emit<LoadField>(
+        obj_type, pending.receiver, "ob_type", offsetof(PyObject, ob_type), TType);
+
+    Register* version = temps_.AllocateStack();
+    branch_tc.emit<LoadField>(
+        version,
+        obj_type,
+        "tp_version_tag",
+        offsetof(PyTypeObject, tp_version_tag),
+        TCUInt32);
+
+    Register* expected = temps_.AllocateStack();
+    branch_tc.emit<LoadConst>(
+        expected, Type::fromCUInt(pending.type_version, TCUInt32));
+
+    Register* matches = temps_.AllocateStack();
+    branch_tc.emit<PrimitiveCompare>(
+        matches, PrimitiveCompareOp::kEqual, version, expected);
+    branch_tc.emit<CondBranch>(matches, success, failure);
+    return obj_type;
+  };
+
+  auto emit_inline_values_valid_branch =
+      [&](TranslationContext& branch_tc,
+          Register* obj_type,
+          BasicBlock* success,
+          BasicBlock* failure) {
+    Register* basicsize = temps_.AllocateStack();
+    branch_tc.emit<LoadField>(
+        basicsize,
+        obj_type,
+        "tp_basicsize",
+        offsetof(PyTypeObject, tp_basicsize),
+        TCInt64);
+
+    Register* valid_extra = temps_.AllocateStack();
+    branch_tc.emit<LoadConst>(
+        valid_extra, Type::fromCInt(offsetof(PyDictValues, valid), TCInt64));
+
+    Register* valid_offset = temps_.AllocateStack();
+    branch_tc.emit<IntBinaryOp>(
+        valid_offset, BinaryOpKind::kAdd, basicsize, valid_extra);
+
+    Register* valid_addr = temps_.AllocateStack();
+    branch_tc.emit<LoadFieldAddress>(valid_addr, pending.receiver, valid_offset);
+
+    Register* zero_idx = temps_.AllocateStack();
+    branch_tc.emit<LoadConst>(zero_idx, Type::fromCInt(0, TCInt64));
+
+    Register* valid = temps_.AllocateStack();
+    branch_tc.emit<LoadArrayItem>(
+        valid, valid_addr, zero_idx, pending.receiver, 0, TCUInt8);
+
+    Register* zero = temps_.AllocateStack();
+    branch_tc.emit<LoadConst>(zero, Type::fromCUInt(0, TCUInt8));
+
+    Register* valid_nonzero = temps_.AllocateStack();
+    branch_tc.emit<PrimitiveCompare>(
+        valid_nonzero, PrimitiveCompareOp::kNotEqual, valid, zero);
+    branch_tc.emit<CondBranch>(valid_nonzero, success, failure);
+  };
+
+  auto emit_heap_keys_version_branch =
+      [&](TranslationContext& branch_tc,
+          Register* obj_type,
+          BasicBlock* success,
+          BasicBlock* failure) {
+    Register* keys = temps_.AllocateStack();
+    branch_tc.emit<LoadField>(
+        keys,
+        obj_type,
+        "ht_cached_keys",
+        offsetof(PyHeapTypeObject, ht_cached_keys),
+        TCPtr);
+
+    Register* version = temps_.AllocateStack();
+    branch_tc.emit<LoadField>(
+        version,
+        keys,
+        "dk_version",
+        offsetof(PyDictKeysObject, dk_version),
+        TCUInt32);
+
+    Register* expected = temps_.AllocateStack();
+    branch_tc.emit<LoadConst>(
+        expected, Type::fromCUInt(pending.keys_version, TCUInt32));
+
+    Register* matches = temps_.AllocateStack();
+    branch_tc.emit<PrimitiveCompare>(
+        matches, PrimitiveCompareOp::kEqual, version, expected);
+    branch_tc.emit<CondBranch>(matches, success, failure);
+  };
+
+  TranslationContext values_check{cfg.AllocateBlock(), tc.frame};
+  TranslationContext keys_check{cfg.AllocateBlock(), tc.frame};
+  TranslationContext fast_path{cfg.AllocateBlock(), tc.frame};
+  TranslationContext fallback_path{cfg.AllocateBlock(), tc.frame};
+  TranslationContext done{cfg.AllocateBlock(), tc.frame};
+
+  Register* common_out = temps_.AllocateStack();
+  Register* obj_type = emit_type_version_branch(
+      tc, values_check.block, fallback_path.block);
+
+  emit_inline_values_valid_branch(
+      values_check, obj_type, keys_check.block, fallback_path.block);
+  emit_heap_keys_version_branch(
+      keys_check, obj_type, fast_path.block, fallback_path.block);
+
+  Register* fast_out = emit_fast_call(fast_path);
+  fast_path.emit<Assign>(common_out, fast_out);
+  fast_path.emit<Branch>(done.block);
+
+  Register* slow_out = emit_generic_call(fallback_path);
+  fallback_path.emit<Assign>(common_out, slow_out);
+  fallback_path.emit<Branch>(done.block);
+
+  for (std::size_t i = 0; i < num_operands; i++) {
+    done.frame.stack.pop();
+  }
+  done.frame.stack.push(common_out);
+
+  pending_method_with_values_call_.reset();
+  JIT_DLOG("profiled-mwv call emitted for instr {}", bc_instr.baseOffset().value());
+  tc.block = done.block;
+  tc.frame = done.frame;
+  return true;
+}
+
 Register* HIRBuilder::findFunctionClosure(BasicBlock* block, Register* func) {
   func = chaseAssign(func);
   if (block == nullptr || func == nullptr) {
@@ -2690,6 +3123,11 @@ InlineResult HIRBuilder::inlineGenexprHIR(
   inner_builder.inline_genexpr_collector_kind_ = collector_kind;
   inner_builder.inline_genexpr_closure_ = closure_tuple;
   inner_builder.inline_genexpr_exit_ = caller->cfg.AllocateBlock();
+  inner_builder.inline_genexpr_success_ =
+      collector_kind == InlineGenexprCollectorKind::kAny
+      ? caller->cfg.AllocateBlock()
+      : nullptr;
+  inner_builder.inline_genexpr_cfg_ = &caller->cfg;
 
   inline_genexpr_parent_frames_.push_back(
       std::make_unique<FrameState>(*caller_frame_state));
@@ -2743,7 +3181,10 @@ InlineResult HIRBuilder::inlineGenexprHIR(
     }
   }
 
-  return {entry_block, inner_builder.inline_genexpr_exit_};
+  return {
+      entry_block,
+      inner_builder.inline_genexpr_exit_,
+      inner_builder.inline_genexpr_success_};
 }
 
 bool HIRBuilder::inlineSetGenexpr(
@@ -2993,7 +3434,13 @@ bool HIRBuilder::tryEmitDeepcopyDictSubscrRewrite(
     return false;
   }
 
-  if (bc_instr.specializedOpcode() != BINARY_SUBSCR_DICT) {
+  bool is_dict_subscr_specialized =
+#if PY_VERSION_HEX >= 0x030E0000
+      bc_instr.specializedOpcode() == BINARY_OP_SUBSCR_DICT;
+#else
+      bc_instr.specializedOpcode() == BINARY_SUBSCR_DICT;
+#endif
+  if (!is_dict_subscr_specialized) {
     tc.emit<GuardType>(container, TDictExact, container, tc.frame);
   }
 
@@ -3087,6 +3534,216 @@ bool HIRBuilder::tryEmitDeepcopyDictSubscrRewrite(
   tc.frame.stack.push(result);
   return true;
 }
+
+bool HIRBuilder::tryRewritePickleLoadStopCall(
+    CFG& cfg,
+    TranslationContext& tc,
+    jit::BytecodeInstructionBlock::Iterator& bc_it,
+    const jit::BytecodeInstructionBlock& bc_instrs) {
+  if (!isPickleUnpicklerLoadFunction(code_)) {
+    return false;
+  }
+
+  BytecodeInstruction bc_instr = *bc_it;
+  if (bc_instr.opcode() != CALL || bc_instr.oparg() != 1 || kwnames_ != nullptr ||
+      tc.frame.stack.size() < 3) {
+    return false;
+  }
+
+  auto next_it = bc_it;
+  ++next_it;
+  if (next_it == bc_instrs.end() || next_it->opcode() != POP_TOP) {
+    return false;
+  }
+
+  Register* self_arg = tc.frame.stack.top();
+  Register* null_sentinel = tc.frame.stack.top(1);
+  if (!isNullSentinel(null_sentinel)) {
+    return false;
+  }
+
+  int key_local_idx = findLocalIndexByName(code_, "key");
+  if (key_local_idx < 0 ||
+      key_local_idx >= static_cast<int>(tc.frame.localsplus.size())) {
+    return false;
+  }
+  Register* key = tc.frame.localsplus.at(key_local_idx);
+  if (key == nullptr) {
+    return false;
+  }
+
+  Register* is_stop_key = temps_.AllocateStack();
+  BasicBlock* stop_block = cfg.AllocateBlock();
+  BasicBlock* generic_block = cfg.AllocateBlock();
+
+  auto* stop_check = tc.emit<CallStatic>(
+      1,
+      is_stop_key,
+      reinterpret_cast<void*>(JITRT_PickleIsStopKey),
+      TCInt32);
+  stop_check->SetOperand(0, key);
+  tc.emit<CondBranch>(is_stop_key, stop_block, generic_block);
+
+  TranslationContext stop_tc{stop_block, tc.frame};
+  stop_tc.frame.stack.pop();
+  stop_tc.frame.stack.pop();
+  stop_tc.frame.stack.pop();
+  Register* stop_result = temps_.AllocateStack();
+  auto* helper_call = stop_tc.emit<CallStatic>(
+      1,
+      stop_result,
+      reinterpret_cast<void*>(JITRT_PickleUnpicklerPopStack),
+      TOptObject);
+  helper_call->SetOperand(0, self_arg);
+  stop_tc.emit<CheckExc>(stop_result, stop_result, stop_tc.frame);
+  stop_tc.emit<Return>(stop_result);
+
+  tc.block = generic_block;
+  Register* out = temps_.AllocateStack();
+  auto* call = tc.emit<CallMethod>(3, out, CallFlags::None);
+  for (auto i = 3; i > 0; i--) {
+    Register* arg = tc.frame.stack.pop();
+    call->SetOperand(i - 1, arg);
+  }
+  call->setFrameState(tc.frame);
+  tc.frame.stack.push(out);
+  tc.frame.stack.pop();
+
+  bc_it = next_it;
+  return true;
+}
+
+bool HIRBuilder::tryInlineAnyGenexprCall(
+    Function& irfunc,
+    CFG& cfg,
+    TranslationContext& tc,
+    jit::BytecodeInstructionBlock::Iterator& bc_it,
+    const jit::BytecodeInstructionBlock& /* bc_instrs */) {
+  BytecodeInstruction bc_instr = *bc_it;
+  if (bc_instr.opcode() != CALL || bc_instr.oparg() != 0 || kwnames_ != nullptr ||
+      tc.frame.stack.size() < 2) {
+    return false;
+  }
+
+  Register* iterable = tc.frame.stack.top();
+  Register* genfunc = tc.frame.stack.top(1);
+
+  BorrowedRef<PyCodeObject> gen_code = getMakeFunctionCode(genfunc);
+  if (!isInlineableSetGenexprCode(gen_code)) {
+    return false;
+  }
+
+  auto pattern = matchInlineableAnyGenexprPattern(code_, bc_instr);
+  if (!pattern.has_value() || !pattern->returns_directly) {
+    return false;
+  }
+
+  Register* closure_tuple = findFunctionClosure(tc.block, genfunc);
+  if (numFreevars(gen_code) != 0 && closure_tuple == nullptr) {
+    return false;
+  }
+
+  InlineResult inline_result = inlineGenexprHIR(
+      &irfunc,
+      &tc.frame,
+      gen_code,
+      iterable,
+      closure_tuple,
+      nullptr,
+      InlineGenexprCollectorKind::kAny);
+  if (inline_result.entry == nullptr || inline_result.exit == nullptr ||
+      inline_result.success == nullptr) {
+    return false;
+  }
+
+  tc.frame.stack.pop();
+  tc.frame.stack.pop();
+  tc.emit<Branch>(inline_result.entry);
+
+  TranslationContext true_tc{inline_result.success, tc.frame};
+  Register* true_val = temps_.AllocateStack();
+  true_tc.emit<LoadConst>(true_val, Type::fromObject(Py_True));
+  true_tc.emit<Return>(true_val, Type::fromObject(Py_True));
+
+  TranslationContext false_tc{inline_result.exit, tc.frame};
+  Register* false_val = temps_.AllocateStack();
+  false_tc.emit<LoadConst>(false_val, Type::fromObject(Py_False));
+  false_tc.emit<Return>(false_val, Type::fromObject(Py_False));
+
+  stop_block_translation_ = true;
+  return true;
+}
+
+bool HIRBuilder::tryEmitSendNoneLoopRewrite(
+    CFG& cfg,
+    TranslationContext& tc,
+    const jit::BytecodeInstruction& bc_instr) {
+  (void)cfg;
+
+  auto log_miss = [&](const char* reason) {
+    if (nameEquals(code_->co_name, "bench_coroutines")) {
+      JIT_LOG(
+          "send-none rewrite miss in {} at bc_off {}: {}",
+          preloader_.fullname(),
+          bc_instr.baseOffset(),
+          reason);
+    }
+  };
+
+  auto log_hit = [&]() {
+    if (nameEquals(code_->co_name, "bench_coroutines")) {
+      JIT_LOG(
+          "send-none rewrite hit in {} at bc_off {}",
+          preloader_.fullname(),
+          bc_instr.baseOffset());
+    }
+  };
+
+  if (kwnames_ != nullptr || tc.frame.stack.size() < 3) {
+    log_miss("stack/kwnames precondition");
+    return false;
+  }
+
+  auto pattern = matchSendNoneLoopPattern(code_, bc_instr);
+  if (!pattern.has_value()) {
+    log_miss("bytecode pattern");
+    return false;
+  }
+
+  Register* send_arg = tc.frame.stack.top();
+  Register* bound_self = tc.frame.stack.top(1);
+  Register* method = tc.frame.stack.top(2);
+
+  if (!bound_self->instr()->IsGetSecondOutput() ||
+      bound_self->instr()->GetOperand(0) != method) {
+    log_miss("bound self is not GetSecondOutput(method)");
+    return false;
+  }
+
+  if (!send_arg->instr()->IsLoadConst() ||
+      static_cast<LoadConst*>(send_arg->instr())->type().asObject() !=
+          Py_None) {
+    log_miss("send arg is not LoadConst(Py_None)");
+    return false;
+  }
+
+  tc.frame.stack.pop();
+  tc.frame.stack.pop();
+  tc.frame.stack.pop();
+
+  Register* send_result = temps_.AllocateStack();
+  tc.emit<Send>(bound_self, send_arg, send_result, tc.frame);
+
+  Register* done = temps_.AllocateNonStack();
+  tc.emit<GetSecondOutput>(done, TCInt64, send_result);
+
+  BasicBlock* done_block = getBlockAtOff(pattern->outer_loop_off);
+  BasicBlock* continue_block = getBlockAtOff(pattern->inner_loop_off);
+    tc.emit<CondBranch>(done, done_block, continue_block);
+    stop_block_translation_ = true;
+    log_hit();
+  return true;
+}
 #endif
 
 void HIRBuilder::emitBinaryOp(
@@ -3134,13 +3791,22 @@ void HIRBuilder::emitBinaryOp(
         tc.emit<GuardType>(right, TUnicodeExact, right, tc.frame);
         break;
       case BINARY_SUBSCR_DICT:
+#if PY_VERSION_HEX >= 0x030E0000
+      case BINARY_OP_SUBSCR_DICT:
+#endif
         tc.emit<GuardType>(left, TDictExact, left, tc.frame);
         break;
       case BINARY_SUBSCR_LIST_INT:
+#if PY_VERSION_HEX >= 0x030E0000
+      case BINARY_OP_SUBSCR_LIST_INT:
+#endif
         tc.emit<GuardType>(left, TListExact, left, tc.frame);
         tc.emit<GuardType>(right, TLongExact, right, tc.frame);
         break;
       case BINARY_SUBSCR_TUPLE_INT:
+#if PY_VERSION_HEX >= 0x030E0000
+      case BINARY_OP_SUBSCR_TUPLE_INT:
+#endif
         tc.emit<GuardType>(left, TTupleExact, left, tc.frame);
         tc.emit<GuardType>(right, TLongExact, right, tc.frame);
         break;
@@ -3756,8 +4422,37 @@ void HIRBuilder::emitCompareOp(
   }
 }
 
-void HIRBuilder::emitToBool(TranslationContext& tc) {
+void HIRBuilder::emitToBool(
+    TranslationContext& tc,
+    const jit::BytecodeInstruction* bc_instr) {
   Register* operand = tc.frame.stack.pop();
+
+  if (bc_instr != nullptr && getConfig().specialized_opcodes) {
+    switch (bc_instr->specializedOpcode()) {
+#if PY_VERSION_HEX >= 0x030E0000
+      // CPython's adaptive TO_BOOL_NONE is only a quickening hint: non-None
+      // values fall back to generic TO_BOOL in the interpreter. Lowering it to
+      // a permanent None guard in JIT code turns shape changes into repeated
+      // deopts, so we intentionally leave it on the generic path here.
+      case TO_BOOL_BOOL:
+        tc.emit<GuardType>(operand, TBool, operand, tc.frame);
+        tc.frame.stack.push(operand);
+        return;
+      case TO_BOOL_INT:
+        tc.emit<GuardType>(operand, TLongExact, operand, tc.frame);
+        break;
+      case TO_BOOL_LIST:
+        tc.emit<GuardType>(operand, TListExact, operand, tc.frame);
+        break;
+      case TO_BOOL_STR:
+        tc.emit<GuardType>(operand, TUnicodeExact, operand, tc.frame);
+        break;
+#endif
+      default:
+        break;
+    }
+  }
+
   Register* truthy_result = temps_.AllocateStack();
   tc.emit<IsTruthy>(truthy_result, operand, tc.frame);
 
@@ -3822,6 +4517,11 @@ void HIRBuilder::emitJumpIf(
   BasicBlock* false_block = getBlockAtOff(false_offset);
 
   if (check_truthy) {
+    if (var->instr()->IsPrimitiveBoxBool()) {
+      tc.emit<CondBranch>(var->instr()->GetOperand(0), true_block, false_block);
+      return;
+    }
+
     Register* tval = temps_.AllocateNonStack();
     // Registers that hold the result of `IsTruthy` are guaranteed to never be
     // the home of a value left on the stack at the end of a basic block, so we
@@ -4034,14 +4734,31 @@ void HIRBuilder::emitLoadAttr(
         if (descr == nullptr) {
           break;
         }
-        // This lowering turns the method load into a constant descriptor plus
-        // the receiver, so keep it on receivers whose exact runtime type is
-        // already stable in HIR. Polymorphic args and loop locals should stay
-        // on LoadMethod to preserve the cache-backed fallback path.
         if (!canUseMethodWithValuesFastPath(
                 receiver, descr, code_, preloader_.globals())) {
+          // Only recover the profiled fast path in the outer function body.
+          // Re-emitting the same hybrid branch inside already-inlined callees
+          // creates a nested shape that later HIR passes do not handle well yet.
+          if (tc.frame.parent == nullptr) {
+            Register* result = temps_.AllocateStack();
+            Register* method_instance = temps_.AllocateStack();
+            tc.emit<LoadMethod>(result, receiver, name_idx, tc.frame);
+            tc.emit<GetSecondOutput>(method_instance, TOptObject, result);
+            pending_method_with_values_call_ = PendingMethodWithValuesCall{
+                receiver,
+                result,
+                descr,
+                bc_instr.cacheU32(2),
+                bc_instr.cacheU32(4)};
+            tc.frame.stack.push(result);
+            tc.frame.stack.push(method_instance);
+            return;
+          } else {
+            pending_method_with_values_call_.reset();
+          }
           break;
         }
+        pending_method_with_values_call_.reset();
         Register* obj_type = emit_type_version_guard(
             bc_instr.cacheU32(2), "LOAD_ATTR_METHOD_WITH_VALUES");
         emit_inline_values_valid_guard(obj_type, "LOAD_ATTR_METHOD_WITH_VALUES");
@@ -5097,6 +5814,13 @@ void HIRBuilder::emitPopJumpIf(
 
   if (bc_instr.opcode() == POP_JUMP_IF_FALSE ||
       bc_instr.opcode() == POP_JUMP_IF_TRUE) {
+    if constexpr (PY_VERSION_HEX >= 0x030E0000) {
+      if (var->instr()->IsPrimitiveBoxBool()) {
+        tc.emit<CondBranch>(var->instr()->GetOperand(0), true_block, false_block);
+        return;
+      }
+    }
+
     Register* is_true = temps_.AllocateNonStack();
     // In 3.14+ coercion to exactly Py_True or Py_False is performed by earlier
     // instructions. See GH-106008.
@@ -6113,18 +6837,37 @@ void HIRBuilder::emitSetAdd(
 void HIRBuilder::emitInlineGenexprYield(
     TranslationContext& tc,
     const jit::BytecodeInstruction& /* bc_instr */) {
-  JIT_CHECK(
-      inline_genexpr_collector_ != nullptr,
-      "inline genexpr collector should be initialized");
   auto yielded = tc.frame.stack.pop();
-  auto result = temps_.AllocateStack();
   switch (inline_genexpr_collector_kind_) {
     case InlineGenexprCollectorKind::kSet:
-      tc.emit<SetSetItem>(result, inline_genexpr_collector_, yielded, tc.frame);
+      JIT_CHECK(
+          inline_genexpr_collector_ != nullptr,
+          "inline genexpr collector should be initialized");
+      {
+        auto result = temps_.AllocateStack();
+        tc.emit<SetSetItem>(result, inline_genexpr_collector_, yielded, tc.frame);
+      }
       return;
     case InlineGenexprCollectorKind::kList:
-      tc.emit<ListAppend>(result, inline_genexpr_collector_, yielded, tc.frame);
+      JIT_CHECK(
+          inline_genexpr_collector_ != nullptr,
+          "inline genexpr collector should be initialized");
+      {
+        auto result = temps_.AllocateStack();
+        tc.emit<ListAppend>(result, inline_genexpr_collector_, yielded, tc.frame);
+      }
       return;
+    case InlineGenexprCollectorKind::kAny: {
+      JIT_CHECK(
+          inline_genexpr_success_ != nullptr && inline_genexpr_cfg_ != nullptr,
+          "inline any-genexpr state should be initialized");
+      auto truthy = temps_.AllocateNonStack();
+      tc.emit<IsTruthy>(truthy, yielded, tc.frame);
+      BasicBlock* continue_block = inline_genexpr_cfg_->AllocateBlock();
+      tc.emit<CondBranch>(truthy, inline_genexpr_success_, continue_block);
+      tc.block = continue_block;
+      return;
+    }
   }
   JIT_ABORT("Unhandled inline genexpr collector kind");
 }
@@ -6575,12 +7318,9 @@ BorrowedRef<> HIRBuilder::constArg(const BytecodeInstruction& bc_instr) {
 }
 
 void HIRBuilder::checkTranslate() {
-  if (
-      preloader_.fullname() == "enum:Flag.__and__" ||
-      preloader_.fullname() == "enum:Flag.__or__" ||
-      preloader_.fullname() == "enum:Flag.__xor__") {
+  if (preloader_.fullname() == "enum:Flag.__and__") {
     throw std::runtime_error{
-        "Cannot compile enum:Flag bitwise helper to HIR after upstream merge"};
+        "Cannot compile enum:Flag.__and__ to HIR after upstream merge"};
   }
 
   PyObject* names = code_->co_names;

@@ -990,6 +990,18 @@ class RegisterToMemoryMoves {
   }
 };
 
+bool isZeroingXorOnRegister(const Instruction* instr, PhyLocation reg) {
+  if (!instr->isXor() || !instr->output()->isNone() ||
+      instr->getNumInputs() != 2) {
+    return false;
+  }
+
+  auto lhs = instr->getInput(0);
+  auto rhs = instr->getInput(1);
+  return lhs->isReg() && rhs->isReg() && lhs->getPhyRegister() == reg &&
+      rhs->getPhyRegister() == reg;
+}
+
 // Replace memory input with register when possible within a basic block and
 // remove the unnecessary moves after the replacement.
 RewriteResult optimizeMoveSequence(BasicBlock* basicblock) {
@@ -1074,6 +1086,11 @@ RewriteResult optimizeMoveSequence(BasicBlock* basicblock) {
                 if (out_phy_reg == ret_reg) {
                   break;
                 }
+              }
+
+              if (isZeroingXorOnRegister(scan, in->getPhyRegister()) ||
+                  isZeroingXorOnRegister(scan, ret_reg)) {
+                break;
               }
             }
 

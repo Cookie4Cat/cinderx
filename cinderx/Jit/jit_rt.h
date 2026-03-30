@@ -182,6 +182,14 @@ PyObject* JITRT_LoadGlobalsDict(PyThreadState* tstate);
  */
 PyObject* JITRT_ListSlice(PyObject* list, PyObject* start, PyObject* stop);
 
+/*
+ * Fast path for `list[:k+1] = list[k::-1]` on exact lists.
+ *
+ * Falls back to generic Python slicing semantics when operand types are not
+ * exact fast-path shapes. Returns 0 on success and -1 on error.
+ */
+int JITRT_ListPrefixReverseAssign(PyObject* list, PyObject* index);
+
 #if PY_VERSION_HEX >= 0x030E0000 && PY_VERSION_HEX < 0x030F0000
 /*
  * Exact-dict item lookup for try/except KeyError lowering.
@@ -203,6 +211,19 @@ PyObject* JITRT_GetDictItemMissSentinel(void);
  * Returns either a new reference to `x` or a new tuple built from `y`.
  */
 PyObject* JITRT_DeepcopyTuplePostMiss(PyObject* x, PyObject* y);
+
+/*
+ * Narrow helper for the stdlib pickle._Unpickler.load() stop path.
+ *
+ * Returns self.stack.pop() while preserving normal Python exceptions.
+ */
+PyObject* JITRT_PickleUnpicklerPopStack(PyObject* self);
+
+/*
+ * Return 1 when key is the stdlib pickle STOP opcode byte string, else 0.
+ * This helper never sets a Python exception.
+ */
+int JITRT_PickleIsStopKey(PyObject* key);
 #endif
 
 /*
@@ -256,6 +277,16 @@ PyObject* JITRT_CallMethod(
  * eval breaker events after the call.
  */
 PyObject* JITRT_Vectorcall(
+    PyObject* callable,
+    PyObject* const* args,
+    size_t nargsf,
+    PyObject* kwnames);
+
+/*
+ * Performs a function call with a vectorcall when the callable is known to be
+ * an exact Python function object.
+ */
+PyObject* JITRT_VectorcallExactPyFunc(
     PyObject* callable,
     PyObject* const* args,
     size_t nargsf,

@@ -17,6 +17,7 @@
 #include "cinderx/Jit/hir/guarded_load_elimination.h"
 #include "cinderx/Jit/hir/hir_stats.h"
 #include "cinderx/Jit/hir/inliner.h"
+#include "cinderx/Jit/hir/inline_genexpr_makefunction_hoist.h"
 #include "cinderx/Jit/hir/insert_update_prev_instr.h"
 #include "cinderx/Jit/hir/list_slice_cleanup.h"
 #include "cinderx/Jit/hir/long_loop_unboxing.h"
@@ -127,6 +128,7 @@ void Compiler::runPasses(
   runPassIf(hir::CleanCFG{}, PassConfig::kCleanCFG);
   runPassIf(hir::DeadCodeElimination{}, PassConfig::kDeadCodeElim);
   runPassIf(hir::CleanCFG{}, PassConfig::kCleanCFG);
+  runPass(jit::hir::InlineGenexprMakeFunctionHoist{}, irfunc, callback);
 
   runPass(jit::hir::RefcountInsertion{}, irfunc, callback);
   runPass(jit::hir::ListSliceCleanup{}, irfunc, callback);

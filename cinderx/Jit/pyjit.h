@@ -56,15 +56,6 @@ bool scheduleJitCompile(BorrowedRef<PyFunctionObject> func);
  */
 Result compileFunction(BorrowedRef<PyFunctionObject> func);
 
-// If a JIT-compiled function repeatedly deopts on a handled subscript
-// exception path, suppress future compilation attempts for that function so
-// the workload can stay on the interpreter rather than repeatedly bouncing
-// through JIT entry and deopt.
-void maybeSuppressAfterRepeatedUnhandledSubscriptException(
-    CodeRuntime* code_runtime,
-    std::size_t deopt_idx,
-    const DeoptMetadata& deopt_meta);
-
 /*
  * Preload a function, along with any functions that it calls that we might want
  * to compile afterwards as well.  This is to support inlining and faster

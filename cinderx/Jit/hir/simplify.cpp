@@ -12,6 +12,7 @@
 #include "cinderx/Common/type.h"
 #include "cinderx/Jit/context.h"
 #include "cinderx/Jit/bytecode.h"
+#include "cinderx/Jit/jit_rt.h"
 #include "cinderx/Jit/hir/analysis.h"
 #include "cinderx/Jit/hir/clean_cfg.h"
 #include "cinderx/Jit/hir/copy_propagation.h"
@@ -23,6 +24,7 @@
 
 #include <fmt/ostream.h>
 
+#include <cstdlib>
 #include <cstring>
 
 namespace jit::hir {
@@ -34,6 +36,17 @@ bool useExactMethodCacheSplit() {
     const char* env = std::getenv("PYTHONJITEXACTMETHODCACHESPLIT");
     if (env == nullptr) {
       return 0;
+    }
+    return *env != '\0' && std::strcmp(env, "0") != 0;
+  }();
+  return enabled != 0;
+}
+
+bool sliceReverseFastPathEnabled() {
+  static int enabled = []() -> int {
+    const char* env = std::getenv("PYTHONJITENABLESLICEFASTPATH");
+    if (env == nullptr) {
+      return 1;
     }
     return *env != '\0' && std::strcmp(env, "0") != 0;
   }();
@@ -614,6 +627,65 @@ bool isLenDerivedInt(Register* reg) {
   }
 
   return false;
+}
+
+Register* stripTypeNarrowing(Register* reg) {
+  Register* cur = chaseAssignOperand(reg);
+  while (true) {
+    Instr* instr = cur->instr();
+    if (instr->IsGuardType() || instr->IsRefineType()) {
+      cur = chaseAssignOperand(instr->GetOperand(0));
+      continue;
+    }
+    return cur;
+  }
+}
+
+bool isNoneConst(Register* reg) {
+  Type ty = stripTypeNarrowing(reg)->type();
+  return ty <= TNoneType || (ty.hasObjectSpec() && ty.objectSpec() == Py_None);
+}
+
+bool isLongConstValue(Register* reg, int64_t value) {
+  auto boxed = getBoxedLongConst(stripTypeNarrowing(reg));
+  return boxed.has_value() && *boxed == value;
+}
+
+bool sameValueIgnoringNarrowing(Register* a, Register* b) {
+  return stripTypeNarrowing(a) == stripTypeNarrowing(b);
+}
+
+Register* matchLongAddOneFromBase(Register* reg, Register** base_out) {
+  Register* stop = stripTypeNarrowing(reg);
+  Register* lhs = nullptr;
+  Register* rhs = nullptr;
+
+  if (stop->instr()->IsLongBinaryOp()) {
+    auto* add = static_cast<const LongBinaryOp*>(stop->instr());
+    if (add->op() != BinaryOpKind::kAdd) {
+      return nullptr;
+    }
+    lhs = stripTypeNarrowing(add->left());
+    rhs = stripTypeNarrowing(add->right());
+  } else if (stop->instr()->IsBinaryOp()) {
+    auto* add = static_cast<const BinaryOp*>(stop->instr());
+    if (add->op() != BinaryOpKind::kAdd) {
+      return nullptr;
+    }
+    lhs = stripTypeNarrowing(add->left());
+    rhs = stripTypeNarrowing(add->right());
+  } else {
+    return nullptr;
+  }
+  if (isLongConstValue(lhs, 1)) {
+    *base_out = rhs;
+    return stop;
+  }
+  if (isLongConstValue(rhs, 1)) {
+    *base_out = lhs;
+    return stop;
+  }
+  return nullptr;
 }
 
 Register* unboxLenArithmeticInt(Register* reg) {
@@ -3363,6 +3435,49 @@ Register* simplifyStoreSubscr(Env& env, const StoreSubscr* instr) {
   Register* container = instr->GetOperand(0);
   Register* sub = instr->GetOperand(1);
   Register* value = instr->GetOperand(2);
+  Register* base_container = chaseAssignOperand(container);
+  Register* base_sub = chaseAssignOperand(sub);
+  Register* base_value = chaseAssignOperand(value);
+
+  // Recognize: list[:k+1] = list[k::-1]
+  //
+  // This is the hot flip shape in fannkuch. Lower to a dedicated runtime
+  // helper to avoid creating temporary slice objects on the common path.
+  if (sliceReverseFastPathEnabled() &&
+      base_sub->instr()->IsBuildSlice() && base_value->instr()->IsBinaryOp()) {
+    auto* lhs_slice = static_cast<const BuildSlice*>(base_sub->instr());
+    auto* rhs_subscr = static_cast<const BinaryOp*>(base_value->instr());
+    if (!(lhs_slice->NumOperands() == 2 &&
+          rhs_subscr->op() == BinaryOpKind::kSubscript &&
+          chaseAssignOperand(rhs_subscr->left()) == base_container &&
+          rhs_subscr->right()->instr()->IsBuildSlice())) {
+    } else {
+      auto* rhs_slice = static_cast<const BuildSlice*>(rhs_subscr->right()->instr());
+      if (rhs_slice->NumOperands() == 3 &&
+          isNoneConst(lhs_slice->start()) &&
+          isNoneConst(rhs_slice->stop()) &&
+          isLongConstValue(rhs_slice->step(), -1)) {
+        Register* rhs_start = rhs_slice->start();
+        Register* add_base = nullptr;
+        if (matchLongAddOneFromBase(lhs_slice->stop(), &add_base) != nullptr &&
+            sameValueIgnoringNarrowing(add_base, rhs_start)) {
+          Register* helper_list = container;
+          Register* helper_index = rhs_start;
+          auto output = env.func.env.AllocateRegister();
+          env.emitRawInstr<CallStatic>(
+              2,
+              output,
+              reinterpret_cast<void*>(JITRT_ListPrefixReverseAssign),
+              TCInt32,
+              helper_list,
+              helper_index);
+          env.emit<CheckNeg>(output, *instr->frameState());
+          env.optimized = true;
+          return nullptr;
+        }
+      }
+    }
+  }
 
   if (value->instr()->IsPrimitiveBox()) {
     auto* box = static_cast<const PrimitiveBox*>(value->instr());

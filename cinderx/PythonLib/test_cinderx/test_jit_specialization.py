@@ -260,3 +260,29 @@ class SpecializationTests(unittest.TestCase):
         self.assertNotIn("UNPACK_SEQUENCE", opnames(f))
         self.assertIn("UNPACK_SEQUENCE_TWO_TUPLE", opnames(f))
         self.assertEqual(f(("c", "d")), "c")
+
+    @passIf(sys.version_info < (3, 14), "Requires Python 3.14 TO_BOOL specialization")
+    def test_to_bool_int(self) -> None:
+        def f(x: int) -> int:
+            if x:
+                return 1
+            return 0
+
+        specialize(f, lambda: f(1))
+
+        self.assertIn("TO_BOOL_INT", opnames(f))
+        self.assertEqual(f(1), 1)
+        self.assertEqual(f(0), 0)
+
+    @passIf(sys.version_info < (3, 14), "Requires Python 3.14 TO_BOOL specialization")
+    def test_to_bool_list(self) -> None:
+        def f(li: list[int]) -> int:
+            if li:
+                return 1
+            return 0
+
+        specialize(f, lambda: f([1]))
+
+        self.assertIn("TO_BOOL_LIST", opnames(f))
+        self.assertEqual(f([1]), 1)
+        self.assertEqual(f([]), 0)

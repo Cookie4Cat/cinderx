@@ -25,7 +25,6 @@
 #include "cinderx/Common/util.h"
 #include "cinderx/Interpreter/interpreter.h"
 #include "cinderx/Jit/code_allocator.h"
-#include "cinderx/Jit/bytecode.h"
 #include "cinderx/Jit/compiled_function.h"
 #include "cinderx/Jit/compiler.h"
 #include "cinderx/Jit/config.h"
@@ -97,60 +96,11 @@ CompilerContext<Compiler>* jitCtx() {
   return nullptr;
 }
 
-void uncompile(BorrowedRef<PyFunctionObject> func);
-
 // Don't care flags: CO_NOFREE, CO_FUTURE_* (the only still-relevant future is
 // "annotations" which doesn't impact bytecode execution.)
 constexpr int required_code_flags = CO_OPTIMIZED | CO_NEWLOCALS;
 bool hasRequiredFlags(BorrowedRef<PyCodeObject> code) {
   return (code->co_flags & required_code_flags) == required_code_flags;
-}
-
-bool codeHasExceptionHandling(BorrowedRef<PyCodeObject> code) {
-#if PY_VERSION_HEX >= 0x030B0000
-  return code->co_exceptiontable != nullptr &&
-      PyBytes_CheckExact(code->co_exceptiontable) &&
-      PyBytes_GET_SIZE(code->co_exceptiontable) > 0;
-#else
-  for (const auto& instr : BytecodeInstructionBlock{code}) {
-    if (instr.opcode() == SETUP_FINALLY) {
-      return true;
-    }
-  }
-  return false;
-#endif
-}
-
-bool isSubscriptBytecode(const DeoptMetadata& deopt_meta) {
-  const auto& frame = deopt_meta.innermostFrame();
-  if (frame.code == nullptr || frame.cause_instr_idx.value() < 0) {
-    return false;
-  }
-
-  BytecodeInstruction instr{frame.code, frame.cause_instr_idx};
-  int opcode = instr.opcode();
-  if (opcode == BINARY_SUBSCR) {
-    return true;
-  }
-#if PY_VERSION_HEX >= 0x030E0000
-  return opcode == BINARY_OP && instr.oparg() == NB_SUBSCR;
-#else
-  return false;
-#endif
-}
-
-std::vector<BorrowedRef<PyFunctionObject>> functionsForRuntime(
-    CompilerContext<Compiler>* ctx,
-    CodeRuntime* code_runtime) {
-  std::vector<BorrowedRef<PyFunctionObject>> funcs;
-  for (BorrowedRef<PyFunctionObject> func : ctx->compiledFuncs()) {
-    CompiledFunction* compiled = ctx->lookupFunc(func);
-    if (compiled == nullptr || compiled->runtime() != code_runtime) {
-      continue;
-    }
-    funcs.push_back(func);
-  }
-  return funcs;
 }
 
 uint64_t countCalls(PyCodeObject* code) {
@@ -1419,48 +1369,6 @@ bool registerFunction(BorrowedRef<PyFunctionObject> func) {
   jit_reg_units.emplace(func.getObj());
 
   return true;
-}
-
-void maybeSuppressAfterRepeatedUnhandledSubscriptExceptionImpl(
-    CodeRuntime* code_runtime,
-    std::size_t deopt_idx,
-    const DeoptMetadata& deopt_meta) {
-  if (deopt_meta.reason != DeoptReason::kUnhandledException) {
-    return;
-  }
-  if (!isSubscriptBytecode(deopt_meta)) {
-    return;
-  }
-  BorrowedRef<PyCodeObject> code = deopt_meta.code();
-  if (code == nullptr || !codeHasExceptionHandling(code)) {
-    return;
-  }
-
-  auto* ctx = jitCtx();
-  if (ctx == nullptr) {
-    return;
-  }
-  const DeoptStat* stat = ctx->deoptStat(code_runtime, deopt_idx);
-  if (stat == nullptr || stat->count < kUnhandledSubscriptSuppressThreshold) {
-    return;
-  }
-
-  auto funcs = functionsForRuntime(ctx, code_runtime);
-  if (funcs.empty()) {
-    return;
-  }
-
-  for (BorrowedRef<PyFunctionObject> func : funcs) {
-    BorrowedRef<PyCodeObject> func_code{func->func_code};
-    if (!(func_code->co_flags & CI_CO_SUPPRESS_JIT)) {
-      JIT_DLOG(
-          "Suppressing {} after {} repeated handled subscript exception deopts",
-          funcFullname(func),
-          stat->count);
-      func_code->co_flags |= CI_CO_SUPPRESS_JIT;
-    }
-    uncompile(func);
-  }
 }
 
 PyObject* multithreaded_compile_test(PyObject*, PyObject*) {
@@ -3584,18 +3492,6 @@ void unregisterFunctionCodes(BorrowedRef<PyFunctionObject> func) {
 }
 
 } // namespace
-
-namespace jit {
-
-void maybeSuppressAfterRepeatedUnhandledSubscriptException(
-    CodeRuntime* code_runtime,
-    std::size_t deopt_idx,
-    const DeoptMetadata& deopt_meta) {
-  maybeSuppressAfterRepeatedUnhandledSubscriptExceptionImpl(
-      code_runtime, deopt_idx, deopt_meta);
-}
-
-} // namespace jit
 
 #if PY_VERSION_HEX < 0x030C0000
 

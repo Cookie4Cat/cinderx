@@ -44,7 +44,6 @@
 #include "cinderx/Jit/lir/regalloc.h"
 #include "cinderx/Jit/lir/verify.h"
 #include "cinderx/Jit/perf_jitdump.h"
-#include "cinderx/Jit/pyjit.h"
 #include "cinderx/UpstreamBorrow/borrowed.h"
 
 #include <fmt/format.h>
@@ -358,8 +357,6 @@ CiPyFrameObjType* prepareForDeopt(
   auto ctx = getContext();
   ctx->recordDeopt(code_runtime, deopt_idx, deopt_obj);
   releaseRefs(deopt_meta, mem);
-  maybeSuppressAfterRepeatedUnhandledSubscriptException(
-      code_runtime, deopt_idx, deopt_meta);
 #if PY_VERSION_HEX >= 0x030C0000
   if (_PyFrame_GetCode(frame)->co_flags & kCoFlagsAnyGenerator) {
     BorrowedRef<PyGenObject> base_gen = _PyGen_GetGeneratorFromFrame(frame);

@@ -245,59 +245,55 @@ class ArmRuntimeTests(unittest.TestCase):
             self.assertEqual(int(lines[-2]), 0, proc.stdout)
             self.assertEqual(int(lines[-1]), 800, proc.stdout)
 
-    def test_skip_chars_handled_index_error_avoids_repeated_unhandled_deopts(
-        self,
-    ) -> None:
+    def test_to_bool_none_specialization_avoids_repeated_non_none_deopts(self) -> None:
         # Regression guard:
-        # a hot `try/except IndexError` string scan may need to deopt once, but
-        # must stop re-entering the compiled path on every later end-of-string.
+        # adaptive TO_BOOL_NONE in the interpreter is only a quickening hint.
+        # The JIT must not compile it into a permanent "value is None" guard,
+        # otherwise later non-None falsey values deopt on every execution.
         code = textwrap.dedent(
             """
+            import dis
             import cinderx.jit as jit
 
             jit.enable()
             jit.enable_specialized_opcodes()
-            jit.compile_after_n_calls(2)
+            jit.compile_after_n_calls(1000000)
 
-            def skip_chars(src, pos, chars):
-                try:
-                    while src[pos] in chars:
-                        pos += 1
-                except IndexError:
-                    pass
-                return pos
+            class Falsey:
+                def __bool__(self):
+                    return False
 
-            src = " " * 50
-            chars = " "
+            def f(x):
+                if x:
+                    return 1
+                return 0
 
-            for _ in range(3):
-                assert skip_chars(src, 0, chars) == 50
+            for _ in range(200000):
+                f(None)
 
-            assert jit.is_jit_compiled(skip_chars)
-            counts = jit.get_function_hir_opcode_counts(skip_chars)
+            opnames = [instr.opname for instr in dis.get_instructions(f, adaptive=True)]
+            assert "TO_BOOL_NONE" in opnames, opnames
+            assert jit.force_compile(f)
+            assert jit.is_jit_compiled(f)
 
             jit.get_and_clear_runtime_stats()
-            result = 0
+            total = 0
             for _ in range(200):
-                result += skip_chars(src, 0, chars)
+                total += f(Falsey())
 
             stats = jit.get_and_clear_runtime_stats()
             deopt_count = sum(
                 entry["int"]["count"]
                 for entry in stats.get("deopt", [])
-                if entry["normal"]["func_qualname"] == "skip_chars"
+                if entry["normal"]["func_qualname"] == "f"
             )
-
-            print(counts.get("BinaryOp", 0))
-            print(counts.get("UnicodeSubscr", 0))
             print(deopt_count)
-            print(jit.is_jit_compiled(skip_chars))
-            print(result)
+            print(total)
             """
         )
 
         with tempfile.TemporaryDirectory() as tmp:
-            script = f"{tmp}/skip_chars_handled_index_error.py"
+            script = f"{tmp}/to_bool_none_no_repeated_deopt.py"
             with open(script, "w", encoding="utf-8") as fp:
                 fp.write(code)
 
@@ -314,11 +310,9 @@ class ArmRuntimeTests(unittest.TestCase):
                 f"stdout:\n{proc.stdout}\nstderr:\n{proc.stderr}",
             )
             lines = [line.strip() for line in proc.stdout.splitlines() if line.strip()]
-            self.assertGreaterEqual(len(lines), 5, proc.stdout)
-            self.assertGreaterEqual(int(lines[-5]) + int(lines[-4]), 1, proc.stdout)
-            self.assertLessEqual(int(lines[-3]), 3, proc.stdout)
-            self.assertEqual(lines[-2], "False", proc.stdout)
-            self.assertEqual(int(lines[-1]), 10000, proc.stdout)
+            self.assertGreaterEqual(len(lines), 2, proc.stdout)
+            self.assertEqual(int(lines[-2]), 0, proc.stdout)
+            self.assertEqual(int(lines[-1]), 0, proc.stdout)
 
     def test_specialized_numeric_leaf_mixed_types_avoid_deopts(self) -> None:
         # Regression guard:
@@ -1114,6 +1108,161 @@ class ArmRuntimeTests(unittest.TestCase):
             lines = [line.strip() for line in proc.stdout.splitlines() if line.strip()]
             self.assertGreaterEqual(len(lines), 4, proc.stdout)
             self.assertGreaterEqual(int(lines[-4]) + int(lines[-3]), 1, proc.stdout)
+            self.assertEqual(int(lines[-2]), 0, proc.stdout)
+            self.assertEqual(int(lines[-1]), 30000, proc.stdout)
+
+    def test_attr_derived_monomorphic_method_load_restores_inlining(self) -> None:
+        if sys.version_info < (3, 14):
+            self.skipTest("requires Python 3.14 LOAD_ATTR_METHOD_WITH_VALUES")
+
+        # Regression guard:
+        # attr-derived receivers such as self.reference.find(update) may be
+        # runtime-monomorphic even when their HIR type is only Object. Those
+        # receivers should still be able to recover the method-with-values fast
+        # path and expose a VectorCall that the HIR inliner can see.
+        code = textwrap.dedent(
+            """
+            import cinderx.jit as jit
+            import cinderjit
+
+            jit.enable()
+            jit.enable_hir_inliner()
+            jit.enable_specialized_opcodes()
+            jit.compile_after_n_calls(1000000)
+
+            class Square:
+                def __init__(self, reference=None, value=0):
+                    self.reference = reference
+                    self.value = value
+
+                def find(self, update):
+                    if self.reference is None:
+                        return self.value + update
+                    return self.reference.find(update) + self.value + update
+
+            root = Square(None, 1)
+            mid = Square(root, 2)
+            outer = Square(mid, 3)
+
+            for _ in range(20000):
+                outer.find(1)
+
+            assert jit.force_compile(Square.find)
+            counts = cinderjit.get_function_hir_opcode_counts(Square.find)
+            stats = jit.get_inlined_functions_stats(Square.find)
+            print(counts.get("CallMethod", 0))
+            print(counts.get("VectorCall", 0))
+            print(stats.get("num_inlined_functions", 0))
+            print(outer.find(1))
+            """
+        )
+
+        with tempfile.TemporaryDirectory() as tmp:
+            script = f"{tmp}/attr_derived_monomorphic_method_load.py"
+            with open(script, "w", encoding="utf-8") as fp:
+                fp.write(code)
+
+            proc = subprocess.run(
+                [sys.executable, script],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                env=dict(os.environ),
+            )
+            self.assertEqual(
+                proc.returncode,
+                0,
+                f"stdout:\n{proc.stdout}\nstderr:\n{proc.stderr}",
+            )
+            lines = [line.strip() for line in proc.stdout.splitlines() if line.strip()]
+            self.assertGreaterEqual(len(lines), 4, proc.stdout)
+            self.assertGreaterEqual(int(lines[-2]), 1, proc.stdout)
+            self.assertEqual(int(lines[-1]), 9, proc.stdout)
+
+    def test_attr_derived_polymorphic_method_load_avoids_method_with_values_deopts(
+        self,
+    ) -> None:
+        if sys.version_info < (3, 14):
+            self.skipTest("requires Python 3.14 LOAD_ATTR_METHOD_WITH_VALUES")
+
+        # Regression guard:
+        # attr-derived receivers should not be reopened so broadly that a
+        # polymorphic field like self.reference reintroduces the old
+        # method-with-values deopt storm.
+        code = textwrap.dedent(
+            """
+            import cinderx.jit as jit
+            import cinderjit
+
+            jit.enable()
+            jit.enable_specialized_opcodes()
+            jit.compile_after_n_calls(1000000)
+
+            class FirstLeaf:
+                def execute(self):
+                    return 1
+
+            class SecondLeaf:
+                def execute(self):
+                    return 2
+
+            class Holder:
+                def __init__(self, reference):
+                    self.reference = reference
+
+                def run(self):
+                    return self.reference.execute()
+
+            holder = Holder(FirstLeaf())
+            for _ in range(20000):
+                holder.run()
+
+            assert jit.force_compile(Holder.run)
+            counts = cinderjit.get_function_hir_opcode_counts(Holder.run)
+
+            jit.get_and_clear_runtime_stats()
+            total = 0
+            for i in range(20000):
+                holder.reference = FirstLeaf() if (i & 1) == 0 else SecondLeaf()
+                total += holder.run()
+
+            stats = jit.get_and_clear_runtime_stats()
+            relevant = [
+                entry
+                for entry in stats["deopt"]
+                if entry["normal"]["func_qualname"] == "Holder.run"
+                and entry["normal"]["description"] == "LOAD_ATTR_METHOD_WITH_VALUES"
+            ]
+
+            print(counts.get("LoadMethod", 0))
+            print(counts.get("LoadMethodCached", 0))
+            print(len(relevant))
+            print(sum(entry["int"]["count"] for entry in relevant))
+            print(total)
+            """
+        )
+
+        with tempfile.TemporaryDirectory() as tmp:
+            script = f"{tmp}/attr_derived_polymorphic_method_load.py"
+            with open(script, "w", encoding="utf-8") as fp:
+                fp.write(code)
+
+            proc = subprocess.run(
+                [sys.executable, script],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                env=dict(os.environ),
+            )
+            self.assertEqual(
+                proc.returncode,
+                0,
+                f"stdout:\n{proc.stdout}\nstderr:\n{proc.stderr}",
+            )
+            lines = [line.strip() for line in proc.stdout.splitlines() if line.strip()]
+            self.assertGreaterEqual(len(lines), 5, proc.stdout)
+            self.assertGreaterEqual(int(lines[-5]) + int(lines[-4]), 1, proc.stdout)
+            self.assertEqual(int(lines[-3]), 0, proc.stdout)
             self.assertEqual(int(lines[-2]), 0, proc.stdout)
             self.assertEqual(int(lines[-1]), 30000, proc.stdout)
 
@@ -2410,6 +2559,82 @@ class ArmRuntimeTests(unittest.TestCase):
             self.assertGreaterEqual(int(lines[-2]), 1, proc.stdout)
             self.assertEqual(float(lines[-1]), 48.0, proc.stdout)
 
+    def test_module_attr_vectorcall_survives_zeroed_return_register(self) -> None:
+        if sys.version_info < (3, 14):
+            self.skipTest("requires Python 3.14 module attr specialization")
+
+        code = textwrap.dedent(
+            """
+            import importlib.util
+            import sys
+            import tempfile
+            import textwrap
+
+            import cinderx.jit as jit
+            import cinderjit
+
+            jit.enable()
+            jit.enable_specialized_opcodes()
+            jit.compile_after_n_calls(1000000)
+
+            module_src = textwrap.dedent(
+                '''
+                def tostring(x):
+                    return b"x"
+
+                def f(mod, x):
+                    for _ in range(30):
+                        y = x
+                    return mod.tostring(y)
+                '''
+            )
+
+            with tempfile.NamedTemporaryFile("w", suffix=".py", delete=False) as fh:
+                fh.write(module_src)
+                path = fh.name
+
+            spec = importlib.util.spec_from_file_location("tmpjitmod", path)
+            mod = importlib.util.module_from_spec(spec)
+            sys.modules[spec.name] = mod
+            assert spec.loader is not None
+            spec.loader.exec_module(mod)
+
+            for _ in range(200):
+                assert mod.f(mod, "a") == b"x"
+
+            assert jit.force_compile(mod.f)
+            counts = cinderjit.get_function_hir_opcode_counts(mod.f)
+            result = mod.f(mod, "a")
+
+            print(jit.is_jit_compiled(mod.f))
+            print(counts.get("VectorCall", 0))
+            print(result.hex())
+            """
+        )
+
+        with tempfile.TemporaryDirectory() as tmp:
+            script = f"{tmp}/module_attr_vectorcall_zeroed_retreg.py"
+            with open(script, "w", encoding="utf-8") as fp:
+                fp.write(code)
+
+            proc = subprocess.run(
+                [sys.executable, script],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                env=dict(os.environ),
+            )
+            self.assertEqual(
+                proc.returncode,
+                0,
+                f"stdout:\n{proc.stdout}\nstderr:\n{proc.stderr}",
+            )
+            lines = [line.strip() for line in proc.stdout.splitlines() if line.strip()]
+            self.assertGreaterEqual(len(lines), 3, proc.stdout)
+            self.assertEqual(lines[-3], "True", proc.stdout)
+            self.assertGreaterEqual(int(lines[-2]), 1, proc.stdout)
+            self.assertEqual(lines[-1], "78", proc.stdout)
+
     def test_list_subclass_append_eliminates_callmethod(self) -> None:
         if sys.version_info < (3, 14):
             self.skipTest("requires Python 3.14 LOAD_ATTR_METHOD_WITH_VALUES")
@@ -3414,6 +3639,101 @@ class ArmRuntimeTests(unittest.TestCase):
             self.assertEqual(int(lines[-2]), 0, proc.stdout)
             self.assertEqual(lines[-1], "([10, 20], 30, [40, 50])", proc.stdout)
 
+    def test_list_prefix_reverse_assign_lowers_to_runtime_fastpath(self) -> None:
+        code = textwrap.dedent(
+            """
+            import cinderx.jit as jit
+            import cinderjit
+
+            jit.enable()
+            jit.enable_specialized_opcodes()
+            jit.compile_after_n_calls(1000000)
+
+            def flip_prefix(perm, k):
+                perm[: k + 1] = perm[k::-1]
+                return perm
+
+            def flip_window(perm, k):
+                perm[1 : k + 1] = perm[k::-1]
+                return perm
+
+            def flip_stride(perm, k):
+                perm[: k + 1] = perm[k::2]
+                return perm
+
+            hot = [0, 1, 2, 3, 4]
+            for _ in range(200000):
+                flip_prefix(hot, 3)
+                flip_window(hot, 3)
+                flip_stride(hot, 3)
+
+            assert jit.force_compile(flip_prefix)
+            assert jit.force_compile(flip_window)
+            assert jit.force_compile(flip_stride)
+            counts = cinderjit.get_function_hir_opcode_counts(flip_prefix)
+            print(counts.get("CallStatic", 0))
+            print(counts.get("StoreSubscr", 0))
+
+            a = [0, 1, 2, 3, 4]
+            print(flip_prefix(a, 3))
+            b = [0, 1, 2, 3, 4]
+            print(flip_prefix(b, -1))
+            c = [0, 1, 2, 3, 4]
+            print(flip_window(c, 3))
+            d = [0, 1, 2, 3, 4]
+            print(flip_stride(d, 3))
+            """
+        )
+
+        with tempfile.TemporaryDirectory() as tmp:
+            script = f"{tmp}/list_prefix_reverse_assign_fastpath.py"
+            with open(script, "w", encoding="utf-8") as fp:
+                fp.write(code)
+
+            proc = subprocess.run(
+                [sys.executable, script],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                env={**os.environ, "PYTHONJITENABLESLICEFASTPATH": "0"},
+            )
+            self.assertEqual(
+                proc.returncode,
+                0,
+                f"stdout:\n{proc.stdout}\nstderr:\n{proc.stderr}",
+            )
+            lines = [line.strip() for line in proc.stdout.splitlines() if line.strip()]
+            self.assertGreaterEqual(len(lines), 6, proc.stdout)
+            off_callstatic = int(lines[-6])
+            off_storesubscr = int(lines[-5])
+            self.assertEqual(lines[-4], "[3, 2, 1, 0, 4]", proc.stdout)
+            self.assertEqual(lines[-3], "[4, 3, 2, 1, 0, 0, 1, 2, 3, 4]", proc.stdout)
+            self.assertEqual(lines[-2], "[0, 3, 2, 1, 0, 4]", proc.stdout)
+            self.assertEqual(lines[-1], "[3, 4]", proc.stdout)
+
+            proc = subprocess.run(
+                [sys.executable, script],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                env={**os.environ, "PYTHONJITENABLESLICEFASTPATH": "1"},
+            )
+            self.assertEqual(
+                proc.returncode,
+                0,
+                f"stdout:\n{proc.stdout}\nstderr:\n{proc.stderr}",
+            )
+            lines = [line.strip() for line in proc.stdout.splitlines() if line.strip()]
+            self.assertGreaterEqual(len(lines), 6, proc.stdout)
+            on_callstatic = int(lines[-6])
+            on_storesubscr = int(lines[-5])
+            self.assertGreaterEqual(on_callstatic, off_callstatic + 1, proc.stdout)
+            self.assertLess(on_storesubscr, off_storesubscr, proc.stdout)
+            self.assertEqual(lines[-4], "[3, 2, 1, 0, 4]", proc.stdout)
+            self.assertEqual(lines[-3], "[4, 3, 2, 1, 0, 0, 1, 2, 3, 4]", proc.stdout)
+            self.assertEqual(lines[-2], "[0, 3, 2, 1, 0, 4]", proc.stdout)
+            self.assertEqual(lines[-1], "[3, 4]", proc.stdout)
+
     def test_istruthy_bool_uses_pointer_compare_fast_path(self) -> None:
         # Regression guard:
         # bool-heavy truthiness checks should not rely solely on
@@ -3783,6 +4103,134 @@ class ArmRuntimeTests(unittest.TestCase):
             self.assertEqual(int(lines[-3]), 1, proc.stdout)
             self.assertEqual(int(lines[-2]), 0, proc.stdout)
             self.assertEqual(lines[-1], "{32, 10, 43, 21}", proc.stdout)
+
+    def test_any_genexpr_eliminates_generator_call(self) -> None:
+        code = textwrap.dedent(
+            """
+            import cinderx.jit as jit
+            import cinderjit
+
+            jit.enable()
+            jit.enable_specialized_opcodes()
+            jit.compile_after_n_calls(1000000)
+
+            class Widget:
+                def __init__(self, has_knob):
+                    self.has_knob = has_knob
+
+            def f(widgets):
+                return any(w.has_knob for w in widgets if w is not None)
+
+            assert jit.force_compile(f)
+            counts = cinderjit.get_function_hir_opcode_counts(f)
+            print(counts.get("CallMethod", 0))
+            print(counts.get("MakeFunction", 0))
+            print(counts.get("InvokeIterNext", 0))
+            print(f([None, Widget(False), Widget(True)]))
+            print(f([None, Widget(False)]))
+            """
+        )
+
+        with tempfile.TemporaryDirectory() as tmp:
+            script = f"{tmp}/any_genexpr_inline.py"
+            with open(script, "w", encoding="utf-8") as fp:
+                fp.write(code)
+
+            proc = subprocess.run(
+                [sys.executable, script],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                env=dict(os.environ),
+            )
+            self.assertEqual(
+                proc.returncode,
+                0,
+                f"stdout:\n{proc.stdout}\nstderr:\n{proc.stderr}",
+            )
+            lines = [line.strip() for line in proc.stdout.splitlines() if line.strip()]
+            self.assertGreaterEqual(len(lines), 5, proc.stdout)
+            self.assertEqual(int(lines[-5]), 0, proc.stdout)
+            self.assertEqual(int(lines[-4]), 0, proc.stdout)
+            self.assertGreaterEqual(int(lines[-3]), 1, proc.stdout)
+            self.assertEqual(lines[-2], "True", proc.stdout)
+            self.assertEqual(lines[-1], "False", proc.stdout)
+
+    def test_set_genexpr_hot_loop_hoists_makefunction_chain(self) -> None:
+        # Regression guard:
+        # after set-genexpr inlining, the residual MakeFunction closure chain
+        # should be hoisted out of the innermost hot path so the loop body no
+        # longer rebuilds it on every generator iteration.
+        code = textwrap.dedent(
+            """
+            import cinderx.jit as jit
+            import cinderjit
+
+            jit.enable()
+            jit.enable_specialized_opcodes()
+            jit.compile_after_n_calls(2)
+
+            def hot():
+                data = tuple(range(8))
+                for _ in range(50000):
+                    set(data[i] + i for i in range(8))
+
+            for _ in range(3):
+                hot()
+
+            hot_func = None
+            for f in jit.get_compiled_functions():
+                if f.__qualname__ == "hot":
+                    hot_func = f
+                    break
+
+            assert hot_func is not None
+            counts = cinderjit.get_function_hir_opcode_counts(hot_func)
+            print(counts.get("MakeFunction", 0))
+            print(counts.get("MakeTuple", 0))
+            print(counts.get("SetFunctionAttr", 0))
+            """
+        )
+
+        with tempfile.TemporaryDirectory() as tmp:
+            script = f"{tmp}/set_genexpr_hot_loop_hoist.py"
+            with open(script, "w", encoding="utf-8") as fp:
+                fp.write(code)
+
+            env = dict(os.environ)
+            env["PYTHONJITDUMPFINALHIR"] = "1"
+            proc = subprocess.run(
+                [sys.executable, script],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                env=env,
+            )
+            self.assertEqual(
+                proc.returncode,
+                0,
+                f"stdout:\n{proc.stdout}\nstderr:\n{proc.stderr}",
+            )
+
+            dump = proc.stdout + "\n" + proc.stderr
+            lines = [line.strip() for line in proc.stdout.splitlines() if line.strip()]
+            self.assertGreaterEqual(len(lines), 3, proc.stdout)
+            self.assertEqual(int(lines[-3]), 1, proc.stdout)
+            self.assertEqual(int(lines[-2]), 1, proc.stdout)
+            self.assertEqual(int(lines[-1]), 1, proc.stdout)
+
+            hot_marker = "Optimized HIR for __main__:hot:"
+            hot_start = dump.find(hot_marker)
+            self.assertNotEqual(hot_start, -1, dump)
+            hot_dump = dump[hot_start:]
+
+            make_pos = hot_dump.find("MakeFunction")
+            first_invoke = hot_dump.find("InvokeIterNext")
+            second_invoke = hot_dump.find("InvokeIterNext", first_invoke + 1)
+            self.assertNotEqual(make_pos, -1, dump)
+            self.assertNotEqual(first_invoke, -1, hot_dump)
+            self.assertNotEqual(second_invoke, -1, hot_dump)
+            self.assertLess(make_pos, second_invoke, hot_dump)
 
     def test_set_genexpr_preserves_exception_behavior(self) -> None:
         code = textwrap.dedent(
@@ -4311,6 +4759,123 @@ class ArmRuntimeTests(unittest.TestCase):
             self.assertEqual(int(lines[-3]), 0, proc.stdout)
             self.assertEqual(int(lines[-2]), 0, proc.stdout)
             self.assertEqual(int(lines[-1]), 19900, proc.stdout)
+
+    def test_pickle_unpickler_stop_control_flow_avoids_deopts(self) -> None:
+        # Regression guard:
+        # stdlib pickle uses _Stop as normal completion control flow.
+        # The hot completion path should not linearly deopt on each load().
+        code = textwrap.dedent(
+            """
+            import io
+            import pickle
+            import cinderx.jit as jit
+
+            DATA = [{"i": i, "s": f"v{i}", "b": b"x" * 16} for i in range(2000)]
+            PAYLOAD = pickle.dumps(DATA, protocol=5)
+
+            jit.enable()
+            jit.enable_specialized_opcodes()
+            jit.compile_after_n_calls(1000000)
+
+            assert jit.force_compile(pickle._Unpickler.load)
+            assert jit.is_jit_compiled(pickle._Unpickler.load)
+
+            def run_once():
+                return pickle._Unpickler(io.BytesIO(PAYLOAD)).load()
+
+            jit.get_and_clear_runtime_stats()
+
+            total = 0
+            for _ in range(200):
+                total += len(run_once())
+
+            stats = jit.get_and_clear_runtime_stats()
+            load_stop_deopts = 0
+            load_deopts = 0
+            for entry in stats.get("deopt", []):
+                normal = entry["normal"]
+                count = entry["int"]["count"]
+                if normal.get("func_qualname") == "_Unpickler.load_stop":
+                    if normal.get("reason") == "Raise":
+                        load_stop_deopts += count
+                elif normal.get("func_qualname") == "_Unpickler.load":
+                    if normal.get("reason") == "UnhandledException":
+                        load_deopts += count
+
+            print(load_stop_deopts)
+            print(load_deopts)
+            print(total)
+            """
+        )
+
+        with tempfile.TemporaryDirectory() as tmp:
+            script = f"{tmp}/pickle_stop_deopts.py"
+            with open(script, "w", encoding="utf-8") as fp:
+                fp.write(code)
+
+            proc = subprocess.run(
+                [sys.executable, script],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                env=dict(os.environ),
+            )
+            self.assertEqual(
+                proc.returncode,
+                0,
+                f"stdout:\n{proc.stdout}\nstderr:\n{proc.stderr}",
+            )
+
+            lines = [line.strip() for line in proc.stdout.splitlines() if line.strip()]
+            self.assertGreaterEqual(len(lines), 3, proc.stdout)
+            self.assertEqual(int(lines[-3]), 0, proc.stdout)
+            self.assertEqual(int(lines[-2]), 0, proc.stdout)
+            self.assertEqual(int(lines[-1]), 400000, proc.stdout)
+
+    def test_pickle_save_dict_nested_method_call_keeps_arguments(self) -> None:
+        code = textwrap.dedent(
+            """
+            import pickle
+            import cinderx.jit as jit
+
+            payload = [{"a": 1}, {"b": 2}, {"c": 3}]
+
+            jit.enable()
+            jit.enable_specialized_opcodes()
+            jit.compile_after_n_calls(1000000)
+
+            assert jit.force_compile(pickle._Pickler.save_dict)
+            assert jit.is_jit_compiled(pickle._Pickler.save_dict)
+
+            data = pickle.dumps(payload, protocol=5)
+            restored = pickle.loads(data)
+            print(len(data))
+            print(restored == payload)
+            """
+        )
+
+        with tempfile.TemporaryDirectory() as tmp:
+            script = f"{tmp}/pickle_save_dict_nested_call.py"
+            with open(script, "w", encoding="utf-8") as fp:
+                fp.write(code)
+
+            proc = subprocess.run(
+                [sys.executable, script],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                env=dict(os.environ),
+            )
+            self.assertEqual(
+                proc.returncode,
+                0,
+                f"stdout:\n{proc.stdout}\nstderr:\n{proc.stderr}",
+            )
+
+            lines = [line.strip() for line in proc.stdout.splitlines() if line.strip()]
+            self.assertGreaterEqual(len(lines), 2, proc.stdout)
+            self.assertGreater(int(lines[-2]), 0, proc.stdout)
+            self.assertEqual(lines[-1], "True", proc.stdout)
 
 
 if __name__ == "__main__":

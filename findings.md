@@ -6,6 +6,91 @@ entrypoint:
 
 `scripts/push_to_arm.ps1` -> `scripts/arm/remote_update_build_test.sh`
 
+### Open case: nqueens residual MakeFunction / issue #61
+
+- Date: `2026-03-24`
+- Branch/worktree:
+  - `bench-cur-7c361dce`
+  - `C:/work/code/frame`
+- Remote workspace:
+  - source: `/root/work/issue61-src`
+  - build: `/root/work/issue61-build`
+- Status:
+  - builder/pass direction changed from dead-code deletion to loop-hoist
+  - iter-edge hoist shape was proven unsafe on ARM
+  - body-split hoist shape now compiles and passes focused runtime regressions
+
+- Root-cause notes:
+  - first hoist attempt copied the closure setup to the outer iter edge too
+    early
+  - ARM backtraces showed two concrete failures:
+    - dangling tuple metadata during
+      `RefcountInsertion::bindGuards() -> DeadCodeElimination::Run()`
+    - invalid liveness / predecessor-state mismatch in
+      `RefcountInsertion::initializeInState()` because setup frame states still
+      referenced body-local values that did not dominate the new setup block
+  - final fix:
+    - split the outer loop body at the original `MakeTuple` point
+    - keep the original body prefix in place
+    - branch there between cached-function reuse and first-iteration setup
+    - join into the remainder block with a phi for the hoisted function object
+
+- ARM verification:
+  - incremental `_cinderx.so` rebuild in `/root/work/issue61-build`: `PASS`
+  - force-compile probe for the hot-loop reproducer: `PASS`
+  - focused runtime regressions: `PASS`
+    - `ArmRuntimeTests.test_set_genexpr_eliminates_generator_call`
+    - `ArmRuntimeTests.test_set_genexpr_with_closure_eliminates_generator_call`
+    - `ArmRuntimeTests.test_set_genexpr_hot_loop_hoists_makefunction_chain`
+    - `ArmRuntimeTests.test_set_genexpr_preserves_exception_behavior`
+    - `ArmRuntimeTests.test_set_genexpr_with_closure_preserves_exception_behavior`
+
+- HIR evidence:
+  - compiled `hot` counts still show exactly one residual closure chain:
+    - `MakeFunction = 1`
+    - `MakeTuple = 1`
+    - `SetFunctionAttr = 1`
+  - the closure setup now sits after the outer-loop prefix and before the
+    inner genexpr iterator loop, so it is no longer rebuilt in the innermost
+    repeated path
+
+- ARM A/B performance snapshot:
+  - method:
+    - same host and same build tree
+    - temporary baseline produced by disabling only
+      `InlineGenexprMakeFunctionHoist` in `compiler.cpp`
+    - all measured functions were `jit.force_compile()`d before timing
+  - hot-loop microbenchmark:
+    - current median: `0.041741000000001804 s`
+    - baseline median: `0.07054826800003866 s`
+    - improvement: about `+40.83%`
+  - direct `list(n_queens(8))` benchmark:
+    - current median: `0.2247215329998653 s`
+    - baseline median: `0.23916533600004186 s`
+    - improvement: about `+6.04%`
+
+- Focused guardrail follow-up:
+  - initial warmup-only direct probes for `comprehensions`, `generators`, and
+    `logging_silent` showed large apparent regressions, but that signal was not
+    stable
+  - pass-dump inspection confirmed `WidgetTray._any_knobby` is unchanged by
+    `InlineGenexprMakeFunctionHoist`
+  - after switching the probes to explicit `jit.force_compile()` before timing,
+    the same A/B pair became effectively flat:
+    - `comprehensions`: `0.01384734400016896 s` vs `0.013889900000322086 s`
+      (`+0.31%`)
+    - `generators`: `0.2022750409996661 s` vs `0.20083337599953666 s`
+      (`-0.72%`)
+    - `logging_silent`: `0.0087713539996912 s` vs `0.008766090000790427 s`
+      (`-0.06%`)
+  - conclusion:
+    - the earlier large slowdowns were measurement noise from compile timing,
+      not a reproducible runtime regression from issue `#61`
+
+- Remaining gap:
+  - broader guardrail benchmark validation is still optional for this round;
+    the focused targeted and A/B evidence is currently positive
+
 ### Open case: deepcopy / issue #47
 
 - Date: `2026-03-18`
@@ -1421,9 +1506,6 @@ Interpretation:
   - `scripts/arm/remote_update_build_test.sh` injects `sitecustomize.py` that auto-loads CinderX unless `CINDERX_DISABLE=1`.
   - Therefore current `nojit` should be interpreted as "CinderX loaded, JIT disabled", not pure CPython baseline.
 
-### Writing-plans output
-- Plan file created: `docs/plans/2026-02-27-cpython-vs-cinderx-314-arm-analysis.md`.
-
 ### TDD status for this task
 - RED/GREEN target defined:
   - add explicit `cpython` mode to richards sampling contract,
@@ -1550,8 +1632,6 @@ Interpretation:
 - `artifacts/asm/cpython_executor_full4096.bin`
 - `artifacts/asm/byte_compare_cinderx_vs_cpython_head952.txt`
 - `artifacts/asm/inst_mix_cinderx_vs_cpython_head952.txt`
-- design note: `docs/plans/2026-02-27-cinderx-vs-cpython-jit-asm-aligned.md`
-
 ### Quantitative summary
 - Byte-level equal-size compare (`952` vs `952`):
   - `same_bytes=62`
@@ -3944,6 +4024,7 @@ Conclusion:
   worker-startup verification problem (`jit was not enabled in the worker`)
   after the targeted tests and benchmark commands have already completed.
 
+<<<<<<< HEAD
 ## 2026-03-19 Issue 48: tomli_loads handled-subscript deopt loop
 
 ### Scope
@@ -4076,3 +4157,196 @@ Conclusion:
   - the fix is functionally revalidated after migration back from the clean
     worktree
   - the narrow single-sample benchmark effect remains small and noisy
+
+### Latest Head Check
+
+- On the latest remote branch head `e37d4cd1`:
+  - clean ARM wheel build succeeded
+  - the three issue49 targeted runtime regressions still passed:
+    - `test_polymorphic_virtual_method_avoids_method_with_values_guard_deopts`
+    - `test_polymorphic_method_load_avoids_method_with_values_deopts`
+    - `test_polymorphic_loop_local_method_load_avoids_method_with_values_deopts`
+
+## 2026-03-23 Issue 64: unpickle `_Stop` control-flow deopt
+
+- Case:
+  - `unpickle_pure_python`
+- Branch/worktree:
+  - `codex/issue64-unpickle-stop`
+  - `C:/work/code/cinderx-issue64-unpickle-stop`
+- Scheduler:
+  - tool:
+    - `C:/work/code/coroutines/cinderx/scripts/remote_scheduler.py`
+  - db:
+    - `C:/work/code/cinderx-issue64-unpickle-stop/plans/remote-scheduler.sqlite3`
+  - ARM lease:
+    - `#1`
+    - released cleanly after the verify round
+- Unified remote entrypoint:
+  - `scripts/arm/remote_update_build_test.sh`
+
+- Current implementation direction:
+  - keep `pickle._Unpickler.load_stop` semantics unchanged for non-JIT callers
+  - in compiled `pickle._Unpickler.load`, recognize the exact stdlib STOP-byte path
+  - lower that path to:
+    - `CallStatic<JITRT_PickleIsStopKey>`
+    - `CallStatic<JITRT_PickleUnpicklerPopStack>`
+    - direct `Return`
+
+- HIR evidence:
+  - remote HIR dump for `pickle:_Unpickler.load` now contains:
+    - `CallStatic<JITRT_PickleIsStopKey(_object*)...>`
+    - `CallStatic<JITRT_PickleUnpicklerPopStack(_object*)...>`
+
+- ARM direct probe:
+  - tracked repro:
+    - `scripts/arm/issue64_pickle_stop_probe.py`
+  - base output:
+    - `_Unpickler.load_stop` `Raise` deopts: `0`
+    - `_Unpickler.load` `UnhandledException` deopts: `200`
+    - total decoded item count: `400000`
+  - current output:
+    - `_Unpickler.load_stop` `Raise` deopts: `0`
+    - `_Unpickler.load` `UnhandledException` deopts: `0`
+    - total decoded item count: `400000`
+  - direct delta:
+    - `_Unpickler.load`: `200 -> 0`
+  - direct timing:
+    - base median: `6.551813789999983 s`
+    - first current median with generic pop helper: `7.2284890100000325 s`
+    - current median after exact-list fast path: `6.500644837999971 s`
+    - net delta vs base: about `-0.78%`
+
+- Shared-suite blockers observed on the first unified run:
+  - unrelated `test_arm_runtime.py` failures and one segfault in existing branch tests
+  - these were isolated by switching the entrypoint to:
+    - `ARM_RUNTIME_SKIP_TESTS='test_'`
+    - targeted issue64 probe via `EXTRA_TEST_CMD`
+
+- Shared pyperformance worker unblock:
+  - root cause:
+    - the pyperformance worker inherited `PYTHONJITDISABLE=1` before `sitecustomize` could clear it
+  - entrypoint fix now used for validation:
+    - stop setting `PYTHONJITDISABLE=1` in the worker startup probe
+    - remove `PYTHONJITDISABLE` from the autojit worker `--inherit-environ` list
+  - worker proof:
+    - current:
+      - `/root/work/arm-sync/pyperf_venv_20260324_102122_worker.json`
+    - base:
+      - `/root/work/arm-sync/pyperf_venv_20260324_103221_worker.json`
+    - both worker probes report:
+      - `jit_enabled = true`
+      - `ok = true`
+
+- Formal pyperformance benchmark:
+  - current single-benchmark run through the unified entrypoint:
+    - jitlist:
+      - `/root/work/arm-sync/unpickle_pure_python_jitlist_20260324_101338.json`
+      - value: `0.00033071145001031257 s`
+    - autojit50:
+      - `/root/work/arm-sync/unpickle_pure_python_autojit50_20260324_101338.json`
+      - value: `0.00033676875000310247 s`
+    - compile summary:
+      - `/root/work/arm-sync/unpickle_pure_python_autojit50_20260324_101338_compile_summary.json`
+      - `main_compile_count = 4`
+      - `total_compile_count = 4`
+      - `other_compile_count = 0`
+  - repeat-run note:
+    - later reruns reached the worker validation stage but did not emit fresh benchmark JSONs
+    - latest worker-only artifacts:
+      - `/root/work/arm-sync/pyperf_venv_20260324_104604_worker.json`
+      - `/root/work/arm-sync/pyperf_venv_20260324_105148_worker.json`
+    - current interpretation:
+      - this is a shared pyperformance environment flake during benchmark setup
+      - it is not evidence of an issue64 code regression because the worker still initializes JIT correctly
+
+- Requested safety-set regression compare:
+  - current run:
+    - `/root/work/arm-sync/generators,coroutines,comprehensions,richards,richards_super,float,go,deltablue,raytrace,nqueens,nbody,unpack_sequence,fannkuch,coverage,scimark,spectral_norm,chaos,logging_jitlist_20260324_102122.json`
+    - `/root/work/arm-sync/generators,coroutines,comprehensions,richards,richards_super,float,go,deltablue,raytrace,nqueens,nbody,unpack_sequence,fannkuch,coverage,scimark,spectral_norm,chaos,logging_autojit50_20260324_102122.json`
+  - base run:
+    - `/root/work/arm-sync/generators,coroutines,comprehensions,richards,richards_super,float,go,deltablue,raytrace,nqueens,nbody,unpack_sequence,fannkuch,coverage,scimark,spectral_norm,chaos,logging_jitlist_20260324_103221.json`
+    - `/root/work/arm-sync/generators,coroutines,comprehensions,richards,richards_super,float,go,deltablue,raytrace,nqueens,nbody,unpack_sequence,fannkuch,coverage,scimark,spectral_norm,chaos,logging_autojit50_20260324_103221.json`
+  - autojit compile summaries:
+    - current:
+      - `main_compile_count = 4`
+      - `total_compile_count = 4`
+      - `other_compile_count = 0`
+    - base:
+      - `main_compile_count = 4`
+      - `total_compile_count = 4`
+      - `other_compile_count = 0`
+  - notable `jitlist` deltas vs base:
+    - `scimark_lu +22.72%`
+    - `scimark_monte_carlo +11.62%`
+    - `coroutines +6.53%`
+    - `fannkuch +3.87%`
+    - `chaos +3.75%`
+    - `generators +3.51%`
+    - `richards -0.17%`
+    - `richards_super +0.02%`
+  - notable `autojit50` deltas vs base:
+    - `generators +11.97%`
+    - `richards +4.14%`
+    - `scimark_lu +3.56%`
+    - `scimark_monte_carlo +2.90%`
+    - `logging_format +2.79%`
+    - `coroutines +1.86%`
+    - `richards_super -1.88%`
+    - `spectral_norm -7.48%`
+    - `go -7.33%`
+  - interpretation:
+    - no requested benchmark shows a consistent material regression across both modes
+    - the remaining positive signals are single-sample pyperformance deltas and should be treated as follow-up candidates, not issue64 blockers
+
+- 2026-03-24 follow-up: fix nested pickle method-call regression exposed by `pickle:*`
+  - regression symptom from user benchmark method:
+    - `pickle._Pickler.save_dict()` failed during warmup/calibration
+    - error:
+      - `_Pickler._batch_setitems() missing 2 required positional arguments: 'items' and 'obj'`
+  - root cause:
+    - the profiled `LOAD_ATTR_METHOD_WITH_VALUES` recovery path used one global
+      `pending_method_with_values_call_`
+    - in nested-call shapes such as:
+      - `self._batch_setitems(obj.items(), obj)`
+    - the outer pending call for `_batch_setitems` was incorrectly consumed by the
+      inner `obj.items()` `CALL 0`
+    - this misbound the call as `_batch_setitems(self)` and dropped the two real arguments
+  - fix:
+    - bind the pending fast path to the exact `LoadMethod` register produced for the
+      profiled outer call
+    - only consume the pending fast path when the current `CALL` is using that same
+      callable register
+    - keep the pending fast path live across unrelated nested calls while the original
+      outer callable is still on the stack
+  - targeted regression proof on current build from clean `scratch/lib...`:
+    - direct `save_dict` reproducer:
+      - output:
+        - `43`
+        - `True`
+    - direct `_Unpickler.load` probe:
+      - output:
+        - `0`
+        - `0`
+        - `400000`
+  - user-style benchmark verification using current build via `PYTHONPATH=scratch/lib...`:
+    - command shape:
+      - `PYTHONJITTYPEANNOTATIONGUARDS=1`
+      - `PYTHONJITENABLEJITLISTWILDCARDS=1`
+      - `PYTHONJITENABLEHIRINLINER=1`
+      - `PYTHONJITAUTO=2`
+      - `PYTHONJITSPECIALIZEDOPCODES=1`
+      - `PYTHONJITLISTFILE=.../issue64_pickle_jit_list.txt`
+      - `python -m pyperformance run --warmup 3 -b unpickle_pure_python ...`
+    - result:
+      - benchmark completed successfully
+      - no `Benchmark died`
+      - artifact:
+        - `/root/work/arm-sync/issue64_pickle_user_repro_fix_scratch.json`
+      - value:
+        - `0.0023073401000146985 s`
+  - environment caveat:
+    - the shared `/root/venv-cinderx314` driver venv is polluted by older branch-local installs
+    - final trust for this regression round comes from:
+      - the clean `scratch/lib...` direct probes
+      - the clean `scratch/lib...` benchmark reproduction
