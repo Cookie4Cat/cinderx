@@ -2423,6 +2423,46 @@ void NativeGenerator::generateDeoptExits(const asmjit::CodeHolder& code) {
 #endif
 }
 
+void NativeGenerator::applyAarch64HintedDeoptBranches(asmjit::CodeHolder& code) {
+#if defined(CINDER_AARCH64)
+  if (env_.pending_hbc_patches.empty()) {
+    return;
+  }
+  if (!asmjit::CpuInfo::host().hasFeature(asmjit::CpuFeatures::ARM::kHBC)) {
+    return;
+  }
+
+  for (const auto& patch : env_.pending_hbc_patches) {
+    auto* label = code.labelEntry(patch.branch_site);
+    JIT_CHECK(
+        label != nullptr && label->isBound(),
+        "Unbound HBC patch label for {}",
+        GetFunction()->fullname);
+    auto* section = label->section();
+    JIT_CHECK(
+        section != nullptr,
+        "Missing section for HBC patch label in {}",
+        GetFunction()->fullname);
+    JIT_CHECK(
+        label->offset() + sizeof(uint32_t) <= section->bufferSize(),
+        "HBC patch label out of range in {}",
+        GetFunction()->fullname);
+
+    auto* encoded =
+        reinterpret_cast<uint32_t*>(section->data() + label->offset());
+    uint32_t inst = *encoded;
+    JIT_CHECK(
+        (inst & 0xFF000010u) == 0x54000000u,
+        "Expected b.cond encoding at HBC patch site in {}, got 0x{:08x}",
+        GetFunction()->fullname,
+        inst);
+    *encoded = inst | 0x10u;
+  }
+#else
+  static_cast<void>(code);
+#endif
+}
+
 void NativeGenerator::linkDeoptPatchers(const asmjit::CodeHolder& code) {
   JIT_CHECK(code.hasBaseAddress(), "code not generated!");
   uint64_t base = code.baseAddress();
@@ -2956,8 +2996,26 @@ void NativeGenerator::generateCode(CodeHolder& codeholder) {
 
   generateDeoptExits(codeholder);
   emitAarch64CallTargetLiteralPool();
+  if (auto err = as_->finalize(); err != kErrorOk) {
+    throw std::runtime_error{fmt::format(
+        "Failed to finalize asmjit builder for {}, got error code {}",
+        GetFunction()->fullname,
+        DebugUtils::errorAsString(err))};
+  }
 
-  code_start_ = finalizeCode(*as_, GetFunction()->fullname);
+  applyAarch64HintedDeoptBranches(codeholder);
+
+  ICodeAllocator* code_allocator =
+      cinderx::getModuleState()->code_allocator.get();
+  AllocateResult result = code_allocator->addCode(&codeholder);
+  if (result.error != kErrorOk) {
+    throw std::runtime_error{fmt::format(
+        "Failed to add generated code for {} to asmjit runtime, got error code "
+        "{}",
+        GetFunction()->fullname,
+        DebugUtils::errorAsString(result.error))};
+  }
+  code_start_ = result.addr;
 
   // ------------- code_start_
   // ^

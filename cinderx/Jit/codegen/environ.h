@@ -67,6 +67,12 @@ struct Environ {
   };
   std::vector<PendingDeoptPatcher> pending_deopt_patchers;
 
+  struct PendingHBCPatch {
+    explicit PendingHBCPatch(asmjit::Label site) : branch_site(site) {}
+    asmjit::Label branch_site;
+  };
+  std::vector<PendingHBCPatch> pending_hbc_patches;
+
   std::vector<PendingDebugLoc> pending_debug_locs;
 
   // Location of incoming arguments

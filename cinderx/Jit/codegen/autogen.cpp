@@ -287,13 +287,19 @@ void TranslateGuard(Environ* env, const Instruction* instr) {
 
   auto emit_b_eq_far = [&](asmjit::Label target) {
     auto skip = as->newLabel();
+    auto patch_site = as->newLabel();
+    as->bind(patch_site);
     as->b_ne(skip);
+    env->pending_hbc_patches.emplace_back(patch_site);
     as->b(target);
     as->bind(skip);
   };
   auto emit_b_ne_far = [&](asmjit::Label target) {
     auto skip = as->newLabel();
+    auto patch_site = as->newLabel();
+    as->bind(patch_site);
     as->b_eq(skip);
+    env->pending_hbc_patches.emplace_back(patch_site);
     as->b(target);
     as->bind(skip);
   };
@@ -311,7 +317,10 @@ void TranslateGuard(Environ* env, const Instruction* instr) {
   };
   auto emit_b_mi_far = [&](asmjit::Label target) {
     auto skip = as->newLabel();
+    auto patch_site = as->newLabel();
+    as->bind(patch_site);
     as->b_pl(skip);
+    env->pending_hbc_patches.emplace_back(patch_site);
     as->b(target);
     as->bind(skip);
   };
@@ -407,7 +416,10 @@ void TranslateGuard(Environ* env, const Instruction* instr) {
             arch::reg_scratch_0,
             static_cast<uint64_t>(2 << _PyLong_NON_SIZE_BITS));
         auto skip = as->newLabel();
+        auto patch_site = as->newLabel();
+        as->bind(patch_site);
         as->b_lo(skip);
+        env->pending_hbc_patches.emplace_back(patch_site);
         as->b(deopt_label);
         as->bind(skip);
         break;

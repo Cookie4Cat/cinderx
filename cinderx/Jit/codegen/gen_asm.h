@@ -139,6 +139,7 @@ class NativeGenerator {
   bool linkFrameNeedsSpill();
   void generateEpilogue(asmjit::BaseNode* epilogue_cursor);
   void generateDeoptExits(const asmjit::CodeHolder& code);
+  void applyAarch64HintedDeoptBranches(asmjit::CodeHolder& code);
   void linkDeoptPatchers(const asmjit::CodeHolder& code);
   void planAarch64HotCallTargets();
   void emitAarch64CallTargetLiteralPool();
