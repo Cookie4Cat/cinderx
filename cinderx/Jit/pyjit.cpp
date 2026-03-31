@@ -183,6 +183,27 @@ bool codeIsInPyperformanceBenchmark(BorrowedRef<PyCodeObject> code) {
           std::string_view::npos;
 }
 
+bool codeIsInNonBenchmarkSitePackages(BorrowedRef<PyCodeObject> code) {
+  if (code == nullptr || code->co_filename == nullptr ||
+      !PyUnicode_Check(code->co_filename)) {
+    return false;
+  }
+
+  const char* filename = PyUnicode_AsUTF8(code->co_filename);
+  if (filename == nullptr) {
+    PyErr_Clear();
+    return false;
+  }
+
+  std::string_view path = filename;
+  bool in_site_packages =
+      path.find("/site-packages/") != std::string_view::npos ||
+      path.find("\\site-packages\\") != std::string_view::npos ||
+      path.find("/dist-packages/") != std::string_view::npos ||
+      path.find("\\dist-packages\\") != std::string_view::npos;
+  return in_site_packages && !codeIsInPyperformanceBenchmark(code);
+}
+
 bool codeIsInStdlib(BorrowedRef<PyCodeObject> code) {
   if (code == nullptr || code->co_filename == nullptr ||
       !PyUnicode_Check(code->co_filename)) {
@@ -215,6 +236,14 @@ bool shouldDeferPyperformanceStartupCompile(BorrowedRef<PyCodeObject> code) {
 
   if (codeIsInPyperformanceBenchmark(code)) {
     return false;
+  }
+
+  // Under very low autojit thresholds, benchmark startup can end up compiling
+  // a large amount of import-time third-party package code before the actual
+  // benchmark body goes hot. Defer non-benchmark site-packages code until
+  // after startup so worker processes focus first on the benchmark itself.
+  if (codeIsInNonBenchmarkSitePackages(code)) {
+    return true;
   }
 
   return codeIsInStdlib(code) || codeIsInFrozenStdlib(code);

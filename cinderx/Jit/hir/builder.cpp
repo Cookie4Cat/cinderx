@@ -4690,6 +4690,9 @@ void HIRBuilder::emitLoadAttr(
         break;
       }
       case LOAD_ATTR_SLOT: {
+        if (is_method) {
+          break;
+        }
         BorrowedRef<PyUnicodeObject> name =
             PyTuple_GET_ITEM(code_->co_names, name_idx);
         const char* field_name = PyUnicode_AsUTF8(name);
@@ -4708,6 +4711,9 @@ void HIRBuilder::emitLoadAttr(
       }
 #if PY_VERSION_HEX >= 0x030E0000
       case LOAD_ATTR_INSTANCE_VALUE: {
+        if (is_method) {
+          break;
+        }
         if (code_->co_nlocals < instance_value_min_locals()) {
           break;
         }
