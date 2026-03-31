@@ -246,6 +246,9 @@ std::optional<Type> sendResultType(const Send& send) {
 } // namespace
 
 Register* chaseAssignOperand(Register* value) {
+  if (value == nullptr) {
+    return nullptr;
+  }
   while (value->instr()->IsAssign()) {
     value = value->instr()->GetOperand(0);
   }
@@ -378,6 +381,8 @@ Type outputTypeWithRecursiveCoroHint(
     case Opcode::kLoadSpecial:
     case Opcode::kLoadTupleItem:
     case Opcode::kMatchKeys:
+      return TObject;
+
     case Opcode::kSend: {
       if (recursive_coro_result_type.has_value() && current_func != nullptr) {
         auto callee = sendCalleeFunction(static_cast<const Send&>(instr));

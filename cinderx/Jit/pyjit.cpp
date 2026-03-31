@@ -3864,6 +3864,9 @@ Result compileFunction(BorrowedRef<PyFunctionObject> func) {
   if (!isJitUsable()) {
     return Result::UNKNOWN_ERROR;
   }
+  if (shouldDeferPyperformanceStartupCompile(func->func_code)) {
+    return Result::PAUSED;
+  }
 
   auto& jit_reg_units = cinderx::getModuleState()->registered_compilation_units;
   jit_reg_units.erase(func);
