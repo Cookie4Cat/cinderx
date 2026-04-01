@@ -142,7 +142,7 @@ bool codeIsInFrozenStdlib(BorrowedRef<PyCodeObject> code) {
       path.find("zipimport") != std::string_view::npos;
 }
 
-bool isRunningUnderPyperformance() {
+bool detectRunningUnderPyperformance() {
   const char* runid = std::getenv("PYPERFORMANCE_RUNID");
   if (runid != nullptr && runid[0] != '\0') {
     return true;
@@ -162,6 +162,14 @@ bool isRunningUnderPyperformance() {
     }
   }
   return false;
+}
+
+bool isRunningUnderPyperformance() {
+  // pyperformance detection is process-wide and immutable for the lifetime of
+  // the worker, so memoize it after the first lookup.
+  static const bool kIsRunningUnderPyperformance =
+      detectRunningUnderPyperformance();
+  return kIsRunningUnderPyperformance;
 }
 
 bool codeIsInPyperformanceBenchmark(BorrowedRef<PyCodeObject> code) {
@@ -227,7 +235,7 @@ bool codeIsInStdlib(BorrowedRef<PyCodeObject> code) {
       path.find("dist-packages") == std::string_view::npos;
 }
 
-bool shouldDeferPyperformanceStartupCompile(BorrowedRef<PyCodeObject> code) {
+bool computeShouldDeferPyperformanceStartupCompile(BorrowedRef<PyCodeObject> code) {
   auto limit = getConfig().compile_after_n_calls;
   if (!limit.has_value() || *limit > kPyperformanceStartupGuardThreshold ||
       !isRunningUnderPyperformance()) {
@@ -247,6 +255,22 @@ bool shouldDeferPyperformanceStartupCompile(BorrowedRef<PyCodeObject> code) {
   }
 
   return codeIsInStdlib(code) || codeIsInFrozenStdlib(code);
+}
+
+bool shouldDeferPyperformanceStartupCompile(BorrowedRef<PyCodeObject> code) {
+  // In pyperformance workloads we often hit the same hot library function many
+  // times in a row. Cache the most recent code-object decision per thread so we
+  // don't repeatedly re-run path classification on every call.
+  thread_local PyCodeObject* last_code = nullptr;
+  thread_local bool last_decision = false;
+  if (code == last_code) {
+    return last_decision;
+  }
+
+  bool decision = computeShouldDeferPyperformanceStartupCompile(code);
+  last_code = code;
+  last_decision = decision;
+  return decision;
 }
 
 // If functions in the cinderx module get compiled, they will somehow keep the
