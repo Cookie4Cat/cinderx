@@ -38,6 +38,8 @@
 #include "cinderx/Jit/jit_rt.h"
 #include "cinderx/Jit/lir/dce.h"
 #include "cinderx/Jit/lir/generator.h"
+
+#include <cstring>
 #include "cinderx/Jit/lir/postalloc.h"
 #include "cinderx/Jit/lir/postgen.h"
 #include "cinderx/Jit/lir/printer.h"
@@ -64,6 +66,22 @@ using namespace jit::lir;
 using namespace jit::util;
 
 namespace jit::codegen {
+
+namespace {
+
+bool isInitialYieldDeopt(const DeoptMetadata& meta) {
+  return meta.descr != nullptr && std::strcmp(meta.descr, "InitialYield") == 0;
+}
+
+bool isNonExceptionalGeneratorYieldDeopt(const DeoptMetadata& meta) {
+  if (meta.reason != DeoptReason::kUnhandledException || meta.descr == nullptr) {
+    return false;
+  }
+  return std::strcmp(meta.descr, "InitialYield") == 0 ||
+      std::strcmp(meta.descr, "YieldValue") == 0;
+}
+
+} // namespace
 
 namespace {
 
@@ -238,9 +256,33 @@ CiPyFrameObjType* prepareForDeopt(
     CodeRuntime* code_runtime,
     std::size_t deopt_idx) {
   JIT_CHECK(deopt_idx != -1ull, "deopt_idx must be valid");
+  void* ret_addr = __builtin_return_address(0);
+  if (std::getenv("CINDERX_DEOPT_TRACE_PRE") != nullptr) {
+#if defined(CINDER_AARCH64)
+    constexpr std::size_t kSavedRegsSize = 0x200;
+    auto* meta_base = reinterpret_cast<const std::uint64_t*>(
+        reinterpret_cast<const char*>(regs) + kSavedRegsSize);
+    JIT_LOG(
+        "deopt pre runtime={} idx={} regs={} ret={} slot4={} slot5={} slot6={} slot7={}",
+        fmt::ptr(code_runtime),
+        deopt_idx,
+        fmt::ptr(regs),
+        fmt::ptr(ret_addr),
+        meta_base[4],
+        meta_base[5],
+        meta_base[6],
+        meta_base[7]);
+#else
+    JIT_LOG(
+        "deopt pre runtime={} idx={} regs={} ret={}",
+        fmt::ptr(code_runtime),
+        deopt_idx,
+        fmt::ptr(regs),
+        fmt::ptr(ret_addr));
+#endif
+  }
   auto const& deopt_metas = code_runtime->deoptMetadatas();
   JIT_CHECK(!deopt_metas.empty(), "CodeRuntime has no deopt metadata");
-  void* ret_addr = __builtin_return_address(0);
   if (std::getenv("CINDERX_DEOPT_TRACE_ENTRY") != nullptr) {
     JIT_LOG(
         "deopt entry runtime={} idx={} size={} regs={} ret={}",
@@ -265,25 +307,37 @@ CiPyFrameObjType* prepareForDeopt(
     auto* meta_base = const_cast<std::uint64_t*>(reinterpret_cast<const std::uint64_t*>(
         reinterpret_cast<const char*>(regs) + kSavedRegsSize));
     std::size_t recovered_idx = static_cast<std::size_t>(-1);
+    std::size_t recovered_slot = static_cast<std::size_t>(-1);
     const std::size_t candidate7 = static_cast<std::size_t>(meta_base[kStage1Slot7]);
     const std::size_t candidate6 = static_cast<std::size_t>(meta_base[kStage1Slot6]);
     if (candidate7 < deopt_metas.size()) {
       recovered_idx = candidate7;
+      recovered_slot = kStage1Slot7;
     } else if (candidate6 < deopt_metas.size()) {
       recovered_idx = candidate6;
+      recovered_slot = kStage1Slot6;
     }
     if (recovered_idx != static_cast<std::size_t>(-1)) {
       // Keep stage2's follow-up resume call consistent with the recovered
-      // deopt index. On AArch64 this index is later reloaded from the
-      // meta_base+32 continuation slot into x2 before calling
-      // resumeInInterpreter().
-      constexpr std::size_t kResumeDeoptIdxSlot = 4; // meta_base + 32
-      meta_base[kResumeDeoptIdxSlot] = recovered_idx;
+      // deopt index. The continuation slot depends on which stage1 slot became
+      // the canonical frame-pointer slot:
+      //   - non-generator deopts recover from slot6 and store the resume index
+      //     at meta_base + 32 (slot4)
+      //   - generator deopts recover from slot7 and store the resume index at
+      //     meta_base + 40 (slot5)
+      constexpr std::size_t kResumeDeoptIdxSlotNonGenerator = 4; // meta_base + 32
+      constexpr std::size_t kResumeDeoptIdxSlotGenerator = 5; // meta_base + 40
+      const std::size_t resume_deopt_idx_slot =
+          recovered_slot == kStage1Slot7 ? kResumeDeoptIdxSlotNonGenerator
+                                         : kResumeDeoptIdxSlotGenerator;
+      meta_base[resume_deopt_idx_slot] = recovered_idx;
       JIT_LOG(
-          "deopt_idx {} out of range (size {}), recovered from stage1 slot as {}, runtime={} regs={} ret={}",
+          "deopt_idx {} out of range (size {}), recovered from stage1 slot {} as {}, patched resume slot {}, runtime={} regs={} ret={}",
           deopt_idx,
           deopt_metas.size(),
+          recovered_slot,
           recovered_idx,
+          resume_deopt_idx_slot,
           fmt::ptr(code_runtime),
           fmt::ptr(regs),
           fmt::ptr(ret_addr));
@@ -310,6 +364,7 @@ CiPyFrameObjType* prepareForDeopt(
 #endif
   }
   const DeoptMetadata& deopt_meta = deopt_metas[deopt_idx];
+  const bool initial_yield_deopt = isInitialYieldDeopt(deopt_meta);
   PyThreadState* tstate = _PyThreadState_UncheckedGet();
 #if PY_VERSION_HEX < 0x030C0000
   Ref<PyFrameObject> f = materializePyFrameForDeopt(tstate);
@@ -330,7 +385,8 @@ CiPyFrameObjType* prepareForDeopt(
 #else
   _PyInterpreterFrame* frame = interpFrameFromThreadState(tstate);
 
-  if (getConfig().frame_mode == FrameMode::kLightweight) {
+  if (!initial_yield_deopt &&
+      getConfig().frame_mode == FrameMode::kLightweight) {
     frame = reifyLightweightFrames(
         tstate, deopt_meta, deopt_meta.inline_depth(), frame);
     if (frame == nullptr) {
@@ -342,12 +398,14 @@ CiPyFrameObjType* prepareForDeopt(
   _PyInterpreterFrame* frame_iter = frame;
 
   // Iterate one past the inline depth because that is the caller frame.
-  for (int i = deopt_meta.inline_depth(); i >= 0; i--) {
-    // Transfer ownership of a light weight frame to the interpreter. The
-    // associated Python frame will be ignored during future attempts to
-    // materialize the stack.
-    reifyFrame(frame_iter, deopt_meta, deopt_meta.frame_meta.at(i), regs);
-    frame_iter = frame_iter->previous;
+  if (!initial_yield_deopt) {
+    for (int i = deopt_meta.inline_depth(); i >= 0; i--) {
+      // Transfer ownership of a light weight frame to the interpreter. The
+      // associated Python frame will be ignored during future attempts to
+      // materialize the stack.
+      reifyFrame(frame_iter, deopt_meta, deopt_meta.frame_meta.at(i), regs);
+      frame_iter = frame_iter->previous;
+    }
   }
 
 #endif
@@ -367,6 +425,19 @@ CiPyFrameObjType* prepareForDeopt(
 #endif
   if (!PyErr_Occurred()) {
     auto reason = deopt_meta.reason;
+    const char* deopt_descr = deopt_meta.descr;
+    if (isNonExceptionalGeneratorYieldDeopt(deopt_meta)) {
+      reason = DeoptReason::kYieldFrom;
+    }
+    if (std::getenv("CINDERX_DEOPT_REASON_TRACE") != nullptr) {
+        JIT_LOG(
+            "deopt reason idx={} reason={} code={} descr={} error_set={}",
+            deopt_idx,
+            static_cast<int>(reason),
+            codeName(_PyFrame_GetCode(frame)),
+            deopt_descr == nullptr ? "<null>" : deopt_descr,
+            0);
+      }
     switch (reason) {
       case DeoptReason::kGuardFailure: {
         ctx->guardFailed(deopt_meta);
@@ -386,6 +457,15 @@ CiPyFrameObjType* prepareForDeopt(
         raiseUnboundFreevarError(deopt_meta.eh_name);
         break;
       case DeoptReason::kUnhandledException:
+        if (std::getenv("CINDERX_DEOPT_REASON_TRACE") != nullptr) {
+          JIT_LOG(
+              "deopt abort idx={} reason={} code={} descr={} error_set={}",
+              deopt_idx,
+              static_cast<int>(reason),
+              codeName(_PyFrame_GetCode(frame)),
+              deopt_descr == nullptr ? "<null>" : deopt_descr,
+              0);
+        }
         JIT_ABORT("unhandled exception without error set");
       case DeoptReason::kRaiseStatic:
         JIT_ABORT("Lost exception when raising static exception");
@@ -485,6 +565,32 @@ PyObject* resumeInInterpreter(
   }
 
   const DeoptMetadata& deopt_meta = deopt_metas[deopt_idx];
+  if (isInitialYieldDeopt(deopt_meta)) {
+    if (std::getenv("CINDERX_DEOPT_REASON_TRACE") != nullptr) {
+      JIT_LOG(
+          "initialyield resume enter frame={} current={} prev={}",
+          fmt::ptr(frame),
+          fmt::ptr(currentFrame(tstate)),
+          fmt::ptr(frame->previous));
+    }
+    ensureInitializedPreviousFrames(frame);
+    JIT_CHECK(currentFrame(tstate) == frame, "unexpected frame at top of stack");
+    setCurrentFrame(tstate, frame->previous);
+    frame->previous = nullptr;
+    BorrowedRef<PyGenObject> gen = _PyGen_GetGeneratorFromFrame(frame);
+    if (std::getenv("CINDERX_DEOPT_REASON_TRACE") != nullptr) {
+      JIT_LOG(
+          "initialyield resume gen={} owner={} frame_state={}",
+          fmt::ptr(gen.get()),
+          frame->owner,
+          gen != nullptr ? gen->gi_frame_state : -1);
+    }
+    PyObject* result = Py_NewRef(reinterpret_cast<PyObject*>(gen.get()));
+    if (std::getenv("CINDERX_DEOPT_REASON_TRACE") != nullptr) {
+      JIT_LOG("initialyield resume return result={}", fmt::ptr(result));
+    }
+    return result;
+  }
   int err_occurred = shouldResumeInterpreterInErrorHandler(deopt_meta.reason);
 
   PyObject* result = nullptr;
@@ -878,9 +984,12 @@ void* generateDeoptTrampoline(bool generator_mode) {
   auto meta_base = a64::x14;
   auto save_scratch = a64::x15;
   a.add(meta_base, a64::sp, saved_regs_size);
-  a.ldr(save_scratch, a64::ptr(meta_base, 0));
+  const int stage1_saved_x28_offset = 0;
+  const int stage1_saved_fp_offset =
+      generator_mode ? 2 * kPointerSize : 1 * kPointerSize;
+  a.ldr(save_scratch, a64::ptr(meta_base, stage1_saved_x28_offset));
   a.str(save_scratch, a64::ptr(a64::sp, 28 * kPointerSize));
-  a.ldr(save_scratch, a64::ptr(meta_base, kPointerSize));
+  a.ldr(save_scratch, a64::ptr(meta_base, stage1_saved_fp_offset));
   a.str(save_scratch, a64::ptr(a64::sp, 29 * kPointerSize));
   a.mov(save_scratch, 0);
   a.str(save_scratch, a64::ptr(a64::sp, 30 * kPointerSize));
@@ -1056,6 +1165,7 @@ void* generateDeoptTrampoline(bool generator_mode) {
   // Third argument: DeoptMetadata index, restored from the stack after
   // prepareForDeopt.
   a.ldr(deopt_idx, deopt_idx_addr);
+  emit_aarch64_generator_trace(5);
   static_assert(
       std::is_same_v<
           decltype(resumeInInterpreter),
@@ -2549,10 +2659,10 @@ void NativeGenerator::generateDeoptExits(const asmjit::CodeHolder& code) {
   // | index of deopt metadata |
   // | saved pc                |
   // | padding (8 bytes)       |
-  // | padding (8 bytes)       |
   // | address of CodeRuntime  |
   // | address of epilogue     |
   // | fp                      |
+  // | padding (8 bytes)       |
   // | x28                     | <-- sp
   // +-------------------------+
   //
@@ -2563,23 +2673,46 @@ void NativeGenerator::generateDeoptExits(const asmjit::CodeHolder& code) {
   // If you change this make sure you update that code!
   as_->bind(deopt_exit);
 
-  // Two slots for padding, then the address of the CodeRuntime and the address
-  // of the epilogue, then the first of the registers to get stored (fp and
-  // x28). One of the slots of padding will get the deopt metadata index
-  // shuffled in, making space to save fp before calling prepareForDeopt.
-  as_->stp(deopt_scratch_reg, arch::fp, a64::ptr_pre(a64::sp, -0x30));
+  // Non-generator and generator deopts use different stage-1 layouts. The
+  // generator trampoline keeps saved_pc in slot6 and deopt_idx in slot7, so
+  // code_rt must live in slot4 once stage 2 reshuffles around the canonical
+  // frame pointer.
+  if (GetFunction()->code->co_flags & kCoFlagsAnyGenerator) {
+    as_->sub(a64::sp, a64::sp, 0x40);
+    as_->str(deopt_scratch_reg, a64::ptr(a64::sp, 0));
+    as_->str(arch::fp, a64::ptr(a64::sp, 16));
 
-  // Save the address of the CodeRuntime.
-  as_->mov(deopt_scratch_reg, reinterpret_cast<uintptr_t>(env_.code_rt));
-  as_->str(
-      deopt_scratch_reg,
-      arch::ptr_resolve(as_, a64::sp, kPointerSize * 3, arch::reg_scratch_0));
+    // Generator deopts must re-enter the shared yield epilogue so the original
+    // frame pointer is restored before the final function exit runs.
+    as_->adr(deopt_scratch_reg, env_.exit_for_yield_label);
+    as_->str(
+        deopt_scratch_reg,
+        arch::ptr_resolve(as_, a64::sp, kPointerSize * 3, arch::reg_scratch_0));
 
-  // Save the address of the epilogue.
-  as_->adr(deopt_scratch_reg, env_.hard_exit_label);
-  as_->str(
-      deopt_scratch_reg,
-      arch::ptr_resolve(as_, a64::sp, kPointerSize * 2, arch::reg_scratch_0));
+    as_->mov(deopt_scratch_reg, reinterpret_cast<uintptr_t>(env_.code_rt));
+    as_->str(
+        deopt_scratch_reg,
+        arch::ptr_resolve(as_, a64::sp, kPointerSize * 4, arch::reg_scratch_0));
+  } else {
+    // Two slots for padding, then the address of the CodeRuntime and the
+    // address of the epilogue, then the first of the registers to get stored
+    // (fp and x28). One of the slots of padding will get the deopt metadata
+    // index shuffled in, making space to save fp before calling
+    // prepareForDeopt.
+    as_->stp(deopt_scratch_reg, arch::fp, a64::ptr_pre(a64::sp, -0x30));
+
+    // Save the address of the CodeRuntime.
+    as_->mov(deopt_scratch_reg, reinterpret_cast<uintptr_t>(env_.code_rt));
+    as_->str(
+        deopt_scratch_reg,
+        arch::ptr_resolve(as_, a64::sp, kPointerSize * 3, arch::reg_scratch_0));
+
+    // Save the address of the epilogue.
+    as_->adr(deopt_scratch_reg, env_.hard_exit_label);
+    as_->str(
+        deopt_scratch_reg,
+        arch::ptr_resolve(as_, a64::sp, kPointerSize * 2, arch::reg_scratch_0));
+  }
 
   auto trampoline = GetFunction()->code->co_flags & kCoFlagsAnyGenerator
       ? deopt_trampoline_generators_

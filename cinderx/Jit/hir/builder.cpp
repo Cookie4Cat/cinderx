@@ -113,10 +113,15 @@ BorrowedRef<PyTypeObject> getStdlibArrayType() {
     return array_type;
   }
 
-  ThreadedCompileSerialize guard;
-  Ref<> mod = Ref<>::steal(PyImport_ImportModule("array"));
+  // Avoid importing stdlib modules from the compiler while we are translating
+  // importlib startup code. Re-entering the import machinery from here can
+  // recurse back into JIT compilation before bootstrap has stabilized.
+  BorrowedRef<PyObject> modules(PyImport_GetModuleDict());
+  if (modules == nullptr) {
+    return nullptr;
+  }
+  BorrowedRef<> mod(PyDict_GetItemString(modules, "array"));
   if (mod == nullptr) {
-    PyErr_Clear();
     return nullptr;
   }
 
