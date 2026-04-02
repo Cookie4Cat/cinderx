@@ -79,6 +79,66 @@ jobs:
           python -m pip install cibuildwheel
           python -m cibuildwheel --version
 
+      - name: Show toolchains inside cibuildwheel wheel images
+        shell: bash
+        run: |
+          set -euxo pipefail
+          for image in \
+            quay.io/pypa/manylinux_2_28:latest \
+            quay.io/pypa/musllinux_1_2:latest
+          do
+            echo "=== $image ==="
+            docker pull "$image"
+            docker run --rm "$image" /bin/sh -lc '
+              echo "image=$0"
+              echo "CC=${CC:-}"
+              echo "CXX=${CXX:-}"
+              cat /etc/os-release || true
+              uname -a || true
+              echo "gcc=$(command -v gcc || true)"
+              gcc --version | head -n 1 || true
+              echo "g++=$(command -v g++ || true)"
+              g++ --version | head -n 1 || true
+              echo "clang=$(command -v clang || true)"
+              clang --version | head -n 1 || true
+              echo "clang++=$(command -v clang++ || true)"
+              clang++ --version | head -n 1 || true
+              echo "cmake=$(command -v cmake || true)"
+              cmake --version | head -n 1 || true
+              echo "python3=$(command -v python3 || true)"
+              python3 --version || true
+              python3 - <<'"'"'PY'"'"'
+import os
+import re
+import shutil
+import subprocess
+
+MIN_GCC_VERSION = 13
+
+cc_path = os.environ.get("CC")
+cxx_path = os.environ.get("CXX")
+if cc_path and cxx_path:
+    print(f"selected_compiler={cc_path} {cxx_path} (from CC/CXX)")
+else:
+    gcc_path = shutil.which("gcc")
+    gxx_path = shutil.which("g++")
+    if gcc_path and gxx_path:
+        out = subprocess.check_output([gcc_path, "--version"], text=True)
+        match = re.search(r"gcc.*?(\d+)\.(\d+)(?:\.(\d+))?", out, re.IGNORECASE)
+        if match and int(match.group(1)) >= MIN_GCC_VERSION:
+            print(f"selected_compiler={gcc_path} {gxx_path} (preferred GCC)")
+        else:
+            clang_path = shutil.which("clang")
+            clangxx_path = shutil.which("clang++")
+            print(f"selected_compiler={clang_path} {clangxx_path} (fallback Clang)")
+    else:
+        clang_path = shutil.which("clang")
+        clangxx_path = shutil.which("clang++")
+        print(f"selected_compiler={clang_path} {clangxx_path} (fallback Clang)")
+PY
+            ' "$image"
+          done
+
       - name: Show versions used by CinderX build jobs
         shell: bash
         run: |
