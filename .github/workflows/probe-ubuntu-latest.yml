@@ -1,0 +1,93 @@
+name: Probe ubuntu-latest
+
+on:
+  workflow_dispatch:
+
+jobs:
+  probe:
+    name: Probe runner environment
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Show runner image and OS details
+        shell: bash
+        run: |
+          set -euxo pipefail
+          echo "ImageOS=${ImageOS:-}"
+          echo "ImageVersion=${ImageVersion:-}"
+          echo "RUNNER_OS=${RUNNER_OS:-}"
+          echo "RUNNER_ARCH=${RUNNER_ARCH:-}"
+          echo "RUNNER_NAME=${RUNNER_NAME:-}"
+          echo "RUNNER_ENVIRONMENT=${RUNNER_ENVIRONMENT:-}"
+          echo
+          cat /etc/os-release
+          echo
+          uname -a
+          echo
+          lsb_release -a || true
+          echo
+          echo "Kernel:"
+          uname -r
+
+      - name: Show default toolchain before setup-python
+        shell: bash
+        run: |
+          set -euxo pipefail
+          which python3 || true
+          python3 --version || true
+          which pip3 || true
+          pip3 --version || true
+          which gcc || true
+          gcc --version | head -n 1 || true
+          which g++ || true
+          g++ --version | head -n 1 || true
+          which clang || true
+          clang --version | head -n 1 || true
+          which cmake || true
+          cmake --version | head -n 1 || true
+          which ninja || true
+          ninja --version || true
+          which make || true
+          make --version | head -n 1 || true
+          which git || true
+          git --version || true
+          docker version --format 'client={{.Client.Version}} server={{.Server.Version}}' || true
+
+      - name: Set up Python 3.14.3
+        uses: actions/setup-python@v6
+        with:
+          python-version: '3.14.3'
+
+      - name: Show Python after setup-python
+        shell: bash
+        run: |
+          set -euxo pipefail
+          which python
+          python --version
+          python -c "import platform, sys, sysconfig; print('executable=', sys.executable); print('version=', sys.version); print('platform=', platform.platform()); print('include=', sysconfig.get_path('include'))"
+          which pip
+          pip --version
+
+      - name: Install and show cibuildwheel
+        shell: bash
+        run: |
+          set -euxo pipefail
+          python -m pip install --upgrade pip
+          python -m pip install cibuildwheel
+          python -m cibuildwheel --version
+
+      - name: Show versions used by CinderX build jobs
+        shell: bash
+        run: |
+          set -euxo pipefail
+          echo "gcc=$(gcc --version | head -n 1 || true)"
+          echo "g++=$(g++ --version | head -n 1 || true)"
+          echo "clang=$(clang --version | head -n 1 || true)"
+          echo "cmake=$(cmake --version | head -n 1 || true)"
+          echo "ninja=$(ninja --version || true)"
+          echo "make=$(make --version | head -n 1 || true)"
+          echo "python=$(python --version 2>&1 || true)"
+          echo "pip=$(pip --version || true)"
+          echo "cibuildwheel=$(python -m cibuildwheel --version || true)"
+          echo "git=$(git --version || true)"
+          echo "docker=$(docker version --format 'client={{.Client.Version}} server={{.Server.Version}}' || true)"
