@@ -1,6 +1,9 @@
 name: Probe ubuntu-latest
 
 on:
+  push:
+    branches:
+      - codex/probe-ubuntu-latest-worktree
   workflow_dispatch:
 
 jobs:
