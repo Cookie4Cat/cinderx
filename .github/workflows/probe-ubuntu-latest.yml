@@ -77,7 +77,7 @@ jobs:
           set -euxo pipefail
           python -m pip install --upgrade pip
           python -m pip install cibuildwheel
-          python -m cibuildwheel --version
+          python -c "import importlib.metadata; print(importlib.metadata.version('cibuildwheel'))"
 
       - name: Show toolchains inside cibuildwheel wheel images
         shell: bash
@@ -130,6 +130,6 @@ jobs:
           echo "make=$(make --version | head -n 1 || true)"
           echo "python=$(python --version 2>&1 || true)"
           echo "pip=$(pip --version || true)"
-          echo "cibuildwheel=$(python -m cibuildwheel --version || true)"
+          echo "cibuildwheel=$(python -c \"import importlib.metadata; print(importlib.metadata.version('cibuildwheel'))\" || true)"
           echo "git=$(git --version || true)"
           echo "docker=$(docker version --format 'client={{.Client.Version}} server={{.Server.Version}}' || true)"
