@@ -107,35 +107,14 @@ jobs:
               cmake --version | head -n 1 || true
               echo "python3=$(command -v python3 || true)"
               python3 --version || true
-              python3 - <<'"'"'PY'"'"'
-import os
-import re
-import shutil
-import subprocess
-
-MIN_GCC_VERSION = 13
-
-cc_path = os.environ.get("CC")
-cxx_path = os.environ.get("CXX")
-if cc_path and cxx_path:
-    print(f"selected_compiler={cc_path} {cxx_path} (from CC/CXX)")
-else:
-    gcc_path = shutil.which("gcc")
-    gxx_path = shutil.which("g++")
-    if gcc_path and gxx_path:
-        out = subprocess.check_output([gcc_path, "--version"], text=True)
-        match = re.search(r"gcc.*?(\d+)\.(\d+)(?:\.(\d+))?", out, re.IGNORECASE)
-        if match and int(match.group(1)) >= MIN_GCC_VERSION:
-            print(f"selected_compiler={gcc_path} {gxx_path} (preferred GCC)")
-        else:
-            clang_path = shutil.which("clang")
-            clangxx_path = shutil.which("clang++")
-            print(f"selected_compiler={clang_path} {clangxx_path} (fallback Clang)")
-    else:
-        clang_path = shutil.which("clang")
-        clangxx_path = shutil.which("clang++")
-        print(f"selected_compiler={clang_path} {clangxx_path} (fallback Clang)")
-PY
+              gcc_major="$(gcc -dumpversion 2>/dev/null | cut -d. -f1 || true)"
+              if [ -n "${CC:-}" ] && [ -n "${CXX:-}" ]; then
+                echo "selected_compiler=$CC $CXX (from CC/CXX)"
+              elif command -v gcc >/dev/null 2>&1 && command -v g++ >/dev/null 2>&1 && [ "${gcc_major:-0}" -ge 13 ] 2>/dev/null; then
+                echo "selected_compiler=$(command -v gcc) $(command -v g++) (preferred GCC)"
+              else
+                echo "selected_compiler=$(command -v clang || true) $(command -v clang++ || true) (fallback Clang)"
+              fi
             ' "$image"
           done
 
