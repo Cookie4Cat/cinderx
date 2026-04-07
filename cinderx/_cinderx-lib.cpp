@@ -642,14 +642,10 @@ builtin_anext(PyObject* module, PyObject* const* args, Py_ssize_t nargs) {
 
 // Visit a Python function on CinderX module initialization.
 int function_visitor(BorrowedRef<PyFunctionObject> func) {
-  // Ensure the code object can track how often it is called.
-  BorrowedRef<PyCodeObject> code = func->func_code;
-  JIT_CHECK(
-      !USE_CODE_EXTRA || codeExtra(code) != nullptr,
-      "Failed to initialize extra data for {}",
-      jit::funcFullname(func));
-
   // Schedule the function to be compiled if desired.
+  // CodeExtra is allocated on-demand by jitVectorcall/countCalls for functions
+  // that are actually scheduled for compilation. Non-JIT functions skip
+  // allocation entirely, avoiding per-call overhead in the interpreter loop.
   scheduleCompile(func);
 
   return 1;

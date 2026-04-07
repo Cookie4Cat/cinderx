@@ -414,7 +414,7 @@ Py_ssize_t load_method_static_cached_oparg_slot(int oparg) {
 
 #define CI_SET_ADAPTIVE_INTERPRETER_ENABLED_STATE \
     PyCodeObject* code = frame->f_code; \
-    CodeExtra *extra = codeExtra(code); \
+    CodeExtra *extra = codeExtraGet(code); \
     adaptive_enabled = extra != NULL && is_adaptive_enabled(extra);
 
 PyObject* _Py_HOT_FUNCTION
@@ -509,7 +509,7 @@ start_frame:
     // Update call count.
     {
         PyCodeObject* code = frame->f_code;
-        CodeExtra *extra = codeExtra(code);
+        CodeExtra *extra = codeExtraGet(code);
         if (extra != NULL) {
             extra->calls += 1;
             adaptive_enabled = is_adaptive_enabled(extra);

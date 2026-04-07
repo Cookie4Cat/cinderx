@@ -447,7 +447,7 @@ do { \
         if (PyCode_Check(executable)) { \
             PyCodeObject* code = (PyCodeObject*)executable; \
             if (!(code->co_flags & CO_NO_MONITORING_EVENTS)) { \
-                CodeExtra *extra = codeExtra(code); \
+                CodeExtra *extra = codeExtraGet(code); \
                 adaptive_enabled = extra != NULL && is_adaptive_enabled(extra); \
             } \
         } \
@@ -459,7 +459,7 @@ do { \
         if (PyCode_Check(executable)) { \
             PyCodeObject* code = (PyCodeObject*)executable; \
             if (!(code->co_flags & CO_NO_MONITORING_EVENTS)) { \
-                CodeExtra *extra = codeExtra(code); \
+                CodeExtra *extra = codeExtraGet(code); \
                 if (extra == NULL) { \
                     adaptive_enabled = false; \
                 } else { \
@@ -478,7 +478,7 @@ do { \
         if (PyCode_Check(executable)) { \
             PyCodeObject* code = (PyCodeObject*)executable; \
             if (!(code->co_flags & CO_NO_MONITORING_EVENTS)) { \
-                CodeExtra *extra = codeExtra(code); \
+                CodeExtra *extra = codeExtraGet(code); \
                 if (extra != NULL) { \
                     Ci_code_extra_incr_calls(extra); \
                 } \

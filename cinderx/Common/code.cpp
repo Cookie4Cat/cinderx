@@ -18,12 +18,19 @@
 
 #endif
 
-namespace {
-
 // Index used for fetching code object extra data.
-Py_ssize_t code_extra_index = -1;
+// Exposed as Ci_code_extra_index for the inline codeExtraGet() fast path on
+// 3.14+.
+#if PY_VERSION_HEX >= 0x030E0000
+extern "C" Py_ssize_t Ci_code_extra_index = -1;
+#else
+static Py_ssize_t code_extra_index = -1;
+#endif
 
-} // namespace
+// Alias so the rest of this file can use a consistent name.
+#if PY_VERSION_HEX >= 0x030E0000
+#define code_extra_index Ci_code_extra_index
+#endif
 
 namespace jit {
 static std::string fullnameImpl(PyObject* module, PyObject* qualname) {
@@ -261,6 +268,28 @@ CodeExtra* codeExtra(PyCodeObject* code) {
 
   return extra;
 }
+
+// On 3.14+, codeExtraGet is defined as static inline in code.h.
+#if PY_VERSION_HEX < 0x030E0000
+CodeExtra* codeExtraGet(PyCodeObject* code) {
+  if constexpr (!USE_CODE_EXTRA) {
+    return nullptr;
+  }
+
+  if (code_extra_index == -1) {
+    return nullptr;
+  }
+
+  auto code_obj = reinterpret_cast<PyObject*>(code);
+
+  void* data_ptr = nullptr;
+  if (PyUnstable_Code_GetExtra(code_obj, code_extra_index, &data_ptr) < 0) {
+    PyErr_Clear();
+    return nullptr;
+  }
+  return reinterpret_cast<CodeExtra*>(data_ptr);
+}
+#endif // PY_VERSION_HEX < 0x030E0000
 
 int numLocals(PyCodeObject* code) {
   return code->co_nlocals;

@@ -128,6 +128,33 @@ void finiCodeExtraIndex();
 // Python error set.
 CodeExtra* codeExtra(PyCodeObject* code);
 
+// Get the extra data object without allocating. Returns nullptr if no extra
+// data has been set yet. Use this on hot paths (e.g. interpreter loop) to
+// avoid allocation and locking overhead for code objects that don't need
+// call counting.
+//
+// On 3.14+, this is inlined to avoid the overhead of PyUnstable_Code_GetExtra.
+// On 3.12, it falls back to the API call.
+#if PY_VERSION_HEX >= 0x030E0000
+// Exposed for the inline fast path below.
+extern Py_ssize_t Ci_code_extra_index;
+
+static inline CodeExtra* codeExtraGet(PyCodeObject* code) {
+  if (!USE_CODE_EXTRA || Ci_code_extra_index == -1) {
+    return NULL;
+  }
+  _PyCodeObjectExtra* co_extra =
+      (_PyCodeObjectExtra*)FT_ATOMIC_LOAD_PTR_ACQUIRE(code->co_extra);
+  if (co_extra == NULL || Ci_code_extra_index >= co_extra->ce_size) {
+    return NULL;
+  }
+  return (CodeExtra*)FT_ATOMIC_LOAD_PTR_ACQUIRE(
+      co_extra->ce_extras[Ci_code_extra_index]);
+}
+#else
+CodeExtra* codeExtraGet(PyCodeObject* code);
+#endif
+
 // Count the various frame variables that a code object will use.
 int numLocals(PyCodeObject* code);
 int numCellvars(PyCodeObject* code);

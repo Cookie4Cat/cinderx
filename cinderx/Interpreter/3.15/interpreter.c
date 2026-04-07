@@ -438,7 +438,7 @@ Py_ssize_t load_method_static_cached_oparg_slot(int oparg) {
     if (PyCode_Check(executable)) {                                          \
       PyCodeObject* code = (PyCodeObject*)executable;                        \
       if (!(code->co_flags & CO_NO_MONITORING_EVENTS)) {                     \
-        CodeExtra* extra = codeExtra(code);                                  \
+        CodeExtra* extra = codeExtraGet(code);                               \
         adaptive_enabled = extra != NULL && is_adaptive_enabled(extra);      \
       }                                                                      \
     }                                                                        \
@@ -450,7 +450,7 @@ Py_ssize_t load_method_static_cached_oparg_slot(int oparg) {
     if (PyCode_Check(executable)) {                                          \
       PyCodeObject* code = (PyCodeObject*)executable;                        \
       if (!(code->co_flags & CO_NO_MONITORING_EVENTS)) {                     \
-        CodeExtra* extra = codeExtra(code);                                  \
+        CodeExtra* extra = codeExtraGet(code);                               \
         if (extra == NULL) {                                                 \
           adaptive_enabled = false;                                          \
         } else {                                                             \
