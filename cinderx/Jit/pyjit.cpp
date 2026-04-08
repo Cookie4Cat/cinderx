@@ -3601,7 +3601,7 @@ int initialize() {
   }
 
   getMutableConfig().state = State::kRunning;
-  Ci_jit_vectorcall = reinterpret_cast<vectorcallfunc>(jitVectorcall);
+  ::Ci_jit_vectorcall = reinterpret_cast<vectorcallfunc>(jitVectorcall);
 
   mod_state->jit_list = std::move(jit_list);
 
@@ -3629,7 +3629,7 @@ void finalize() {
   // Disable the JIT first so nothing we do in here ends up attempting to
   // invoke the JIT while we're finalizing our data structures.
   getMutableConfig().state = State::kFinalizing;
-  Ci_jit_vectorcall = nullptr;
+  ::Ci_jit_vectorcall = nullptr;
 
   // Deopt all JIT generators, since JIT generators reference code and other
   // metadata that we will be freeing later in this function.
