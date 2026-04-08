@@ -475,13 +475,16 @@ do { \
 #define CI_UPDATE_CALL_COUNT \
     do { \
         if (Ci_jit_vectorcall != NULL) { \
-            PyObject *executable = PyStackRef_AsPyObjectBorrow(frame->f_executable); \
-            if (PyFunction_Check(executable) && \
-                ((PyFunctionObject*)executable)->vectorcall == Ci_jit_vectorcall) { \
-                PyCodeObject* code = (PyCodeObject*)((PyFunctionObject*)executable)->func_code; \
-                CodeExtra *extra = codeExtra(code); \
-                if (extra != NULL) { \
-                    Ci_code_extra_incr_calls(extra); \
+            PyObject *fobj = PyStackRef_AsPyObjectBorrow(frame->f_funcobj); \
+            if (PyFunction_Check(fobj) && \
+                ((PyFunctionObject*)fobj)->vectorcall == Ci_jit_vectorcall) { \
+                PyObject *executable = PyStackRef_AsPyObjectBorrow(frame->f_executable); \
+                if (PyCode_Check(executable)) { \
+                    PyCodeObject* code = (PyCodeObject*)executable; \
+                    CodeExtra *extra = codeExtra(code); \
+                    if (extra != NULL) { \
+                        Ci_code_extra_incr_calls(extra); \
+                    } \
                 } \
             } \
         } \

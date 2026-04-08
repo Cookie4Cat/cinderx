@@ -6,6 +6,7 @@
 
 #include "cinderx/UpstreamBorrow/borrowed.h"
 #include "cinderx/Interpreter/cinder_opcode.h"
+#include "cinderx/Interpreter/interpreter.h"
 
 #include "cinderx/module_c_state.h"
 
