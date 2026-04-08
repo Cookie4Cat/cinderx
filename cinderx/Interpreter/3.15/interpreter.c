@@ -446,16 +446,20 @@ Py_ssize_t load_method_static_cached_oparg_slot(int oparg) {
 
 #define CI_UPDATE_CALL_COUNT                                                 \
   do {                                                                       \
-    PyObject* executable = PyStackRef_AsPyObjectBorrow(frame->f_executable); \
-    if (PyCode_Check(executable)) {                                          \
-      PyCodeObject* code = (PyCodeObject*)executable;                        \
-      if (!(code->co_flags & CO_NO_MONITORING_EVENTS)) {                     \
-        CodeExtra* extra = codeExtra(code);                                  \
-        if (extra == NULL) {                                                 \
-          adaptive_enabled = false;                                          \
-        } else {                                                             \
-          Ci_code_extra_incr_calls(extra);                                   \
-          adaptive_enabled = is_adaptive_enabled(extra);                     \
+    if (Ci_jit_vectorcall != NULL) {                                         \
+      PyObject* executable = PyStackRef_AsPyObjectBorrow(frame->f_executable); \
+      if (PyFunction_Check(executable) &&                                    \
+          ((PyFunctionObject*)executable)->vectorcall == Ci_jit_vectorcall) {\
+        PyCodeObject* code =                                                 \
+            (PyCodeObject*)((PyFunctionObject*)executable)->func_code;       \
+        if (!(code->co_flags & CO_NO_MONITORING_EVENTS)) {                   \
+          CodeExtra* extra = codeExtra(code);                                \
+          if (extra == NULL) {                                               \
+            adaptive_enabled = false;                                        \
+          } else {                                                           \
+            Ci_code_extra_incr_calls(extra);                                 \
+            adaptive_enabled = is_adaptive_enabled(extra);                   \
+          }                                                                  \
         }                                                                    \
       }                                                                      \
     }                                                                        \

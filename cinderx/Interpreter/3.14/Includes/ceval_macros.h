@@ -474,10 +474,11 @@ do { \
 #define CI_SET_ADAPTIVE_INTERPRETER_ENABLED_STATE ((void)0);
 #define CI_UPDATE_CALL_COUNT \
     do { \
-        PyObject *executable = PyStackRef_AsPyObjectBorrow(frame->f_executable); \
-        if (PyCode_Check(executable)) { \
-            PyCodeObject* code = (PyCodeObject*)executable; \
-            if (!(code->co_flags & CO_NO_MONITORING_EVENTS)) { \
+        if (Ci_jit_vectorcall != NULL) { \
+            PyObject *executable = PyStackRef_AsPyObjectBorrow(frame->f_executable); \
+            if (PyFunction_Check(executable) && \
+                ((PyFunctionObject*)executable)->vectorcall == Ci_jit_vectorcall) { \
+                PyCodeObject* code = (PyCodeObject*)((PyFunctionObject*)executable)->func_code; \
                 CodeExtra *extra = codeExtra(code); \
                 if (extra != NULL) { \
                     Ci_code_extra_incr_calls(extra); \

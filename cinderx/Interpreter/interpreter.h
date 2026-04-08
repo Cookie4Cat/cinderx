@@ -71,6 +71,10 @@ void Ci_InitOpcodes();
 extern bool Ci_DelayAdaptiveCode;
 extern uint64_t Ci_AdaptiveThreshold;
 
+// The JIT vectorcall entry point, or NULL if the JIT is not active.
+// Used by the interpreter loop to skip call counting for non-JIT functions.
+extern vectorcallfunc Ci_jit_vectorcall;
+
 #ifdef __cplusplus
 }
 #endif

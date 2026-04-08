@@ -506,15 +506,24 @@ Ci_EvalFrame(PyThreadState *tstate, _PyInterpreterFrame *frame, int throwflag)
     stack_pointer = _PyFrame_GetStackPointer(frame);
 
 start_frame:
-    // Update call count.
+    // Update call count. Only count calls for functions pending JIT compilation
+    // (vectorcall == Ci_jit_vectorcall). All other functions (stdlib, already
+    // compiled, non-JIT) skip this entirely to avoid unnecessary overhead.
     {
-        PyCodeObject* code = frame->f_code;
-        CodeExtra *extra = codeExtra(code);
-        if (extra != NULL) {
-            extra->calls += 1;
-            adaptive_enabled = is_adaptive_enabled(extra);
+        PyObject *fobj = frame->f_funcobj;
+        if (Ci_jit_vectorcall != NULL &&
+                PyFunction_Check(fobj) &&
+                ((PyFunctionObject*)fobj)->vectorcall == Ci_jit_vectorcall) {
+            PyCodeObject* code = frame->f_code;
+            CodeExtra *extra = codeExtra(code);
+            if (extra != NULL) {
+                extra->calls += 1;
+                adaptive_enabled = is_adaptive_enabled(extra);
+            } else {
+                adaptive_enabled = false;
+            }
         } else {
-            adaptive_enabled = false;
+            adaptive_enabled = !Ci_DelayAdaptiveCode;
         }
     }
 
