@@ -478,9 +478,9 @@ do { \
             PyObject *fobj = PyStackRef_AsPyObjectBorrow(frame->f_funcobj); \
             if (PyFunction_Check(fobj) && \
                 ((PyFunctionObject*)fobj)->vectorcall == Ci_jit_vectorcall) { \
-                PyObject *executable = PyStackRef_AsPyObjectBorrow(frame->f_executable); \
-                if (PyCode_Check(executable)) { \
-                    PyCodeObject* code = (PyCodeObject*)executable; \
+                PyCodeObject* code = \
+                    (PyCodeObject*)((PyFunctionObject*)fobj)->func_code; \
+                if (!(code->co_flags & CO_NO_MONITORING_EVENTS)) { \
                     CodeExtra *extra = codeExtra(code); \
                     if (extra != NULL) { \
                         Ci_code_extra_incr_calls(extra); \
