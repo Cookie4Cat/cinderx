@@ -443,29 +443,39 @@ do { \
 #ifdef CINDER_ENABLE_STATIC_PYTHON
 #define CI_SET_ADAPTIVE_INTERPRETER_ENABLED_STATE \
     do { \
-        PyObject *executable = PyStackRef_AsPyObjectBorrow(frame->f_executable); \
-        if (PyCode_Check(executable)) { \
-            PyCodeObject* code = (PyCodeObject*)executable; \
-            if (!(code->co_flags & CO_NO_MONITORING_EVENTS)) { \
-                CodeExtra *extra = codeExtra(code); \
-                adaptive_enabled = extra != NULL && is_adaptive_enabled(extra); \
-            } \
+        adaptive_enabled = false; \
+        PyObject* fobj = PyStackRef_AsPyObjectBorrow(frame->f_funcobj); \
+        if (!PyFunction_Check(fobj)) { \
+            break; \
+        } \
+        PyFunctionObject* func = (PyFunctionObject*)fobj; \
+        if (func->vectorcall == getInterpretedVectorcall(func)) { \
+            break; \
+        } \
+        PyCodeObject* code = (PyCodeObject*)func->func_code; \
+        if (!(code->co_flags & CO_NO_MONITORING_EVENTS)) { \
+            CodeExtra* extra = codeExtra(code); \
+            adaptive_enabled = extra != NULL && is_adaptive_enabled(extra); \
         } \
     } while (0);
 
 #define CI_UPDATE_CALL_COUNT \
     do { \
-        PyObject *executable = PyStackRef_AsPyObjectBorrow(frame->f_executable); \
-        if (PyCode_Check(executable)) { \
-            PyCodeObject* code = (PyCodeObject*)executable; \
-            if (!(code->co_flags & CO_NO_MONITORING_EVENTS)) { \
-                CodeExtra *extra = codeExtra(code); \
-                if (extra == NULL) { \
-                    adaptive_enabled = false; \
-                } else { \
-                    Ci_code_extra_incr_calls(extra); \
-                    adaptive_enabled = is_adaptive_enabled(extra); \
-                } \
+        adaptive_enabled = false; \
+        PyObject* fobj = PyStackRef_AsPyObjectBorrow(frame->f_funcobj); \
+        if (!PyFunction_Check(fobj)) { \
+            break; \
+        } \
+        PyFunctionObject* func = (PyFunctionObject*)fobj; \
+        if (func->vectorcall == getInterpretedVectorcall(func)) { \
+            break; \
+        } \
+        PyCodeObject* code = (PyCodeObject*)func->func_code; \
+        if (!(code->co_flags & CO_NO_MONITORING_EVENTS)) { \
+            CodeExtra* extra = codeExtra(code); \
+            if (extra != NULL) { \
+                Ci_code_extra_incr_calls(extra); \
+                adaptive_enabled = is_adaptive_enabled(extra); \
             } \
         } \
     } while (0);

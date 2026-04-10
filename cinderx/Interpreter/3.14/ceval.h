@@ -951,7 +951,23 @@ clear_thread_frame(PyThreadState *tstate, _PyInterpreterFrame * frame)
     assert((PyObject **)frame + _PyFrame_GetCode(frame)->co_framesize ==
         tstate->datastack_top);
     assert(frame->frame_obj == NULL || frame->frame_obj->f_frame == frame);
-    _PyFrame_ClearExceptCode(frame);
+    if (frame->frame_obj == NULL) {
+        _PyStackRef *sp = frame->stackpointer;
+        _PyStackRef *locals = frame->localsplus;
+        frame->stackpointer = locals;
+        while (sp > locals) {
+            sp--;
+            PyStackRef_XCLOSE(*sp);
+        }
+        if (frame->f_locals != NULL) {
+            PyObject *locals_obj = frame->f_locals;
+            frame->f_locals = NULL;
+            Py_DECREF(locals_obj);
+        }
+        PyStackRef_CLEAR(frame->f_funcobj);
+    } else {
+        _PyFrame_ClearExceptCode(frame);
+    }
     PyStackRef_CLEAR(frame->f_executable);
     _PyThreadState_PopFrame(tstate, frame);
 }
