@@ -2771,18 +2771,23 @@ _PyCode_GetTLBC(PyCodeObject *co)
     return result;
 }
 
+static inline Py_ALWAYS_INLINE void
+Cix_dict_insert_split_value_inline(
+    PyInterpreterState *interp,
+    PyDictObject *mp,
+    PyObject *key,
+    PyObject *value,
+    Py_ssize_t ix) {
+  insert_split_value(interp, mp, key, value, ix);
+}
+
 void Cix_dict_insert_split_value(
     PyInterpreterState *interp,
     PyDictObject *mp,
     PyObject *key,
     PyObject *value,
     Py_ssize_t ix) {
-#if defined(__clang__)
-  [[clang::always_inline]]
-#elif defined(__GNUC__)
-  [[gnu::always_inline]]
-#endif
-  insert_split_value(interp, mp, key, value, ix);
+  Cix_dict_insert_split_value_inline(interp, mp, key, value, ix);
 }
 
 #define _PyObject_SetAttributeErrorContext _CiPyObject_SetAttributeErrorContext

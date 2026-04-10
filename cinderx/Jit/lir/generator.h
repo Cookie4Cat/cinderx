@@ -51,6 +51,7 @@ class LIRGenerator {
 
   // Borrowed pointers so the caches can be looked up by index; they're
   // allocated from and owned by Runtime.
+  std::vector<LoadMethodCache*> load_method_caches_;
   std::vector<LoadTypeAttrCache*> load_type_attr_caches_;
   std::vector<LoadTypeMethodCache*> load_type_method_caches_;
 #if PY_VERSION_HEX >= 0x030E0000
@@ -82,6 +83,11 @@ class LIRGenerator {
 
     if (hir_instr.IsGuardIs()) {
       const auto& guard = static_cast<const hir::GuardIs&>(hir_instr);
+      env_->code_rt->addReference(guard.target());
+      instr->addOperands(MemImm{guard.target()});
+    } else if (hir_instr.IsGuardModuleAttrValue()) {
+      const auto& guard =
+          static_cast<const hir::GuardModuleAttrValue&>(hir_instr);
       env_->code_rt->addReference(guard.target());
       instr->addOperands(MemImm{guard.target()});
     } else if (hir_instr.IsGuardType()) {

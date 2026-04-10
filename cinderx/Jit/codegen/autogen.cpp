@@ -2,6 +2,8 @@
 
 #include "cinderx/Jit/codegen/autogen.h"
 
+#include "pycore_long.h"
+
 #include "cinderx/Common/util.h"
 #include "cinderx/Jit/code_patcher.h"
 #include "cinderx/Jit/codegen/arch.h"
@@ -159,6 +161,8 @@ void AutoTranslator::translateInstr(Environ* env, const Instruction* instr)
 
 namespace {
 
+static const double kDoubleZero = 0.0;
+
 void fillLiveValueLocations(
     CodeRuntime* code_runtime,
     std::size_t deopt_idx,
@@ -192,10 +196,23 @@ void TranslateGuard(Environ* env, const Instruction* instr) {
   bool is_double = false;
   if (kind != kAlwaysFail) {
     if (instr->getInput(2)->dataType() == jit::lir::OperandBase::kDouble) {
-      JIT_CHECK(kind == kNotZero, "Only NotZero is supported for double");
       auto vecd_reg = AutoTranslator::getVecD(instr->getInput(2));
-      as->ptest(vecd_reg, vecd_reg);
-      as->jz(deopt_label);
+      switch (kind) {
+        case kNotZero:
+          as->ptest(vecd_reg, vecd_reg);
+          as->jz(deopt_label);
+          break;
+        case kNotNegative: {
+          auto skip = as->newLabel();
+          as->ucomisd(vecd_reg, x86::ptr(reinterpret_cast<uint64_t>(&kDoubleZero)));
+          as->jp(skip);
+          as->jb(deopt_label);
+          as->bind(skip);
+          break;
+        }
+        default:
+          JIT_ABORT("Unsupported guard kind {} for double", kind);
+      }
       is_double = true;
     } else {
       reg = AutoTranslator::getGp(instr->getInput(2));
@@ -238,6 +255,13 @@ void TranslateGuard(Environ* env, const Instruction* instr) {
       case kAlwaysFail:
         as->jmp(deopt_label);
         break;
+      case kCompactLong: {
+        as->cmp(
+            x86::qword_ptr(reg, offsetof(PyLongObject, long_value.lv_tag)),
+            2 << _PyLong_NON_SIZE_BITS);
+        as->jae(deopt_label);
+        break;
+      }
       case kIs:
         emit_cmp(reg);
         as->jne(deopt_label);
@@ -261,16 +285,56 @@ void TranslateGuard(Environ* env, const Instruction* instr) {
   auto deopt_label = as->newLabel();
   auto kind = instr->getInput(0)->getConstant();
 
+  auto emit_b_eq_far = [&](asmjit::Label target) {
+    auto skip = as->newLabel();
+    as->b_ne(skip);
+    as->b(target);
+    as->bind(skip);
+  };
+  auto emit_b_ne_far = [&](asmjit::Label target) {
+    auto skip = as->newLabel();
+    as->b_eq(skip);
+    as->b(target);
+    as->bind(skip);
+  };
+  auto emit_cbz_far = [&](auto reg_arg, asmjit::Label target) {
+    auto skip = as->newLabel();
+    as->cbnz(reg_arg, skip);
+    as->b(target);
+    as->bind(skip);
+  };
+  auto emit_cbnz_far = [&](auto reg_arg, asmjit::Label target) {
+    auto skip = as->newLabel();
+    as->cbz(reg_arg, skip);
+    as->b(target);
+    as->bind(skip);
+  };
+  auto emit_b_mi_far = [&](asmjit::Label target) {
+    auto skip = as->newLabel();
+    as->b_pl(skip);
+    as->b(target);
+    as->bind(skip);
+  };
+
   arch::Gp reg = arch::reg_scratch_0;
   bool is_double = false;
   uint64_t mask = 0;
   size_t sign_bit = 0;
   if (kind != kAlwaysFail) {
     if (instr->getInput(2)->dataType() == jit::lir::OperandBase::kDouble) {
-      JIT_CHECK(kind == kNotZero, "Only NotZero is supported for double")
       auto vecd_reg = AutoTranslator::getVecD(instr->getInput(2));
-      as->fmov(reg, vecd_reg);
-      as->cbz(reg, deopt_label);
+      switch (kind) {
+        case kNotZero:
+          as->fmov(reg, vecd_reg);
+          emit_cbz_far(reg, deopt_label);
+          break;
+        case kNotNegative:
+          as->fcmp(vecd_reg, 0.0);
+          emit_b_mi_far(deopt_label);
+          break;
+        default:
+          JIT_ABORT("Unsupported guard kind {} for double", kind);
+      }
       is_double = true;
     } else {
       auto data_type = instr->getInput(2)->dataType();
@@ -308,9 +372,9 @@ void TranslateGuard(Environ* env, const Instruction* instr) {
       case kNotZero:
         if (mask) {
           as->tst(reg, mask);
-          as->b_eq(deopt_label);
+          emit_b_eq_far(deopt_label);
         } else {
-          as->cbz(reg, deopt_label);
+          emit_cbz_far(reg, deopt_label);
         }
         break;
       case kNotNegative: {
@@ -325,17 +389,32 @@ void TranslateGuard(Environ* env, const Instruction* instr) {
       case kZero:
         if (mask) {
           as->tst(reg, mask);
-          as->b_ne(deopt_label);
+          emit_b_ne_far(deopt_label);
         } else {
-          as->cbnz(reg, deopt_label);
+          emit_cbnz_far(reg, deopt_label);
         }
         break;
       case kAlwaysFail:
         as->b(deopt_label);
         break;
+      case kCompactLong: {
+        as->ldr(
+            arch::reg_scratch_0,
+            arch::ptr_offset(
+                reg, offsetof(PyLongObject, long_value.lv_tag)));
+        arch::cmp_immediate(
+            as,
+            arch::reg_scratch_0,
+            static_cast<uint64_t>(2 << _PyLong_NON_SIZE_BITS));
+        auto skip = as->newLabel();
+        as->b_lo(skip);
+        as->b(deopt_label);
+        as->bind(skip);
+        break;
+      }
       case kIs:
         emit_cmp(reg);
-        as->b_ne(deopt_label);
+        emit_b_ne_far(deopt_label);
         break;
       case kHasType: {
         as->ldr(
@@ -343,7 +422,7 @@ void TranslateGuard(Environ* env, const Instruction* instr) {
             arch::ptr_offset(reg, offsetof(PyObject, ob_type)));
 
         emit_cmp(arch::reg_scratch_0);
-        as->b_ne(deopt_label);
+        emit_b_ne_far(deopt_label);
         break;
       }
     }
@@ -401,48 +480,91 @@ void TranslateCompare(Environ* env, const Instruction* instr) {
   auto as = env->as;
   const OperandBase* inp0 = instr->getInput(0);
   const OperandBase* inp1 = instr->getInput(1);
+  bool is_fp = inp0->isVecD() && inp1->isVecD();
 
   if (inp1->isImm() || inp1->isMem()) {
     as->cmp(AutoTranslator::getGp(inp0), inp1->getConstantOrAddress());
-  } else if (!inp1->isVecD()) {
+  } else if (!is_fp) {
     as->cmp(AutoTranslator::getGp(inp0), AutoTranslator::getGp(inp1));
   } else {
-    as->comisd(AutoTranslator::getVecD(inp0), AutoTranslator::getVecD(inp1));
+    if (instr->opcode() == Instruction::kLessThanUnsigned ||
+        instr->opcode() == Instruction::kLessThanEqualUnsigned) {
+      as->comisd(AutoTranslator::getVecD(inp1), AutoTranslator::getVecD(inp0));
+    } else {
+      as->comisd(AutoTranslator::getVecD(inp0), AutoTranslator::getVecD(inp1));
+    }
   }
   auto output = AutoTranslator::getGp(instr->output());
-  switch (instr->opcode()) {
-    case Instruction::kEqual:
-      as->sete(output);
-      break;
-    case Instruction::kNotEqual:
-      as->setne(output);
-      break;
-    case Instruction::kGreaterThanSigned:
-      as->setg(output);
-      break;
-    case Instruction::kGreaterThanEqualSigned:
-      as->setge(output);
-      break;
-    case Instruction::kLessThanSigned:
-      as->setl(output);
-      break;
-    case Instruction::kLessThanEqualSigned:
-      as->setle(output);
-      break;
-    case Instruction::kGreaterThanUnsigned:
-      as->seta(output);
-      break;
-    case Instruction::kGreaterThanEqualUnsigned:
-      as->setae(output);
-      break;
-    case Instruction::kLessThanUnsigned:
-      as->setb(output);
-      break;
-    case Instruction::kLessThanEqualUnsigned:
-      as->setbe(output);
-      break;
-    default:
-      JIT_ABORT("bad instruction for TranslateCompare");
+  if (is_fp) {
+    switch (instr->opcode()) {
+      case Instruction::kEqual: {
+        auto unordered = as->newLabel();
+        auto done = as->newLabel();
+        as->jp(unordered);
+        as->sete(output);
+        as->jmp(done);
+        as->bind(unordered);
+        as->mov(output, 0);
+        as->bind(done);
+        break;
+      }
+      case Instruction::kNotEqual: {
+        auto unordered = as->newLabel();
+        auto done = as->newLabel();
+        as->jp(unordered);
+        as->setne(output);
+        as->jmp(done);
+        as->bind(unordered);
+        as->mov(output, 1);
+        as->bind(done);
+        break;
+      }
+      case Instruction::kGreaterThanUnsigned:
+      case Instruction::kLessThanUnsigned:
+        as->seta(output);
+        break;
+      case Instruction::kGreaterThanEqualUnsigned:
+      case Instruction::kLessThanEqualUnsigned:
+        as->setae(output);
+        break;
+      default:
+        JIT_ABORT("bad floating-point instruction for TranslateCompare");
+    }
+  } else {
+    switch (instr->opcode()) {
+      case Instruction::kEqual:
+        as->sete(output);
+        break;
+      case Instruction::kNotEqual:
+        as->setne(output);
+        break;
+      case Instruction::kGreaterThanSigned:
+        as->setg(output);
+        break;
+      case Instruction::kGreaterThanEqualSigned:
+        as->setge(output);
+        break;
+      case Instruction::kLessThanSigned:
+        as->setl(output);
+        break;
+      case Instruction::kLessThanEqualSigned:
+        as->setle(output);
+        break;
+      case Instruction::kGreaterThanUnsigned:
+        as->seta(output);
+        break;
+      case Instruction::kGreaterThanEqualUnsigned:
+        as->setae(output);
+        break;
+      case Instruction::kLessThanUnsigned:
+        as->setb(output);
+        break;
+      case Instruction::kLessThanEqualUnsigned:
+        as->setbe(output);
+        break;
+      default:
+        JIT_ABORT("bad instruction for TranslateCompare");
+    }
   }
   if (instr->output()->dataType() != OperandBase::k8bit) {
     as->movzx(
@@ -453,6 +575,7 @@ void TranslateCompare(Environ* env, const Instruction* instr) {
   auto as = env->as;
   const OperandBase* inp0 = instr->getInput(0);
   const OperandBase* inp1 = instr->getInput(1);
+  bool is_fp = inp0->isVecD() && inp1->isVecD();
 
   if (inp1->isMem()) {
     JIT_CHECK(inp1->sizeInBits() == 64, "Only 64-bit memory supported");
@@ -466,7 +589,7 @@ void TranslateCompare(Environ* env, const Instruction* instr) {
   } else if (inp1->isImm()) {
     auto constant = inp1->getConstantOrAddress();
     arch::cmp_immediate(as, AutoTranslator::getGpWiden(inp0), constant);
-  } else if (!inp1->isVecD()) {
+  } else if (!is_fp) {
     as->cmp(AutoTranslator::getGpWiden(inp0), AutoTranslator::getGpWiden(inp1));
   } else {
     as->fcmp(AutoTranslator::getVecD(inp0), AutoTranslator::getVecD(inp1));
@@ -481,22 +604,28 @@ void TranslateCompare(Environ* env, const Instruction* instr) {
       as->cset(output, arm::CondCode::kNE);
       break;
     case Instruction::kGreaterThanSigned:
+      JIT_CHECK(!is_fp, "Signed floating-point compare is unsupported");
       as->cset(output, arm::CondCode::kGT);
       break;
     case Instruction::kGreaterThanEqualSigned:
+      JIT_CHECK(!is_fp, "Signed floating-point compare is unsupported");
       as->cset(output, arm::CondCode::kGE);
       break;
     case Instruction::kLessThanSigned:
+      JIT_CHECK(!is_fp, "Signed floating-point compare is unsupported");
       as->cset(output, arm::CondCode::kLT);
       break;
     case Instruction::kLessThanEqualSigned:
+      JIT_CHECK(!is_fp, "Signed floating-point compare is unsupported");
       as->cset(output, arm::CondCode::kLE);
       break;
     case Instruction::kGreaterThanUnsigned:
-      as->cset(output, arm::CondCode::kHI);
+      as->cset(
+          output, is_fp ? arm::CondCode::kGT : arm::CondCode::kHI);
       break;
     case Instruction::kGreaterThanEqualUnsigned:
-      as->cset(output, arm::CondCode::kHS);
+      as->cset(
+          output, is_fp ? arm::CondCode::kGE : arm::CondCode::kHS);
       break;
     case Instruction::kLessThanUnsigned:
       as->cset(output, arm::CondCode::kLO);
@@ -540,6 +669,74 @@ void translateIntToBool(Environ* env, const Instruction* instr) {
   } else {
     as->cmp(AutoTranslator::getGpWiden(input), 0);
     as->cset(output, a64::CondCode::kNE);
+  }
+#else
+  CINDER_UNSUPPORTED
+#endif
+}
+
+alignas(16) static const uint64_t kDoubleAbsMask[2] = {
+    0x7fffffffffffffffULL,
+    0xffffffffffffffffULL,
+};
+
+arch::Mem AsmIndirectOperandBuilder(const OperandBase* operand);
+
+void translateFabs(Environ* env, const Instruction* instr) {
+  const OperandBase* output = instr->output();
+  const OperandBase* input = instr->getInput(0);
+  JIT_CHECK(output->isReg() && output->isVecD(), "Expected VecD output");
+
+#if defined(CINDER_X86_64)
+  x86::Builder* as = env->as;
+  auto out = AutoTranslator::getVecD(output);
+
+  switch (input->type()) {
+    case OperandBase::kReg:
+      if (output->getPhyRegister() != input->getPhyRegister()) {
+        as->movsd(out, AutoTranslator::getVecD(input));
+      }
+      break;
+    case OperandBase::kStack:
+      as->movsd(out, x86::ptr(x86::rbp, input->getStackSlot().loc));
+      break;
+    case OperandBase::kMem:
+      as->movsd(out, x86::ptr(reinterpret_cast<uint64_t>(input->getMemoryAddress())));
+      break;
+    case OperandBase::kInd:
+      as->movsd(out, AsmIndirectOperandBuilder(input));
+      break;
+    default:
+      JIT_ABORT("Unsupported operand type for Fabs: {}", input->type());
+  }
+
+  auto mask = x86::ptr(reinterpret_cast<uint64_t>(kDoubleAbsMask));
+  mask.setSize(16);
+  as->andpd(out, mask);
+#elif defined(CINDER_AARCH64)
+  a64::Builder* as = env->as;
+  auto out = AutoTranslator::getVecD(output);
+
+  switch (input->type()) {
+    case OperandBase::kReg:
+      as->fabs(out, AutoTranslator::getVecD(input));
+      break;
+    case OperandBase::kStack: {
+      auto ptr =
+          arch::ptr_resolve(as, arch::fp, input->getStackSlot().loc, arch::reg_scratch_0);
+      as->ldr(out, ptr);
+      as->fabs(out, out);
+      break;
+    }
+    case OperandBase::kMem:
+      as->mov(arch::reg_scratch_0, input->getMemoryAddress());
+      as->ldr(out, a64::ptr(arch::reg_scratch_0));
+      as->fabs(out, out);
+      break;
+    case OperandBase::kInd:
+      JIT_ABORT("Unsupported operand type for Fabs: {}", input->type());
+    default:
+      JIT_ABORT("Unsupported operand type for Fabs: {}", input->type());
   }
 #else
   CINDER_UNSUPPORTED
@@ -1136,7 +1333,6 @@ struct RegOperand {
     switch (size) {
       case 8:
       case 16:
-        JIT_ABORT("Currently unsupported size.");
       case 32:
         return asmjit::a64::w(reg.loc);
       case 64:
@@ -1533,6 +1729,15 @@ BEGIN_RULES(Instruction::kFdiv)
   GEN("xx", ASM(divsd, OP(0), OP(1)))
 END_RULES
 
+BEGIN_RULES(Instruction::kFsqrt)
+  GEN("Xx", ASM(sqrtsd, OP(0), OP(1)))
+END_RULES
+
+BEGIN_RULES(Instruction::kFabs)
+  GEN("Xx", CALL_C(translateFabs))
+  GEN("Xm", CALL_C(translateFabs))
+END_RULES
+
 BEGIN_RULES(Instruction::kPush)
   GEN("r", ASM(push, OP(0)))
   GEN("m", ASM(push, STK(0)))
@@ -1762,6 +1967,14 @@ void leaIndex(
     arch::Gp base,
     arch::Gp index,
     uint8_t multiplier) {
+  // NOTE: LIR encodes scaled-index multipliers as log2(scale). For example:
+  //  - multiplier=0 => scale=1
+  //  - multiplier=1 => scale=2
+  //  - multiplier=2 => scale=4
+  //  - multiplier=3 => scale=8
+  //
+  // AArch64 supports scaled indexing via lsl, so interpret `multiplier` as the
+  // shift amount. This also avoids clobbering `index` when `output == index`.
   switch (multiplier) {
     case 0:
       as->add(output, base, index);
@@ -1776,8 +1989,12 @@ void leaIndex(
       as->add(output, base, index, a64::lsl(3));
       break;
     default: {
-      // Use scratch register to avoid clobbering index when output and
-      // index are the same register.
+      // Fallback for unexpected multipliers: output = base + index * (1 <<
+      // multiplier). This case shouldn't normally be hit because LIR only
+      // produces 0..3.
+      //
+      // Use scratch register to avoid clobbering index when output and index
+      // are the same register.
       as->mov(arch::reg_scratch_0, uint64_t{1} << multiplier);
       as->madd(output, index, arch::reg_scratch_0, base);
       break;
@@ -1907,34 +2124,24 @@ void translateCall(Environ* env, const Instruction* instr) {
 
   auto output = instr->output();
   auto input = instr->getInput(0);
+  bool debug_recorded = false;
 
-  // Load call target into a register, then save the return address at
-  // [fp + 16] before calling. This allows getIP() to find the return address
-  // at a fixed offset from the frame base, which is needed for cross-thread
-  // frame inspection (e.g. sys._current_frames()).
-  a64::Gp target;
   if (input->isReg()) {
-    target = AT::getGp(input);
+    as->blr(AT::getGp(input));
   } else if (input->isImm()) {
-    as->mov(arch::reg_scratch_br, input->getConstant());
-    target = arch::reg_scratch_br;
+    emitCall(*env, static_cast<uint64_t>(input->getConstant()), instr);
+    debug_recorded = true;
   } else if (input->isStack()) {
     auto loc = input->getStackSlot().loc;
     as->ldr(
         arch::reg_scratch_br,
         arch::ptr_resolve(as, arch::fp, loc, arch::reg_scratch_0));
-    target = arch::reg_scratch_br;
+    as->blr(arch::reg_scratch_br);
   } else {
     JIT_ABORT("Unsupported operand type for Call: {}", input->type());
   }
 
-  asmjit::Label after_call = as->newLabel();
-  as->adr(arch::reg_scratch_0, after_call);
-  as->str(arch::reg_scratch_0, a64::ptr(arch::fp, 16));
-  as->blr(target);
-  as->bind(after_call);
-
-  if (instr->origin()) {
+  if (instr->origin() && !debug_recorded) {
     asmjit::Label label = as->newLabel();
     as->bind(label);
     env->pending_debug_locs.emplace_back(label, instr->origin());
@@ -2714,6 +2921,11 @@ BEGIN_RULES(Instruction::kMove)
   GEN("Rx", ASM(fmov, OP(0), OP(1)))
 END_RULES
 
+// Atomic move with relaxed ordering.
+//
+// This corresponds to the C++/C memory_order_relaxed. On AArch64 a relaxed
+// load/store can be implemented as a normal load/store; we use the same
+// lowering as kMove.
 BEGIN_RULES(Instruction::kMoveRelaxed)
   GEN("Rm", CALL_C(translateMove))
   GEN("Mr", CALL_C(translateMove))
@@ -2850,6 +3062,15 @@ END_RULES
 BEGIN_RULES(Instruction::kFdiv)
   GEN("Xxx", ASM(fdiv, OP(0), OP(1), OP(2)))
   GEN("xx", ASM(fdiv, OP(0), OP(0), OP(1)))
+END_RULES
+
+BEGIN_RULES(Instruction::kFsqrt)
+  GEN("Xx", ASM(fsqrt, OP(0), OP(1)))
+END_RULES
+
+BEGIN_RULES(Instruction::kFabs)
+  GEN("Xx", CALL_C(translateFabs))
+  GEN("Xm", CALL_C(translateFabs))
 END_RULES
 
 BEGIN_RULES(Instruction::kPush)

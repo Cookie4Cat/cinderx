@@ -6540,7 +6540,7 @@
                 #if ENABLE_SPECIALIZATION && defined(ENABLE_ADAPTIVE_STATIC_PYTHON)
                 if (adaptive_enabled) {
                     _PyFrame_SetStackPointer(frame, stack_pointer);
-                    specialize_with_value(next_instr, func, TP_ALLOC_CACHED, 0, 0);
+                    specialize_with_value(next_instr, (PyObject *)type, TP_ALLOC_CACHED, 0, 0);
                     stack_pointer = _PyFrame_GetStackPointer(frame);
                 }
                 #endif

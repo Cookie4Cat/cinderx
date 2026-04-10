@@ -732,6 +732,13 @@ DEFINE_SIMPLE_INSTR(
     Operands<2>,
     DeoptBase);
 
+DEFINE_SIMPLE_INSTR(
+    ListSlice,
+    (TListExact, TObject, TObject),
+    HasOutput,
+    Operands<3>,
+    DeoptBase);
+
 // Gets a tuple representation from a sequence.
 DEFINE_SIMPLE_INSTR(GetTuple, (TObject), HasOutput, Operands<1>, DeoptBase);
 
@@ -813,6 +820,7 @@ enum class CallFlags : uint32_t {
   KwArgs = 1 << 0,
   Awaited = 1 << 1,
   Static = 1 << 2,
+  NoSpecialize = 1 << 3,
 };
 
 constexpr uint32_t raw(CallFlags flags) {
@@ -1498,6 +1506,37 @@ class INSTR_CLASS(
   BinaryOpKind op_;
 };
 
+class INSTR_CLASS(
+    CheckedIntBinaryOp,
+    (Constraint::kMatchAllAsCInt, Constraint::kMatchAllAsCInt),
+    HasOutput,
+    Operands<2>,
+    DeoptBase) {
+ public:
+  CheckedIntBinaryOp(
+      Register* dst,
+      BinaryOpKind op,
+      Register* left,
+      Register* right,
+      const FrameState& frame)
+      : InstrT(dst, left, right, frame), op_(op) {}
+
+  BinaryOpKind op() const {
+    return op_;
+  }
+
+  Register* left() const {
+    return GetOperand(0);
+  }
+
+  Register* right() const {
+    return GetOperand(1);
+  }
+
+ private:
+  BinaryOpKind op_;
+};
+
 // Perform a binary operation (e.g. '+', '-') on primitive double operands
 class INSTR_CLASS(
     DoubleBinaryOp,
@@ -1527,6 +1566,9 @@ class INSTR_CLASS(
  private:
   BinaryOpKind op_;
 };
+
+DEFINE_SIMPLE_INSTR(DoubleAbs, (TCDouble), HasOutput, Operands<1>);
+DEFINE_SIMPLE_INSTR(DoubleSqrt, (TCDouble), HasOutput, Operands<1>);
 
 class InlineBase {
  public:
@@ -1765,6 +1807,21 @@ class INSTR_CLASS(
 
  private:
   CompareOp op_;
+};
+
+class INSTR_CLASS(
+    LongUnboxCompact,
+    (TLongExact),
+    HasOutput,
+    Operands<1>,
+    DeoptBase) {
+ public:
+  LongUnboxCompact(Register* dst, Register* value, const FrameState& frame)
+      : InstrT(dst, value, frame) {}
+
+  Register* value() const {
+    return GetOperand(0);
+  }
 };
 
 // Perform the comparison indicated by op between two strings
@@ -2613,11 +2670,64 @@ class INSTR_CLASS(
   int cache_id_;
 };
 
+// Perform a full method lookup. Fill the cache if the receiver does not match
+// the cached exact receiver type.
+class INSTR_CLASS(
+    FillMethodCache,
+    (TObject),
+    HasOutput,
+    Operands<1>,
+    DeoptBaseWithNameIdx) {
+ public:
+  FillMethodCache(
+      Register* dst,
+      Register* receiver,
+      int name_idx,
+      int cache_id,
+      const FrameState& frame)
+      : InstrT(dst, receiver, name_idx, frame), cache_id_(cache_id) {}
+  FillMethodCache(
+      Register* dst,
+      Register* receiver,
+      int name_idx,
+      int cache_id,
+      std::unique_ptr<FrameState> frame)
+      : InstrT(dst, receiver, name_idx), cache_id_(cache_id) {
+    setFrameState(std::move(frame));
+  }
+
+  Register* receiver() const {
+    return reg();
+  }
+
+  int cache_id() const {
+    return cache_id_;
+  }
+
+ private:
+  int cache_id_;
+};
+
 // Load the type from a cache specialized for loading methods from type
 // receivers
 class INSTR_CLASS(LoadTypeMethodCacheEntryType, (), HasOutput, Operands<0>) {
  public:
   LoadTypeMethodCacheEntryType(Register* dst, int cache_id)
+      : InstrT(dst), cache_id_(cache_id) {}
+
+  int cache_id() const {
+    return cache_id_;
+  }
+
+ private:
+  int cache_id_;
+};
+
+// Load the cached receiver type from a cache specialized for loading methods
+// from exact instance receivers.
+class INSTR_CLASS(LoadMethodCacheEntryType, (), HasOutput, Operands<0>) {
+ public:
+  LoadMethodCacheEntryType(Register* dst, int cache_id)
       : InstrT(dst), cache_id_(cache_id) {}
 
   int cache_id() const {
@@ -2644,6 +2754,29 @@ class INSTR_CLASS(
   }
 
   // The type object we're loading the method from
+  Register* receiver() const {
+    return reg();
+  }
+
+ private:
+  int cache_id_;
+};
+
+// Load the cached callable from a cache specialized for loading methods from
+// exact instance receivers. The second output remains the receiver object.
+class INSTR_CLASS(
+    LoadMethodCacheEntryValue,
+    (TObject),
+    HasOutput,
+    Operands<1>) {
+ public:
+  LoadMethodCacheEntryValue(Register* dst, int cache_id, Register* receiver)
+      : InstrT(dst, receiver), cache_id_(cache_id) {}
+
+  int cache_id() const {
+    return cache_id_;
+  }
+
   Register* receiver() const {
     return reg();
   }
@@ -3265,6 +3398,12 @@ DEFINE_SIMPLE_INSTR(GetANext, (TObject), HasOutput, Operands<1>, DeoptBase);
 
 // Get the length of an object by calling __len__.
 DEFINE_SIMPLE_INSTR(GetLength, (TObject), HasOutput, Operands<1>, DeoptBase);
+DEFINE_SIMPLE_INSTR(
+    GetLengthInt64,
+    (TObject),
+    HasOutput,
+    Operands<1>,
+    DeoptBase);
 
 // Invoke next() on the iterator.
 //
@@ -3377,12 +3516,46 @@ DEFINE_SIMPLE_INSTR(
     Operands<1>,
     DeoptBase);
 
+DEFINE_SIMPLE_INSTR(
+    GuardNonNegativeDouble,
+    (TCDouble),
+    Operands<1>,
+    DeoptBase);
+
 // A guard that verifies that its src is the same object as the target, or
 // deopts if not.
 class INSTR_CLASS(GuardIs, (TOptObject), HasOutput, Operands<1>, DeoptBase) {
  public:
   GuardIs(Register* dst, PyObject* target, Register* src)
       : InstrT(dst, src), target_(target) {}
+
+  PyObject* target() const {
+    return target_;
+  }
+
+ private:
+  PyObject* target_;
+};
+
+class INSTR_CLASS(
+    GuardModuleAttrValue,
+    (TObject),
+    Operands<1>,
+    DeoptBaseWithNameIdx) {
+ public:
+  GuardModuleAttrValue(PyObject* target, Register* receiver, int name_idx)
+      : InstrT(receiver, name_idx), target_(target) {}
+
+  GuardModuleAttrValue(
+      PyObject* target,
+      Register* receiver,
+      int name_idx,
+      const FrameState& frame)
+      : InstrT(receiver, name_idx, frame), target_(target) {}
+
+  Register* receiver() const {
+    return reg();
+  }
 
   PyObject* target() const {
     return target_;
@@ -4000,6 +4173,14 @@ class Environment {
     return next_load_type_method_cache_;
   }
 
+  int allocateLoadMethodCache() {
+    return next_load_method_cache_++;
+  }
+
+  int numLoadMethodCaches() const {
+    return next_load_method_cache_;
+  }
+
  private:
   DISALLOW_COPY_AND_ASSIGN(Environment);
 
@@ -4008,6 +4189,7 @@ class Environment {
   int next_register_id_{0};
   int next_load_type_attr_cache_{0};
   int next_load_type_method_cache_{0};
+  int next_load_method_cache_{0};
 };
 
 constexpr unsigned long kThreadSafeFlagsMask = Py_TPFLAGS_BASETYPE;

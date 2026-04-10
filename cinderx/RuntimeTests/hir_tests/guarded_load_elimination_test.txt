@@ -1,0 +1,251 @@
+--- Test Suite Name ---
+GuardedLoadEliminationTest
+--- Passes ---
+GuardedLoadElimination
+--- Test Name ---
+EliminatesRedundantLoadTupleItemInBlock
+--- Input ---
+# HIR
+fun test {
+  bb 0 {
+    v0 = LoadArg<0; "t", TupleExact>
+    v1 = LoadTupleItem<0> v0
+    v2 = LoadTupleItem<0> v0
+    Return v2
+  }
+}
+--- Expected 3.10 ---
+fun test {
+  bb 0 {
+    v0:TupleExact = LoadArg<0; "t", TupleExact>
+    v1:Object = LoadTupleItem<0> v0
+    Return v1
+  }
+}
+--- Expected 3.12 ---
+fun test {
+  bb 0 {
+    v0:TupleExact = LoadArg<0; "t", TupleExact>
+    v1:Object = LoadTupleItem<0> v0
+    Return v1
+  }
+}
+--- Expected 3.14 ---
+fun test {
+  bb 0 {
+    v0:TupleExact = LoadArg<0, TupleExact>
+    v1:Object = LoadTupleItem<0> v0
+    Return v1
+  }
+}
+--- Expected 3.15 ---
+fun test {
+  bb 0 {
+    v0:TupleExact = LoadArg<0; "t", TupleExact>
+    v1:Object = LoadTupleItem<0> v0
+    Return v1
+  }
+}
+--- Test Name ---
+EliminatesRedundantExactLoadMethodCachedInBlock
+--- Input ---
+# HIR
+fun test {
+  bb 0 {
+    v0 = LoadArg<0; "s", UnicodeExact>
+    v1 = LoadMethodCached<0; "upper"> v0
+    v2 = GetSecondOutput<OptObject> v1
+    v3 = LoadMethodCached<0; "upper"> v0
+    v4 = GetSecondOutput<OptObject> v3
+    v5 = CallMethod<2> v3 v4
+    Return v5
+  }
+}
+--- Expected 3.10 ---
+fun test {
+  bb 0 {
+    v0:UnicodeExact = LoadArg<0; "s", UnicodeExact>
+    v1:Object = LoadMethodCached<0; "upper"> v0 {
+      FrameState {
+        CurInstrOffset -2
+      }
+    }
+    v2:OptObject = GetSecondOutput<OptObject> v1
+    v4:OptObject = GetSecondOutput<OptObject> v1
+    v5:Object = CallMethod<2> v1 v4 {
+      FrameState {
+        CurInstrOffset -2
+      }
+    }
+    Return v5
+  }
+}
+--- Expected 3.12 ---
+fun test {
+  bb 0 {
+    v0:UnicodeExact = LoadArg<0; "s", UnicodeExact>
+    v1:Object = LoadMethodCached<0; "upper"> v0 {
+      FrameState {
+        CurInstrOffset -2
+      }
+    }
+    v2:OptObject = GetSecondOutput<OptObject> v1
+    v4:OptObject = GetSecondOutput<OptObject> v1
+    v5:Object = CallMethod<2> v1 v4 {
+      FrameState {
+        CurInstrOffset -2
+      }
+    }
+    Return v5
+  }
+}
+--- Expected 3.14 ---
+fun test {
+  bb 0 {
+    v0:UnicodeExact = LoadArg<0, UnicodeExact>
+    v1:Object = LoadMethodCached<0> v0 {
+      FrameState {
+        CurInstrOffset -2
+      }
+    }
+    v2:OptObject = GetSecondOutput<OptObject> v1
+    v4:OptObject = GetSecondOutput<OptObject> v1
+    v5:Object = CallMethod<2> v1 v4 {
+      FrameState {
+        CurInstrOffset -2
+      }
+    }
+    Return v5
+  }
+}
+--- Expected 3.15 ---
+fun test {
+  bb 0 {
+    v0:UnicodeExact = LoadArg<0; "s", UnicodeExact>
+    v1:Object = LoadMethodCached<0; "upper"> v0 {
+      FrameState {
+        CurInstrOffset -2
+      }
+    }
+    v2:OptObject = GetSecondOutput<OptObject> v1
+    v4:OptObject = GetSecondOutput<OptObject> v1
+    v5:Object = CallMethod<2> v1 v4 {
+      FrameState {
+        CurInstrOffset -2
+      }
+    }
+    Return v5
+  }
+}
+--- Test Name ---
+DoesNotEliminateExactLoadMethodCachedAcrossCallBarrier
+--- Input ---
+# HIR
+fun test {
+  bb 0 {
+    v0 = LoadArg<0; "s", UnicodeExact>
+    v1 = LoadMethodCached<0; "upper"> v0
+    v2 = GetSecondOutput<OptObject> v1
+    v3 = CallMethod<2> v1 v2
+    v4 = LoadMethodCached<0; "upper"> v0
+    v5 = GetSecondOutput<OptObject> v4
+    Return v5
+  }
+}
+--- Expected 3.10 ---
+fun test {
+  bb 0 {
+    v0:UnicodeExact = LoadArg<0; "s", UnicodeExact>
+    v1:Object = LoadMethodCached<0; "upper"> v0 {
+      FrameState {
+        CurInstrOffset -2
+      }
+    }
+    v2:OptObject = GetSecondOutput<OptObject> v1
+    v3:Object = CallMethod<2> v1 v2 {
+      FrameState {
+        CurInstrOffset -2
+      }
+    }
+    v4:Object = LoadMethodCached<0; "upper"> v0 {
+      FrameState {
+        CurInstrOffset -2
+      }
+    }
+    v5:OptObject = GetSecondOutput<OptObject> v4
+    Return v5
+  }
+}
+--- Expected 3.12 ---
+fun test {
+  bb 0 {
+    v0:UnicodeExact = LoadArg<0; "s", UnicodeExact>
+    v1:Object = LoadMethodCached<0; "upper"> v0 {
+      FrameState {
+        CurInstrOffset -2
+      }
+    }
+    v2:OptObject = GetSecondOutput<OptObject> v1
+    v3:Object = CallMethod<2> v1 v2 {
+      FrameState {
+        CurInstrOffset -2
+      }
+    }
+    v4:Object = LoadMethodCached<0; "upper"> v0 {
+      FrameState {
+        CurInstrOffset -2
+      }
+    }
+    v5:OptObject = GetSecondOutput<OptObject> v4
+    Return v5
+  }
+}
+--- Expected 3.14 ---
+fun test {
+  bb 0 {
+    v0:UnicodeExact = LoadArg<0, UnicodeExact>
+    v1:Object = LoadMethodCached<0> v0 {
+      FrameState {
+        CurInstrOffset -2
+      }
+    }
+    v2:OptObject = GetSecondOutput<OptObject> v1
+    v3:Object = CallMethod<2> v1 v2 {
+      FrameState {
+        CurInstrOffset -2
+      }
+    }
+    v4:Object = LoadMethodCached<0> v0 {
+      FrameState {
+        CurInstrOffset -2
+      }
+    }
+    v5:OptObject = GetSecondOutput<OptObject> v4
+    Return v5
+  }
+}
+--- Expected 3.15 ---
+fun test {
+  bb 0 {
+    v0:UnicodeExact = LoadArg<0; "s", UnicodeExact>
+    v1:Object = LoadMethodCached<0; "upper"> v0 {
+      FrameState {
+        CurInstrOffset -2
+      }
+    }
+    v2:OptObject = GetSecondOutput<OptObject> v1
+    v3:Object = CallMethod<2> v1 v2 {
+      FrameState {
+        CurInstrOffset -2
+      }
+    }
+    v4:Object = LoadMethodCached<0; "upper"> v0 {
+      FrameState {
+        CurInstrOffset -2
+      }
+    }
+    v5:OptObject = GetSecondOutput<OptObject> v4
+    Return v5
+  }
+}
+--- End ---

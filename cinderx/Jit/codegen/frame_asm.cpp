@@ -10,6 +10,7 @@
 #include "cinderx/Common/py-portability.h"
 #include "cinderx/Common/util.h"
 #include "cinderx/Jit/codegen/arch.h"
+#include "cinderx/Jit/codegen/gen_asm_utils.h"
 #include "cinderx/Jit/codegen/register_preserver.h"
 #include "cinderx/Jit/frame.h"
 #include "cinderx/Jit/frame_header.h"
@@ -91,19 +92,31 @@ void initThreadStateOffset() {
   // out that offset.
   uint32_t* ts_func = reinterpret_cast<uint32_t*>(&_PyThreadState_GetCurrent);
 
+  size_t scan_start = 0;
+  uint32_t reg = 0;
+  bool matched = false;
+
   if (ts_func[0] == 0xa9bf7bfd && // stp x29, x30, [sp, #-16]!
       ts_func[1] == 0x910003fd && // mov x29, sp
-      ((ts_func[2] & ~0x1f) == 0xd53bd048) // mrs x?, tpidr_el0
+      ((ts_func[2] & ~0x1f) == 0xd53bd040) // mrs x?, tpidr_el0
   ) {
     // Here we know we are loading the thread local base offset into some
     // register, based on the mrs instruction.
-    uint32_t reg = ts_func[2] & 0x1f;
-    int32_t current_offset = 0;
+    reg = ts_func[2] & 0x1f;
+    scan_start = 3;
+    matched = true;
+  } else if ((ts_func[0] & ~0x1f) == 0xd53bd040) { // mrs x?, tpidr_el0 (no prologue)
+    reg = ts_func[0] & 0x1f;
+    scan_start = 1;
+    matched = true;
+  } 
 
+  if (matched) {
+    int32_t current_offset = 0;
     // Now, we will interpret any subsequent add instructions in order to
     // determine the offset. We will know we are done when we hit an ldr x0, or
     // we hit something unknown and need to break.
-    for (size_t index = 3;; index++) {
+    for (size_t index = scan_start;; index++) {
       if (ts_func[index] == (0xf9400000 | (reg << 5))) {
         // ldr x0, [x?]
         //
@@ -133,7 +146,6 @@ void initThreadStateOffset() {
 
     tstate_offset = current_offset;
   }
-
 #ifndef Py_DEBUG
   if (tstate_offset == -1) {
     assert(false);
@@ -163,8 +175,10 @@ void FrameAsm::loadTState(const arch::Gp& dst_reg) {
         dst_reg,
         arch::ptr_resolve(as_, dst_reg, tstate_offset, arch::reg_scratch_0));
   } else {
-    as_->mov(arch::reg_scratch_br, _PyThreadState_GetCurrent);
-    as_->blr(arch::reg_scratch_br);
+    emitCall(
+        env_,
+        reinterpret_cast<uint64_t>(_PyThreadState_GetCurrent),
+        nullptr);
     as_->mov(dst_reg, a64::x0);
   }
 #else
@@ -200,8 +214,10 @@ void FrameAsm::linkNormalGeneratorFrame(
   as_->mov(a64::x2, reinterpret_cast<intptr_t>(codeRuntime()));
   as_->adr(a64::x3, env_.gen_resume_entry_label);
   as_->mov(a64::x4, arch::fp);
-  as_->mov(arch::reg_scratch_br, JITRT_AllocateAndLinkGenAndInterpreterFrame);
-  as_->blr(arch::reg_scratch_br);
+  emitCall(
+      env_,
+      reinterpret_cast<uint64_t>(JITRT_AllocateAndLinkGenAndInterpreterFrame),
+      nullptr);
   as_->mov(tstate_reg, a64::x0);
   // tstate is now in x0 and GenDataFooter* in x1. Swap fp over to the
   // generator data so spilled data starts getting stored there. There
@@ -526,7 +542,7 @@ void FrameAsm::linkLightWeightFunctionFrame(
 #endif
 
   asmjit::BaseNode* store_f_code_cursor = as_->cursor();
-#if PY_VERSION_HEX >= 0x030E0000
+#if PY_VERSION_HEX >= 0x030F0000
   PyObject* executable = frame_reifier;
 #else
   PyObject* executable = (PyObject*)func_->code.get();
@@ -554,6 +570,26 @@ void FrameAsm::linkLightWeightFunctionFrame(
 #endif
   env_.addAnnotation(
       "Set _PyInterpreterFrame::f_funcobj", store_f_funcobj_cursor);
+
+#if PY_VERSION_HEX >= 0x030E0000
+  // Keep key frame metadata valid even before lazy frame population. This
+  // avoids crashes in C APIs that inspect the current frame (e.g.
+  // PyEval_GetGlobals / frame cleanup paths) while running JIT code.
+  asmjit::BaseNode* store_frame_meta_cursor = as_->cursor();
+  as_->mov(
+      scratch,
+      x86::ptr(func_reg, offsetof(PyFunctionObject, func_globals)));
+  as_->mov(x86::ptr(x86::rbp, FRAME_OFFSET(f_globals)), scratch);
+  as_->mov(
+      scratch,
+      x86::ptr(func_reg, offsetof(PyFunctionObject, func_builtins)));
+  as_->mov(x86::ptr(x86::rbp, FRAME_OFFSET(f_builtins)), scratch);
+  as_->mov(x86::qword_ptr(x86::rbp, FRAME_OFFSET(frame_obj)), 0);
+  as_->mov(x86::word_ptr(x86::rbp, FRAME_OFFSET(return_offset)), 0);
+  as_->mov(x86::byte_ptr(x86::rbp, FRAME_OFFSET(visited)), 0);
+  env_.addAnnotation(
+      "Initialize lightweight frame metadata", store_frame_meta_cursor);
+#endif
 
   // Store prev_instr + tlbc_index
   asmjit::BaseNode* store_prev_instr_cursor = as_->cursor();
@@ -691,7 +727,7 @@ void FrameAsm::linkLightWeightFunctionFrame(
 #endif
 
   asmjit::BaseNode* store_f_code_cursor = as_->cursor();
-#if PY_VERSION_HEX >= 0x030E0000
+#if PY_VERSION_HEX >= 0x030F0000
   PyObject* executable = frame_reifier;
 #else
   PyObject* executable = (PyObject*)func_->code.get();
@@ -728,6 +764,49 @@ void FrameAsm::linkLightWeightFunctionFrame(
 #endif
   env_.addAnnotation(
       "Set _PyInterpreterFrame::f_funcobj", store_f_funcobj_cursor);
+
+#if PY_VERSION_HEX >= 0x030E0000
+  // Keep key frame metadata valid even before lazy frame population. This
+  // avoids crashes in C APIs that inspect the current frame (e.g.
+  // PyEval_GetGlobals / frame cleanup paths) while running JIT code.
+  asmjit::BaseNode* store_frame_meta_cursor = as_->cursor();
+  as_->ldr(
+      scratch,
+      arch::ptr_offset(func_reg, offsetof(PyFunctionObject, func_globals)));
+  as_->str(
+      scratch,
+      arch::ptr_resolve(
+          as_, arch::fp, FRAME_OFFSET(f_globals), arch::reg_scratch_1));
+  as_->ldr(
+      scratch,
+      arch::ptr_offset(func_reg, offsetof(PyFunctionObject, func_builtins)));
+  as_->str(
+      scratch,
+      arch::ptr_resolve(
+          as_, arch::fp, FRAME_OFFSET(f_builtins), arch::reg_scratch_1));
+  as_->str(
+      a64::xzr,
+      arch::ptr_resolve(
+          as_, arch::fp, FRAME_OFFSET(frame_obj), arch::reg_scratch_1));
+  as_->strh(
+      a64::wzr,
+      arch::ptr_resolve(
+          as_,
+          arch::fp,
+          FRAME_OFFSET(return_offset),
+          arch::reg_scratch_1,
+          arch::AccessSize::k16));
+  as_->strb(
+      a64::wzr,
+      arch::ptr_resolve(
+          as_,
+          arch::fp,
+          FRAME_OFFSET(visited),
+          arch::reg_scratch_1,
+          arch::AccessSize::k8));
+  env_.addAnnotation(
+      "Initialize lightweight frame metadata", store_frame_meta_cursor);
+#endif
 
   // Store prev_instr + tlbc_index
   asmjit::BaseNode* store_prev_instr_cursor = as_->cursor();
@@ -876,15 +955,16 @@ void FrameAsm::linkNormalFunctionFrame(
 
   as_->mov(tstate_reg, x86::rax);
 #elif defined(CINDER_AARCH64)
+  uint64_t helper = 0;
   if (kPyDebug) {
     as_->mov(a64::x1, reinterpret_cast<intptr_t>(GetFunction()->code.get()));
-    as_->mov(arch::reg_scratch_br, JITRT_AllocateAndLinkInterpreterFrame_Debug);
+    helper = reinterpret_cast<uint64_t>(JITRT_AllocateAndLinkInterpreterFrame_Debug);
   } else {
-    as_->mov(
-        arch::reg_scratch_br, JITRT_AllocateAndLinkInterpreterFrame_Release);
+    helper =
+        reinterpret_cast<uint64_t>(JITRT_AllocateAndLinkInterpreterFrame_Release);
   }
 
-  as_->blr(arch::reg_scratch_br);
+  emitCall(env_, helper, nullptr);
   as_->mov(tstate_reg, a64::x0);
 #else
   CINDER_UNSUPPORTED
@@ -949,8 +1029,7 @@ void FrameAsm::linkNormalFrame(
       a64::x2,
       reinterpret_cast<intptr_t>(codeRuntime()->frameState()->globals().get()));
 
-  as_->mov(arch::reg_scratch_br, JITRT_AllocateAndLinkFrame);
-  as_->blr(arch::reg_scratch_br);
+  emitCall(env_, reinterpret_cast<uint64_t>(JITRT_AllocateAndLinkFrame), nullptr);
   as_->mov(tstate_reg, a64::x0);
 #else
   CINDER_UNSUPPORTED
@@ -1068,8 +1147,7 @@ void FrameAsm::generateUnlinkFrame([[maybe_unused]] bool is_generator) {
   } else {
     as_->str(a64::x0, saved_x0_ptr);
   }
-  as_->mov(arch::reg_scratch_br, JITRT_UnlinkFrame);
-  as_->blr(arch::reg_scratch_br);
+  emitCall(env_, reinterpret_cast<uint64_t>(JITRT_UnlinkFrame), nullptr);
 
   // It is possible that the scratch register used to compute the pointer was
   // clobbered by the call. If so, we need to reload it. This only happens if

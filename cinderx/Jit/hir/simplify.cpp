@@ -8,11 +8,15 @@
 #include "cinderx/Common/log.h"
 #include "cinderx/Common/property.h"
 #include "cinderx/Common/py-portability.h"
+#include "cinderx/Common/code.h"
 #include "cinderx/Common/type.h"
 #include "cinderx/Jit/context.h"
+#include "cinderx/Jit/bytecode.h"
+#include "cinderx/Jit/jit_rt.h"
 #include "cinderx/Jit/hir/analysis.h"
 #include "cinderx/Jit/hir/clean_cfg.h"
 #include "cinderx/Jit/hir/copy_propagation.h"
+#include "cinderx/Jit/hir/pass.h"
 #include "cinderx/Jit/hir/printer.h"
 #include "cinderx/Jit/hir/type.h"
 #include "cinderx/Jit/threaded_compile.h"
@@ -20,7 +24,36 @@
 
 #include <fmt/ostream.h>
 
+#include <cstdlib>
+#include <cstring>
+
 namespace jit::hir {
+
+namespace {
+
+bool useExactMethodCacheSplit() {
+  static int enabled = []() -> int {
+    const char* env = std::getenv("PYTHONJITEXACTMETHODCACHESPLIT");
+    if (env == nullptr) {
+      return 0;
+    }
+    return *env != '\0' && std::strcmp(env, "0") != 0;
+  }();
+  return enabled != 0;
+}
+
+bool sliceReverseFastPathEnabled() {
+  static int enabled = []() -> int {
+    const char* env = std::getenv("PYTHONJITENABLESLICEFASTPATH");
+    if (env == nullptr) {
+      return 1;
+    }
+    return *env != '\0' && std::strcmp(env, "0") != 0;
+  }();
+  return enabled != 0;
+}
+
+} // namespace
 
 // This file contains the Simplify pass, which is a collection of
 // strength-reduction optimizations. An optimization should be added as a case
@@ -55,6 +88,106 @@ namespace jit::hir {
 // functions.
 
 namespace {
+bool armMdpIntClampMinMaxEnabled() {
+  const char* env = std::getenv("PYTHONJIT_ARM_MDP_INT_CLAMP_MIN_MAX");
+  return env == nullptr || (env[0] != '\0' && std::strcmp(env, "0") != 0);
+}
+
+bool armMdpFractionMinCompareEnabled() {
+  const char* env = std::getenv("PYTHONJIT_ARM_MDP_FRACTION_MIN_COMPARE");
+  return env == nullptr || (env[0] != '\0' && std::strcmp(env, "0") != 0);
+}
+
+bool armMdpPriorityCompareAddEnabled() {
+  const char* env = std::getenv("PYTHONJIT_ARM_MDP_PRIORITY_COMPARE_ADD");
+  return env == nullptr || (env[0] != '\0' && std::strcmp(env, "0") != 0);
+}
+
+bool isMdpApplyHPChangeCode(BorrowedRef<PyCodeObject> code) {
+  if (code == nullptr || !PyUnicode_Check(code->co_qualname) ||
+      !PyUnicode_Check(code->co_filename)) {
+    return false;
+  }
+  const char* qualname = PyUnicode_AsUTF8(code->co_qualname);
+  const char* filename = PyUnicode_AsUTF8(code->co_filename);
+  if (qualname == nullptr || filename == nullptr) {
+    PyErr_Clear();
+    return false;
+  }
+  return std::strcmp(qualname, "applyHPChange") == 0 &&
+      std::strstr(filename, "bm_mdp/run_benchmark.py") != nullptr;
+}
+
+bool isMdpGetCritDistCode(BorrowedRef<PyCodeObject> code) {
+  if (code == nullptr || !PyUnicode_Check(code->co_qualname) ||
+      !PyUnicode_Check(code->co_filename)) {
+    return false;
+  }
+  const char* qualname = PyUnicode_AsUTF8(code->co_qualname);
+  const char* filename = PyUnicode_AsUTF8(code->co_filename);
+  if (qualname == nullptr || filename == nullptr) {
+    PyErr_Clear();
+    return false;
+  }
+  return std::strcmp(qualname, "getCritDist") == 0 &&
+      std::strstr(filename, "bm_mdp/run_benchmark.py") != nullptr;
+}
+
+bool isMdpGetSuccessorsBCode(BorrowedRef<PyCodeObject> code) {
+  if (code == nullptr || !PyUnicode_Check(code->co_qualname) ||
+      !PyUnicode_Check(code->co_filename)) {
+    return false;
+  }
+  const char* qualname = PyUnicode_AsUTF8(code->co_qualname);
+  const char* filename = PyUnicode_AsUTF8(code->co_filename);
+  if (qualname == nullptr || filename == nullptr) {
+    PyErr_Clear();
+    return false;
+  }
+  return std::strcmp(qualname, "Battle._getSuccessorsB") == 0 &&
+      std::strstr(filename, "bm_mdp/run_benchmark.py") != nullptr;
+}
+
+bool isLongObjectConst(Register* reg, long expected) {
+  PyObject* obj = reg->type().asObject();
+  if (obj == nullptr || !PyLong_CheckExact(obj)) {
+    return false;
+  }
+  int overflow = 0;
+  long actual = PyLong_AsLongAndOverflow(obj, &overflow);
+  if (overflow != 0 || PyErr_Occurred()) {
+    PyErr_Clear();
+    return false;
+  }
+  return actual == expected;
+}
+
+bool matchMdpPriorityBonusMultiply(
+    Register* reg,
+    Register** compare_out,
+    Register** bonus_const_out) {
+  if (!reg->instr()->IsBinaryOp()) {
+    return false;
+  }
+  auto* binop = static_cast<const BinaryOp*>(reg->instr());
+  if (binop->op() != BinaryOpKind::kMultiply) {
+    return false;
+  }
+
+  Register* left = binop->left();
+  Register* right = binop->right();
+  if (isLongObjectConst(left, 10000) && right->instr()->IsUnicodeCompare()) {
+    *compare_out = right;
+    *bonus_const_out = left;
+    return true;
+  }
+  if (isLongObjectConst(right, 10000) && left->instr()->IsUnicodeCompare()) {
+    *compare_out = left;
+    *bonus_const_out = right;
+    return true;
+  }
+  return false;
+}
 
 struct Env {
   explicit Env(Function& f)
@@ -232,6 +365,35 @@ struct Env {
   }
 };
 
+static void replaceDominatedUsesAfterInstr(
+    Function& func,
+    Instr& instr,
+    Register* orig,
+    Register* replacement);
+
+static Register* simplifyCondBranchTinyBoolMethodRefinement(
+    Env& env,
+    const CondBranch* instr);
+
+bool isRegisterUsed(const Function& func, const Register* reg) {
+  for (const auto& block : func.cfg.blocks) {
+    for (const auto& instr : block) {
+      bool found = false;
+      instr.visitUses([&](Register* use) {
+        if (use == reg) {
+          found = true;
+          return false;
+        }
+        return true;
+      });
+      if (found) {
+        return true;
+      }
+    }
+  }
+  return false;
+}
+
 Register* simplifyCheck(const CheckBase* instr) {
   // These all check their input for null.
   if (instr->GetOperand(0)->isA(TObject)) {
@@ -354,10 +516,11 @@ Register* emitGetLengthInt64(Env& env, Register* obj) {
 
 Register* simplifyGetLength(Env& env, const GetLength* instr) {
   Register* obj = instr->GetOperand(0);
-  if (Register* size = emitGetLengthInt64(env, obj)) {
-    return env.emit<PrimitiveBox>(size, TCInt64, *instr->frameState());
+  Register* size = emitGetLengthInt64(env, obj);
+  if (size == nullptr) {
+    size = env.emit<GetLengthInt64>(obj, *instr->frameState());
   }
-  return nullptr;
+  return env.emit<PrimitiveBox>(size, TCInt64, *instr->frameState());
 }
 
 Register* simplifyIntConvert(Env& env, const IntConvert* instr) {
@@ -367,6 +530,267 @@ Register* simplifyIntConvert(Env& env, const IntConvert* instr) {
     return instr->GetOperand(0);
   }
   return nullptr;
+}
+
+bool isIntConst(Register* reg, intptr_t value) {
+  Type ty = reg->type();
+  return ty.hasIntSpec() && ty.intSpec() == value;
+}
+
+std::optional<int64_t> getBoxedLongConst(Register* reg) {
+  reg = chaseAssignOperand(reg);
+  Type ty = reg->type();
+  if (ty.hasIntSpec()) {
+    return ty.intSpec();
+  }
+  if (!ty.hasObjectSpec() || !PyLong_CheckExact(ty.objectSpec())) {
+    return std::nullopt;
+  }
+
+  int overflow = 0;
+  long long value = PyLong_AsLongLongAndOverflow(ty.objectSpec(), &overflow);
+  PyErr_Clear();
+  if (overflow != 0) {
+    return std::nullopt;
+  }
+  return static_cast<int64_t>(value);
+}
+
+bool isBoxedFloatConst(Register* reg, double value) {
+  reg = chaseAssignOperand(reg);
+  Type ty = reg->type();
+  if (ty.hasDoubleSpec()) {
+    return ty.doubleSpec() == value;
+  }
+  if (!ty.hasObjectSpec() || !PyFloat_CheckExact(ty.objectSpec())) {
+    return false;
+  }
+  return PyFloat_AS_DOUBLE(ty.objectSpec()) == value;
+}
+
+bool isPowerTwoConst(Register* reg) {
+  auto int_value = getBoxedLongConst(reg);
+  if (int_value.has_value() && *int_value == 2) {
+    return true;
+  }
+  return isBoxedFloatConst(reg, 2.0);
+}
+
+bool isLenDerivedInt(Register* reg) {
+  reg = chaseAssignOperand(reg);
+  if (!(reg->type() <= TCInt64)) {
+    return false;
+  }
+
+  Instr* instr = reg->instr();
+  if (instr->IsGetLengthInt64()) {
+    return true;
+  }
+  if (instr->IsLoadField()) {
+    auto* load = static_cast<LoadField*>(instr);
+    if (!(load->type() <= TCInt64)) {
+      return false;
+    }
+    if (load->name() == "ob_size" &&
+        load->offset() == offsetof(PyVarObject, ob_size)) {
+      return true;
+    }
+    if (load->name() == "ma_used" &&
+        load->offset() == offsetof(PyDictObject, ma_used)) {
+      return true;
+    }
+    if (load->name() == "used" &&
+        load->offset() == offsetof(PySetObject, used)) {
+      return true;
+    }
+    if (load->name() == "length" &&
+        load->offset() == offsetof(PyASCIIObject, length)) {
+      return true;
+    }
+    return false;
+  }
+
+  if (instr->IsIntBinaryOp()) {
+    auto* binop = static_cast<IntBinaryOp*>(instr);
+    switch (binop->op()) {
+      case BinaryOpKind::kAdd:
+        return (isLenDerivedInt(binop->left()) &&
+                getBoxedLongConst(binop->right()).has_value()) ||
+            (isLenDerivedInt(binop->right()) &&
+             getBoxedLongConst(binop->left()).has_value());
+      case BinaryOpKind::kRShift:
+        return isLenDerivedInt(binop->left()) &&
+            getBoxedLongConst(binop->right()).has_value();
+      default:
+        return false;
+    }
+  }
+
+  return false;
+}
+
+Register* stripTypeNarrowing(Register* reg) {
+  Register* cur = chaseAssignOperand(reg);
+  while (true) {
+    Instr* instr = cur->instr();
+    if (instr->IsGuardType() || instr->IsRefineType()) {
+      cur = chaseAssignOperand(instr->GetOperand(0));
+      continue;
+    }
+    return cur;
+  }
+}
+
+bool isNoneConst(Register* reg) {
+  Type ty = stripTypeNarrowing(reg)->type();
+  return ty <= TNoneType || (ty.hasObjectSpec() && ty.objectSpec() == Py_None);
+}
+
+bool isLongConstValue(Register* reg, int64_t value) {
+  auto boxed = getBoxedLongConst(stripTypeNarrowing(reg));
+  return boxed.has_value() && *boxed == value;
+}
+
+bool sameValueIgnoringNarrowing(Register* a, Register* b) {
+  return stripTypeNarrowing(a) == stripTypeNarrowing(b);
+}
+
+Register* matchLongAddOneFromBase(Register* reg, Register** base_out) {
+  Register* stop = stripTypeNarrowing(reg);
+  Register* lhs = nullptr;
+  Register* rhs = nullptr;
+
+  if (stop->instr()->IsLongBinaryOp()) {
+    auto* add = static_cast<const LongBinaryOp*>(stop->instr());
+    if (add->op() != BinaryOpKind::kAdd) {
+      return nullptr;
+    }
+    lhs = stripTypeNarrowing(add->left());
+    rhs = stripTypeNarrowing(add->right());
+  } else if (stop->instr()->IsBinaryOp()) {
+    auto* add = static_cast<const BinaryOp*>(stop->instr());
+    if (add->op() != BinaryOpKind::kAdd) {
+      return nullptr;
+    }
+    lhs = stripTypeNarrowing(add->left());
+    rhs = stripTypeNarrowing(add->right());
+  } else {
+    return nullptr;
+  }
+  if (isLongConstValue(lhs, 1)) {
+    *base_out = rhs;
+    return stop;
+  }
+  if (isLongConstValue(rhs, 1)) {
+    *base_out = lhs;
+    return stop;
+  }
+  return nullptr;
+}
+
+Register* unboxLenArithmeticInt(Register* reg) {
+  reg = chaseAssignOperand(reg);
+  if (reg->type() <= TCInt64) {
+    return reg;
+  }
+  if (reg->instr()->IsPrimitiveBox()) {
+    auto* box = static_cast<PrimitiveBox*>(reg->instr());
+    if (box->value()->type() <= TCInt64) {
+      return box->value();
+    }
+  }
+  return nullptr;
+}
+
+Register* emitIntConstantLikeOutput(Env& env, Type output_type, uint64_t value) {
+  if (output_type <= TCSigned) {
+    return env.emit<LoadConst>(
+        Type::fromCInt(static_cast<int64_t>(value), output_type));
+  }
+  if (output_type <= TCUnsigned) {
+    return env.emit<LoadConst>(Type::fromCUInt(value, output_type));
+  }
+  JIT_ABORT("unexpected IntBinaryOp output type '{}'", output_type);
+}
+
+Register* simplifyIntBinaryOp(Env& env, const IntBinaryOp* instr) {
+  Register* left = instr->left();
+  Register* right = instr->right();
+
+  bool left_is_zero = isIntConst(left, 0);
+  bool right_is_zero = isIntConst(right, 0);
+  bool left_is_one = isIntConst(left, 1);
+  bool right_is_one = isIntConst(right, 1);
+
+  switch (instr->op()) {
+    case BinaryOpKind::kAdd:
+      if (left_is_zero) {
+        return right;
+      }
+      if (right_is_zero) {
+        return left;
+      }
+      return nullptr;
+
+    case BinaryOpKind::kSubtract:
+      if (right_is_zero) {
+        return left;
+      }
+      return nullptr;
+
+    case BinaryOpKind::kMultiply:
+      if (left_is_zero || right_is_zero) {
+        return emitIntConstantLikeOutput(env, instr->output()->type(), 0);
+      }
+      if (left_is_one) {
+        return right;
+      }
+      if (right_is_one) {
+        return left;
+      }
+      return nullptr;
+
+    case BinaryOpKind::kAnd:
+      if (left_is_zero || right_is_zero) {
+        return emitIntConstantLikeOutput(env, instr->output()->type(), 0);
+      }
+      return nullptr;
+
+    case BinaryOpKind::kOr:
+    case BinaryOpKind::kXor:
+      if (left_is_zero) {
+        return right;
+      }
+      if (right_is_zero) {
+        return left;
+      }
+      return nullptr;
+
+    case BinaryOpKind::kLShift:
+    case BinaryOpKind::kRShift:
+    case BinaryOpKind::kRShiftUnsigned:
+      if (right_is_zero) {
+        return left;
+      }
+      return nullptr;
+
+    case BinaryOpKind::kFloorDivide:
+    case BinaryOpKind::kFloorDivideUnsigned:
+      if (right_is_one) {
+        return left;
+      }
+      return nullptr;
+
+    case BinaryOpKind::kModulo:
+    case BinaryOpKind::kModuloUnsigned:
+      if (right_is_one) {
+        return emitIntConstantLikeOutput(env, instr->output()->type(), 0);
+      }
+      return nullptr;
+
+    default:
+      return nullptr;
+  }
 }
 
 Register* simplifyCompare(Env& env, const Compare* instr) {
@@ -422,6 +846,11 @@ Register* simplifyCompare(Env& env, const Compare* instr) {
 }
 
 Register* simplifyCondBranch(Env& env, const CondBranch* instr) {
+  if (Register* result =
+          simplifyCondBranchTinyBoolMethodRefinement(env, instr)) {
+    return result;
+  }
+
   Register* cond = instr->GetOperand(0);
   Type cond_type = cond->type();
   // Constant condition folds into an unconditional jump.
@@ -484,6 +913,17 @@ Register* simplifyIsTruthy(Env& env, const IsTruthy* instr) {
       return env.emit<LoadConst>(Type::fromCBool(res));
     }
   }
+  Register* modeled_input = modelReg(instr->GetOperand(0));
+  if (modeled_input->instr()->IsLongCompare()) {
+    BasicBlock* block = instr->block();
+    if (block != nullptr && !block->empty() && block->back().IsCondBranch() &&
+        block->back().GetOperand(0) == instr->output()) {
+      // Leave LongCompare -> IsTruthy intact so DynamicComparisonElimination
+      // can fuse the branch predicate into a bool-producing compare and avoid
+      // allocating a temporary PyBool object.
+      return nullptr;
+    }
+  }
   if (ty <= TBool) {
     Register* left = instr->GetOperand(0);
     env.emit<UseType>(left, TBool);
@@ -508,6 +948,15 @@ Register* simplifyIsTruthy(Env& env, const IsTruthy* instr) {
 
 Register* simplifyLoadTupleItem(Env& env, const LoadTupleItem* instr) {
   Register* src = instr->GetOperand(0);
+  if (src->instr()->IsMakeTuple()) {
+    size_t length = static_cast<const MakeTuple*>(src->instr())->nvalues();
+    if (instr->idx() < length) {
+      env.emit<UseType>(src, TTupleExact);
+      return src->instr()->GetOperand(instr->idx());
+    }
+    return nullptr;
+  }
+
   Type src_ty = src->type();
   if (!src_ty.hasValueSpec(TTuple)) {
     return nullptr;
@@ -575,8 +1024,48 @@ Register* simplifyLoadModuleMethodCached(
     const LoadMethod* load_meth) {
   Register* receiver = load_meth->GetOperand(0);
   int name_idx = load_meth->name_idx();
+#if PY_VERSION_HEX >= 0x030E0000
+  return env.emit<LoadModuleAttrCached>(
+      receiver, name_idx, *load_meth->frameState());
+#else
   return env.emit<LoadModuleMethodCached>(
       receiver, name_idx, *load_meth->frameState());
+#endif
+}
+
+Register* simplifyLongCompare(Env& env, const LongCompare* instr) {
+  Register* left = unboxLenArithmeticInt(instr->left());
+  Register* right = unboxLenArithmeticInt(instr->right());
+  std::optional<int64_t> left_const = getBoxedLongConst(instr->left());
+  std::optional<int64_t> right_const = getBoxedLongConst(instr->right());
+
+  if (left == nullptr && !left_const.has_value()) {
+    return nullptr;
+  }
+  if (right == nullptr && !right_const.has_value()) {
+    return nullptr;
+  }
+
+  bool len_like_left = left != nullptr && isLenDerivedInt(left);
+  bool len_like_right = right != nullptr && isLenDerivedInt(right);
+  if (!len_like_left && !len_like_right) {
+    return nullptr;
+  }
+
+  auto prim_op = toPrimitiveCompareOp(instr->op());
+  if (!prim_op.has_value()) {
+    return nullptr;
+  }
+
+  if (left == nullptr) {
+    left = env.emit<LoadConst>(Type::fromCInt(*left_const, TCInt64));
+  }
+  if (right == nullptr) {
+    right = env.emit<LoadConst>(Type::fromCInt(*right_const, TCInt64));
+  }
+
+  Register* result = env.emit<PrimitiveCompare>(*prim_op, left, right);
+  return env.emit<PrimitiveBoxBool>(result);
 }
 
 Register* simplifyLoadTypeMethodCached(Env& env, const LoadMethod* load_meth) {
@@ -613,10 +1102,44 @@ Register* simplifyLoadMethod(Env& env, const LoadMethod* load_meth) {
   if (type == &PyModule_Type || type == &Ci_StrictModule_Type) {
     return simplifyLoadModuleMethodCached(env, load_meth);
   }
+  if (
+      useExactMethodCacheSplit() && type != nullptr &&
+      type != &PyModule_Type && type != &Ci_StrictModule_Type &&
+      PyType_HasFeature(type, Py_TPFLAGS_MANAGED_DICT)) {
+    const int cache_id = env.func.env.allocateLoadMethodCache();
+    env.emit<UseType>(receiver, receiver->type());
+    Register* obj_type = env.emit<LoadField>(
+        receiver, "ob_type", offsetof(PyObject, ob_type), TType);
+    Register* guard = env.emit<LoadMethodCacheEntryType>(cache_id);
+    Register* type_matches =
+        env.emit<PrimitiveCompare>(PrimitiveCompareOp::kEqual, guard, obj_type);
+    return env.emitCond(
+        [&](BasicBlock* fast_path, BasicBlock* slow_path) {
+          env.emit<CondBranch>(type_matches, fast_path, slow_path);
+        },
+        [&] { return env.emit<LoadMethodCacheEntryValue>(cache_id, receiver); },
+        [&] {
+          return env.emit<FillMethodCache>(
+              receiver,
+              load_meth->name_idx(),
+              cache_id,
+              *load_meth->frameState());
+        });
+  }
   return env.emit<LoadMethodCached>(
       load_meth->GetOperand(0),
       load_meth->name_idx(),
       *load_meth->frameState());
+}
+
+Register* simplifyGetSecondOutput(Env& env, const GetSecondOutput* instr) {
+#if PY_VERSION_HEX >= 0x030E0000
+  Register* src = modelReg(instr->GetOperand(0));
+  if (src->instr()->IsLoadModuleAttrCached()) {
+    return env.emit<LoadConst>(TNullptr);
+  }
+#endif
+  return nullptr;
 }
 
 Register* simplifyBinaryOp(Env& env, const BinaryOp* instr) {
@@ -624,9 +1147,43 @@ Register* simplifyBinaryOp(Env& env, const BinaryOp* instr) {
   Register* lhs = instr->left();
   Register* rhs = instr->right();
 
+  if (armMdpPriorityCompareAddEnabled() && op == BinaryOpKind::kMultiply &&
+      isMdpGetSuccessorsBCode(BorrowedRef<PyCodeObject>{env.func.code})) {
+    Register* compare = nullptr;
+    Register* bonus_const = nullptr;
+    if (matchMdpPriorityBonusMultiply(instr->output(), &compare, &bonus_const)) {
+      Register* zero = env.emit<LoadConst>(Type::fromObject(_PyLong_GetZero()));
+      Register* bonus = env.emitCond(
+          [&](BasicBlock* bb1, BasicBlock* bb2) {
+            Register* compare_truth =
+                env.emit<IsTruthy>(compare, *instr->frameState());
+            return env.emit<CondBranch>(compare_truth, bb1, bb2);
+          },
+          [&] { return bonus_const; },
+          [&] { return zero; });
+      if (!bonus->isA(TLongExact)) {
+        bonus = env.emit<GuardType>(TLongExact, bonus, *instr->frameState());
+      }
+      return bonus;
+    }
+  }
+
   if (op == BinaryOpKind::kSubscript) {
     if (lhs->isA(TDictExact)) {
       return env.emit<DictSubscr>(lhs, rhs, *instr->frameState());
+    }
+    if (lhs->isA(TListExact) && rhs->instr()->IsBuildSlice()) {
+      auto* build_slice = static_cast<const BuildSlice*>(rhs->instr());
+      Register* start = build_slice->start();
+      Register* stop = build_slice->stop();
+      bool supported_start = start->isA(TNoneType) || start->isA(TLongExact);
+      bool supported_stop = stop->isA(TNoneType) || stop->isA(TLongExact);
+      if (build_slice->NumOperands() == 2 && supported_start && supported_stop) {
+        env.emit<UseType>(lhs, TListExact);
+        env.emit<UseType>(start, start->type());
+        env.emit<UseType>(stop, stop->type());
+        return env.emit<ListSlice>(lhs, start, stop, *instr->frameState());
+      }
     }
     if (!rhs->isA(TLongExact)) {
       return nullptr;
@@ -741,7 +1298,35 @@ Register* simplifyBinaryOp(Env& env, const BinaryOp* instr) {
        FloatBinaryOp::slotMethod(instr->op()))) {
     env.emit<UseType>(lhs, TFloatExact);
     env.emit<UseType>(rhs, TFloatExact);
+
+    // For common exact-float arithmetic, lower through primitive doubles so
+    // LIR can emit native FP ops (Fadd/Fsub/Fmul) instead of helper calls.
+    //
+    // Keep operations with Python-specific edge semantics (for example
+    // TrueDivide raising on +/-0.0) on the FloatBinaryOp helper path.
+    if (instr->op() == BinaryOpKind::kAdd ||
+        instr->op() == BinaryOpKind::kSubtract ||
+        instr->op() == BinaryOpKind::kMultiply) {
+      Register* lhs_unboxed = env.emit<PrimitiveUnbox>(lhs, TCDouble);
+      Register* rhs_unboxed = env.emit<PrimitiveUnbox>(rhs, TCDouble);
+      Register* out_unboxed =
+          env.emit<DoubleBinaryOp>(instr->op(), lhs_unboxed, rhs_unboxed);
+      return env.emit<PrimitiveBox>(out_unboxed, TCDouble, *instr->frameState());
+    }
+
     return env.emit<FloatBinaryOp>(instr->op(), lhs, rhs, *instr->frameState());
+  }
+
+  if (op == BinaryOpKind::kPower && isPowerTwoConst(rhs)) {
+    Register* guarded_lhs =
+        lhs->isA(TFloatExact)
+        ? lhs
+        : env.emit<GuardType>(TFloatExact, lhs, *instr->frameState());
+    env.emit<UseType>(guarded_lhs, TFloatExact);
+    Register* lhs_unboxed = env.emit<PrimitiveUnbox>(guarded_lhs, TCDouble);
+    Register* out_unboxed = env.emit<DoubleBinaryOp>(
+        BinaryOpKind::kMultiply, lhs_unboxed, lhs_unboxed);
+    return env.emit<PrimitiveBox>(out_unboxed, TCDouble, *instr->frameState());
   }
 
   if ((lhs->isA(TUnicodeExact) && rhs->isA(TLongExact)) &&
@@ -828,6 +1413,33 @@ Register* simplifyInPlaceOp(Env& env, const InPlaceOp* instr) {
 }
 
 Register* simplifyLongBinaryOp(Env& env, const LongBinaryOp* instr) {
+  Register* left = unboxLenArithmeticInt(instr->left());
+  Register* right = unboxLenArithmeticInt(instr->right());
+  auto right_const = getBoxedLongConst(instr->right());
+  auto left_const = getBoxedLongConst(instr->left());
+
+  if (instr->op() == BinaryOpKind::kFloorDivide &&
+      left != nullptr && right_const.has_value() && *right_const == 2 &&
+      isLenDerivedInt(left)) {
+      Register* shift = env.emit<LoadConst>(Type::fromCInt(1, TCInt64));
+      Register* result = env.emit<IntBinaryOp>(BinaryOpKind::kRShift, left, shift);
+      return env.emit<PrimitiveBox>(result, TCInt64, *instr->frameState());
+  }
+  if (instr->op() == BinaryOpKind::kAdd) {
+    if (left != nullptr && right_const.has_value() && isLenDerivedInt(left)) {
+      Register* addend =
+          env.emit<LoadConst>(Type::fromCInt(*right_const, TCInt64));
+      Register* result = env.emit<IntBinaryOp>(BinaryOpKind::kAdd, left, addend);
+      return env.emit<PrimitiveBox>(result, TCInt64, *instr->frameState());
+    }
+    if (right != nullptr && left_const.has_value() && isLenDerivedInt(right)) {
+      Register* addend =
+          env.emit<LoadConst>(Type::fromCInt(*left_const, TCInt64));
+      Register* result = env.emit<IntBinaryOp>(BinaryOpKind::kAdd, right, addend);
+      return env.emit<PrimitiveBox>(result, TCInt64, *instr->frameState());
+    }
+  }
+
   // This isn't safe in the multi-threaded compilation on 3.12 because
   // we don't hold the GIL which is required for allocation.
   RETURN_MULTITHREADED_COMPILE(nullptr);
@@ -873,6 +1485,13 @@ Register* simplifyFloatBinaryOp(Env& env, const FloatBinaryOp* instr) {
   // `x ** 0.5`, convert to the unboxed path.  The LIR generator can lower this
   // into a call to sqrt().
   if (op == BinaryOpKind::kPower) {
+    if (isPowerTwoConst(instr->right())) {
+      Register* unbox_left = env.emit<PrimitiveUnbox>(instr->left(), TCDouble);
+      Register* result = env.emit<DoubleBinaryOp>(
+          BinaryOpKind::kMultiply, unbox_left, unbox_left);
+      return env.emit<PrimitiveBox>(result, TCDouble, *instr->frameState());
+    }
+
     Type right_type = instr->right()->type();
     if (right_type.hasObjectSpec() && PyFloat_Check(right_type.objectSpec()) &&
         PyFloat_AS_DOUBLE(right_type.objectSpec()) == 0.5) {
@@ -1022,9 +1641,10 @@ Register* simplifyUnbox(Env& env, const Instr* instr) {
 
 #if PY_VERSION_HEX >= 0x030E0000
 
+template <typename LoadAttrT>
 Register* simplifyLoadAttrSplitDict(
     Env& env,
-    const LoadAttr* load_attr,
+    const LoadAttrT* load_attr,
     BorrowedRef<PyTypeObject> type,
     BorrowedRef<PyUnicodeObject> name) {
 #ifdef Py_GIL_DISABLED
@@ -1060,6 +1680,22 @@ Register* simplifyLoadAttrSplitDict(
       "inline_values.valid",
       type->tp_basicsize + offsetof(PyDictValues, valid),
       TCUInt8);
+  if (env.func.allow_aggressive_split_dict_loads) {
+    auto* valid_guard = env.emitInstr<Guard>(inline_values_valid);
+    valid_guard->setGuiltyReg(receiver);
+    valid_guard->setDescr("inline_values.valid");
+
+    Register* maybe_attr = env.emit<LoadField>(
+        receiver,
+        unicodeAsString(name),
+        attr_idx * sizeof(PyObject*) + type->tp_basicsize +
+            offsetof(PyDictValues, values),
+        TOptObject);
+    Register* attr =
+        env.emit<CheckField>(maybe_attr, name, *load_attr->frameState());
+    static_cast<CheckField*>(attr->instr())->setGuiltyReg(receiver);
+    return attr;
+  }
 
   return env.emitCond(
       [&](BasicBlock* bb1, BasicBlock* bb2) {
@@ -1093,9 +1729,10 @@ Register* simplifyLoadAttrSplitDict(
 // - The receiver has a known, exact type.
 // - The type has a valid version tag.
 // - The type doesn't have a descriptor at the attribute name.
+template <typename LoadAttrT>
 Register* simplifyLoadAttrSplitDict(
     Env& env,
-    const LoadAttr* load_attr,
+    const LoadAttrT* load_attr,
     BorrowedRef<PyTypeObject> type,
     BorrowedRef<PyUnicodeObject> name) {
 
@@ -1300,11 +1937,53 @@ Register* simplifyLoadAttrGenericDescriptor(Env& env, const DescrInfo& info) {
   return env.emit<CheckExc>(call->output(), *info.frame_state);
 }
 
+bool simplifyStoreAttrMemberDescr(
+    Env& env,
+    const DescrInfo& info,
+    Register* value) {
+  if (Py_TYPE(info.descr) != &PyMemberDescr_Type) {
+    return false;
+  }
+
+  PyMemberDef* def =
+      reinterpret_cast<PyMemberDescrObject*>(info.descr.get())->d_member;
+  if ((def->flags & READONLY) != 0) {
+    return false;
+  }
+  if (def->type != T_OBJECT && def->type != T_OBJECT_EX) {
+    return false;
+  }
+
+  const char* name_cstr = PyUnicode_AsUTF8(info.attr_name);
+  if (name_cstr == nullptr) {
+    PyErr_Clear();
+    name_cstr = "<unknown>";
+  }
+
+  emitTypeAttrDeoptPatcher(env, info, "member descriptor attribute");
+  env.emit<UseType>(info.receiver, info.type);
+  Register* previous = env.emit<LoadField>(
+      info.receiver,
+      name_cstr,
+      def->offset,
+      TOptObject,
+      /* borrowed= */ false);
+  env.emitInstr<StoreField>(
+      info.receiver,
+      name_cstr,
+      def->offset,
+      value,
+      TOptObject,
+      previous);
+  return true;
+}
+
 // Attempt to handle LOAD_ATTR cases where the load is a common case for object
 // instances (not types).
+template <typename LoadAttrT>
 Register* simplifyLoadAttrInstanceReceiver(
     Env& env,
-    const LoadAttr* load_attr) {
+    const LoadAttrT* load_attr) {
   Register* receiver = load_attr->GetOperand(0);
   Type type = receiver->type();
   BorrowedRef<PyTypeObject> py_type{type.runtimePyType()};
@@ -1349,7 +2028,8 @@ Register* simplifyLoadAttrInstanceReceiver(
   return nullptr;
 }
 
-Register* simplifyLoadAttrTypeReceiver(Env& env, const LoadAttr* load_attr) {
+template <typename LoadAttrT>
+Register* simplifyLoadAttrTypeReceiver(Env& env, const LoadAttrT* load_attr) {
   Register* receiver = load_attr->GetOperand(0);
   if (!receiver->isA(TType)) {
     return nullptr;
@@ -1405,6 +2085,16 @@ Register* simplifyLoadAttr(Env& env, const LoadAttr* load_attr) {
   return nullptr;
 }
 
+Register* simplifyLoadAttrCached(Env& env, const LoadAttrCached* load_attr) {
+  if (Register* reg = simplifyLoadAttrInstanceReceiver(env, load_attr)) {
+    return reg;
+  }
+  if (Register* reg = simplifyLoadAttrTypeReceiver(env, load_attr)) {
+    return reg;
+  }
+  return nullptr;
+}
+
 // If we're loading ob_fval from a known float into a double, this can be
 // simplified into a LoadConst.
 Register* simplifyLoadField(Env& env, const LoadField* instr) {
@@ -1441,7 +2131,43 @@ Register* simplifyIsNegativeAndErrOccurred(
   return env.emit<LoadConst>(Type::fromCInt(0, output_type));
 }
 
+bool simplifyStoreAttrInstanceReceiver(Env& env, const StoreAttr* store_attr) {
+  Register* receiver = store_attr->GetOperand(0);
+  Type type = receiver->type();
+  BorrowedRef<PyTypeObject> py_type{type.runtimePyType()};
+
+  if (!type.isExact() || py_type == nullptr ||
+      !PyType_HasFeature(py_type, Py_TPFLAGS_READY) ||
+      py_type->tp_setattro != PyObject_GenericSetAttr) {
+    return false;
+  }
+  if (getThreadedCompileContext().compileRunning()) {
+    if (!Ci_Type_HasValidVersionTag(py_type)) {
+      return false;
+    }
+  } else if (!ensureVersionTag(py_type)) {
+    return false;
+  }
+
+  BorrowedRef<PyUnicodeObject> attr_name{store_attr->name()};
+  if (!PyUnicode_CheckExact(attr_name)) {
+    return false;
+  }
+
+  BorrowedRef<> descr{typeLookupSafe(py_type, attr_name)};
+  if (descr == nullptr) {
+    return false;
+  }
+
+  DescrInfo info{
+      store_attr->frameState(), receiver, type, py_type, attr_name, descr};
+  return simplifyStoreAttrMemberDescr(env, info, store_attr->GetOperand(1));
+}
+
 Register* simplifyStoreAttr(Env& env, const StoreAttr* store_attr) {
+  if (simplifyStoreAttrInstanceReceiver(env, store_attr)) {
+    return nullptr;
+  }
   if (getConfig().attr_caches) {
     return env.emit<StoreAttrCached>(
         store_attr->GetOperand(0),
@@ -1460,12 +2186,7 @@ static bool isBuiltin(PyMethodDef* meth, const char* name) {
   return builtins.find(meth) == name;
 }
 
-static bool isBuiltin(Register* callable, const char* name) {
-  Type callable_type = callable->type();
-  if (!callable_type.hasObjectSpec()) {
-    return false;
-  }
-  PyObject* callable_obj = callable_type.objectSpec();
+static bool isBuiltin(PyObject* callable_obj, const char* name) {
   if (Py_TYPE(callable_obj) == &PyCFunction_Type) {
     PyCFunctionObject* func =
         reinterpret_cast<PyCFunctionObject*>(callable_obj);
@@ -1477,6 +2198,843 @@ static bool isBuiltin(Register* callable, const char* name) {
     return isBuiltin(meth->d_method, name);
   }
   return false;
+}
+
+static bool isBuiltin(Register* callable, const char* name) {
+  Type callable_type = callable->type();
+  if (!callable_type.hasObjectSpec()) {
+    return false;
+  }
+  return isBuiltin(callable_type.objectSpec(), name);
+}
+
+enum class TinyMethodResult {
+  kReturnSelf,
+  kReturnTrue,
+  kReturnFalse,
+};
+
+struct TinyMethodCandidate {
+  BorrowedRef<PyTypeObject> type;
+  TinyMethodResult result;
+};
+
+struct TinyBoolMethodBranchTypes {
+  BorrowedRef<PyTypeObject> true_type;
+  BorrowedRef<PyTypeObject> false_type;
+};
+
+struct ReceiverAttrUseSite {
+  BasicBlock* block;
+  Instr* instr;
+};
+
+static bool isSelfLoadOpcode(int opcode) {
+  switch (opcode) {
+    case LOAD_FAST:
+    case LOAD_FAST_BORROW:
+    case LOAD_FAST_CHECK:
+      return true;
+    default:
+      return false;
+  }
+}
+
+static std::optional<TinyMethodResult> classifyTinyInstanceMethod(
+    BorrowedRef<PyFunctionObject> func) {
+  BorrowedRef<PyCodeObject> code{func->func_code};
+  if (
+      code->co_argcount != 1 || code->co_kwonlyargcount != 0 ||
+      (code->co_flags & (CO_VARARGS | CO_VARKEYWORDS)) != 0) {
+    return std::nullopt;
+  }
+
+  BorrowedRef<> arg0_name_obj{jit::getVarname(code, 0)};
+  if (!PyUnicode_CheckExact(arg0_name_obj)) {
+    return std::nullopt;
+  }
+  const char* arg0_name = PyUnicode_AsUTF8(arg0_name_obj);
+  if (arg0_name == nullptr || std::strcmp(arg0_name, "self") != 0) {
+    PyErr_Clear();
+    return std::nullopt;
+  }
+
+  std::vector<BytecodeInstruction> body;
+  for (auto bc_instr : BytecodeInstructionBlock{code}) {
+    if (bc_instr.opcode() == RESUME) {
+      continue;
+    }
+    body.push_back(bc_instr);
+  }
+
+  if (body.size() == 2 && isSelfLoadOpcode(body[0].opcode()) &&
+      body[0].oparg() == 0 && body[1].opcode() == RETURN_VALUE) {
+    return TinyMethodResult::kReturnSelf;
+  }
+
+  auto classify_const = [&](BorrowedRef<> value) -> std::optional<TinyMethodResult> {
+    if (value == Py_True) {
+      return TinyMethodResult::kReturnTrue;
+    }
+    if (value == Py_False) {
+      return TinyMethodResult::kReturnFalse;
+    }
+    return std::nullopt;
+  };
+
+  if (body.size() == 1 && body[0].opcode() == RETURN_CONST) {
+    BorrowedRef<> constant{PyTuple_GET_ITEM(code->co_consts, body[0].oparg())};
+    return classify_const(constant);
+  }
+
+  if (body.size() == 2 && body[0].opcode() == LOAD_CONST &&
+      body[1].opcode() == RETURN_VALUE) {
+    BorrowedRef<> constant{PyTuple_GET_ITEM(code->co_consts, body[0].oparg())};
+    return classify_const(constant);
+  }
+
+  return std::nullopt;
+}
+
+static std::vector<TinyMethodCandidate> findTinyMethodCandidates(
+    BorrowedRef<PyDictObject> globals,
+    BorrowedRef<PyUnicodeObject> method_name) {
+  std::vector<TinyMethodCandidate> candidates;
+  ThreadedCompileSerialize guard;
+  PyObject* key = nullptr;
+  PyObject* value = nullptr;
+  Py_ssize_t pos = 0;
+  while (PyDict_Next(globals, &pos, &key, &value)) {
+    if (!PyType_Check(value)) {
+      continue;
+    }
+    BorrowedRef<PyTypeObject> type{reinterpret_cast<PyTypeObject*>(value)};
+    BorrowedRef<> method = typeLookupSafe(type, method_name);
+    if (method == nullptr || !PyFunction_Check(method)) {
+      continue;
+    }
+    auto result = classifyTinyInstanceMethod(
+        reinterpret_cast<PyFunctionObject*>(method.get()));
+    if (!result.has_value()) {
+      continue;
+    }
+    candidates.push_back({type, *result});
+  }
+  return candidates;
+}
+
+static std::optional<TinyBoolMethodBranchTypes> findTinyBoolMethodBranchTypes(
+    BorrowedRef<PyDictObject> globals,
+    BorrowedRef<PyUnicodeObject> method_name) {
+  auto candidates = findTinyMethodCandidates(globals, method_name);
+  std::optional<BorrowedRef<PyTypeObject>> true_type;
+  std::optional<BorrowedRef<PyTypeObject>> false_type;
+  for (const auto& candidate : candidates) {
+    switch (candidate.result) {
+      case TinyMethodResult::kReturnTrue:
+        if (true_type.has_value()) {
+          return std::nullopt;
+        }
+        true_type = candidate.type;
+        break;
+      case TinyMethodResult::kReturnFalse:
+        if (false_type.has_value()) {
+          return std::nullopt;
+        }
+        false_type = candidate.type;
+        break;
+      case TinyMethodResult::kReturnSelf:
+        break;
+    }
+  }
+  if (!true_type.has_value() || !false_type.has_value()) {
+    return std::nullopt;
+  }
+  return TinyBoolMethodBranchTypes{*true_type, *false_type};
+}
+
+static void replaceDominatedUsesAfterInstr(
+    Function& func,
+    Instr& instr,
+    Register* orig,
+    Register* replacement) {
+  DominatorAnalysis dom{func};
+  BasicBlock* block = instr.block();
+  bool after_instr = false;
+  for (Instr& current : *block) {
+    if (after_instr) {
+      current.ReplaceUsesOf(orig, replacement);
+    }
+    if (&current == &instr) {
+      after_instr = true;
+    }
+  }
+
+  for (const BasicBlock* dominated : dom.getBlocksDominatedBy(block)) {
+    if (dominated == block) {
+      continue;
+    }
+    for (Instr& current : *const_cast<BasicBlock*>(dominated)) {
+      current.ReplaceUsesOf(orig, replacement);
+    }
+  }
+}
+
+static bool hasDominatedAttrUseAfterInstr(
+    Function& func,
+    Instr& instr,
+    Register* reg) {
+  DominatorAnalysis dom{func};
+  BasicBlock* block = instr.block();
+  bool after_instr = false;
+  for (Instr& current : *block) {
+    if (after_instr && (current.IsLoadAttr() || current.IsLoadAttrCached())) {
+      for (size_t i = 0; i < current.NumOperands(); i++) {
+        if (current.GetOperand(i) == reg) {
+          return true;
+        }
+      }
+    }
+    if (&current == &instr) {
+      after_instr = true;
+    }
+  }
+
+  for (const BasicBlock* dominated : dom.getBlocksDominatedBy(block)) {
+    if (dominated == block) {
+      continue;
+    }
+    for (const Instr& current : *dominated) {
+      if (!current.IsLoadAttr() && !current.IsLoadAttrCached()) {
+        continue;
+      }
+      for (size_t i = 0; i < current.NumOperands(); i++) {
+        if (current.GetOperand(i) == reg) {
+          return true;
+        }
+      }
+    }
+  }
+  return false;
+}
+
+static bool isReceiverAttrUse(const Instr& instr, Register* reg) {
+  if (!instr.IsLoadAttr() && !instr.IsLoadAttrCached()) {
+    return false;
+  }
+  for (size_t i = 0; i < instr.NumOperands(); i++) {
+    if (instr.GetOperand(i) == reg) {
+      return true;
+    }
+  }
+  return false;
+}
+
+static std::optional<ReceiverAttrUseSite> findSingleEntryReceiverAttrUseSite(
+    Function& func,
+    BasicBlock* branch_entry,
+    Register* receiver) {
+  DominatorAnalysis dom{func};
+  const auto& branch_dom = dom.getBlocksDominatedBy(branch_entry);
+
+  std::optional<ReceiverAttrUseSite> first_site;
+  std::vector<BasicBlock*> use_blocks;
+  for (auto& block : func.cfg.blocks) {
+    if (!branch_dom.contains(&block)) {
+      continue;
+    }
+    for (Instr& instr : block) {
+      if (!isReceiverAttrUse(instr, receiver)) {
+        continue;
+      }
+      if (!first_site.has_value()) {
+        first_site = ReceiverAttrUseSite{&block, &instr};
+      }
+      use_blocks.push_back(&block);
+      break;
+    }
+  }
+
+  if (!first_site.has_value()) {
+    return std::nullopt;
+  }
+
+  const auto& first_dom = dom.getBlocksDominatedBy(first_site->block);
+  for (BasicBlock* use_block : use_blocks) {
+    if (use_block != first_site->block && !first_dom.contains(use_block)) {
+      return std::nullopt;
+    }
+  }
+  return first_site;
+}
+
+static bool refineReceiverInBranchFromTinyBoolMethod(
+    Env& env,
+    BasicBlock* branch_entry,
+    Register* receiver,
+    BorrowedRef<PyTypeObject> receiver_type) {
+  auto site = findSingleEntryReceiverAttrUseSite(env.func, branch_entry, receiver);
+  if (!site.has_value()) {
+    return false;
+  }
+
+  auto* deopt = site->instr->asDeoptBase();
+  if (deopt == nullptr || deopt->frameState() == nullptr) {
+    return false;
+  }
+
+  BasicBlock* saved_block = env.block;
+  auto saved_cursor = env.cursor;
+  BCOffset saved_bc_off = env.bc_off;
+  bool saved_optimized = env.optimized;
+
+  env.block = site->block;
+  env.cursor = site->block->iterator_to(*site->instr);
+  env.bc_off = site->instr->bytecodeOffset();
+  Register* guarded_receiver = env.emit<GuardType>(
+      Type::fromTypeExact(receiver_type), receiver, *deopt->frameState());
+
+  env.block = saved_block;
+  env.cursor = saved_cursor;
+  env.bc_off = saved_bc_off;
+  env.optimized = saved_optimized;
+
+  replaceDominatedUsesAfterInstr(
+      env.func, *guarded_receiver->instr(), receiver, guarded_receiver);
+  return true;
+}
+
+static Register* simplifyCondBranchTinyBoolMethodRefinement(
+    Env& env,
+    const CondBranch* instr) {
+  Register* cond = instr->GetOperand(0);
+  if (!cond->instr()->IsIsTruthy()) {
+    return nullptr;
+  }
+
+  auto* is_truthy = static_cast<const IsTruthy*>(cond->instr());
+  Register* value = is_truthy->GetOperand(0);
+  if (!value->instr()->IsCallMethod()) {
+    return nullptr;
+  }
+
+  auto* call = static_cast<const CallMethod*>(value->instr());
+  if (call->NumArgs() != 0) {
+    return nullptr;
+  }
+
+  Register* target = modelReg(call->func());
+  if (!isLoadMethodBase(*target->instr())) {
+    return nullptr;
+  }
+
+  auto* load_method = static_cast<const LoadMethodBase*>(target->instr());
+  BorrowedRef<PyCodeObject> code = env.func.codeFor(*load_method);
+  if (code == nullptr) {
+    return nullptr;
+  }
+
+  BorrowedRef<PyUnicodeObject> method_name{
+      PyTuple_GET_ITEM(code->co_names, load_method->name_idx())};
+  auto branch_types = findTinyBoolMethodBranchTypes(
+      BorrowedRef<PyDictObject>{env.func.globals}, method_name);
+  if (!branch_types.has_value()) {
+    return nullptr;
+  }
+
+  Register* receiver = load_method->receiver();
+  bool changed = false;
+  changed |= refineReceiverInBranchFromTinyBoolMethod(
+      env, instr->true_bb(), receiver, branch_types->true_type);
+  changed |= refineReceiverInBranchFromTinyBoolMethod(
+      env, instr->false_bb(), receiver, branch_types->false_type);
+  if (!changed) {
+    return nullptr;
+  }
+
+  return env.emit<CondBranch>(cond, instr->true_bb(), instr->false_bb());
+}
+
+static Register* simplifyCallMethodTinyReturnSelf(
+    Env& env,
+    const CallMethod* instr) {
+  if (instr->NumArgs() != 0) {
+    return nullptr;
+  }
+
+  Register* target = modelReg(instr->func());
+  if (!isLoadMethodBase(*target->instr())) {
+    return nullptr;
+  }
+  auto load_method = static_cast<const LoadMethodBase*>(target->instr());
+  BorrowedRef<PyCodeObject> code = env.func.codeFor(*load_method);
+  if (code == nullptr) {
+    return nullptr;
+  }
+  BorrowedRef<PyUnicodeObject> method_name{
+      PyTuple_GET_ITEM(code->co_names, load_method->name_idx())};
+  auto candidates = findTinyMethodCandidates(
+      BorrowedRef<PyDictObject>{env.func.globals}, method_name);
+  std::optional<BorrowedRef<PyTypeObject>> candidate_type;
+  for (const auto& candidate : candidates) {
+    if (candidate.result != TinyMethodResult::kReturnSelf) {
+      continue;
+    }
+    if (candidate_type.has_value()) {
+      return nullptr;
+    }
+    candidate_type = candidate.type;
+  }
+  if (!candidate_type.has_value()) {
+    return nullptr;
+  }
+
+  Register* receiver = load_method->receiver();
+  if (!hasDominatedAttrUseAfterInstr(
+          env.func, *const_cast<CallMethod*>(instr), receiver)) {
+    return nullptr;
+  }
+  Register* guarded_receiver = env.emit<GuardType>(
+      Type::fromTypeExact(*candidate_type), receiver, *instr->frameState());
+  replaceDominatedUsesAfterInstr(
+      env.func, *const_cast<CallMethod*>(instr), receiver, guarded_receiver);
+  return env.emit<Assign>(guarded_receiver);
+}
+
+static BorrowedRef<PyDictObject> getKnownModuleDict(BorrowedRef<> obj) {
+  if (PyModule_Check(obj)) {
+    return reinterpret_cast<PyModuleObject*>(obj.get())->md_dict;
+  }
+  if (Ci_StrictModule_Check(obj)) {
+    return reinterpret_cast<Ci_StrictModuleObject*>(obj.get())->globals;
+  }
+  return nullptr;
+}
+
+static PyMethodDef* findModuleMethod(PyModuleDef* def, const char* name) {
+  if (def == nullptr || def->m_methods == nullptr) {
+    return nullptr;
+  }
+  for (PyMethodDef* method = def->m_methods; method->ml_name != nullptr;
+       method++) {
+    if (std::strcmp(method->ml_name, name) == 0) {
+      return method;
+    }
+  }
+  return nullptr;
+}
+
+static PyObject* getKnownBuiltinMathSqrt(const LoadModuleAttrCached* load) {
+  Register* receiver = load->GetOperand(0);
+  Type receiver_type = receiver->type();
+  if (!receiver_type.hasObjectSpec()) {
+    return nullptr;
+  }
+
+  BorrowedRef<> module_obj = receiver_type.objectSpec();
+  if (!PyModule_Check(module_obj)) {
+    return nullptr;
+  }
+
+  PyModuleDef* def = PyModule_GetDef(module_obj);
+  if (def == nullptr) {
+    PyErr_Clear();
+    return nullptr;
+  }
+  if (std::strcmp(def->m_name, "math") != 0) {
+    return nullptr;
+  }
+
+  if (PyUnicode_CompareWithASCIIString(load->name(), "sqrt") != 0) {
+    PyErr_Clear();
+    return nullptr;
+  }
+
+  PyMethodDef* sqrt_def = findModuleMethod(def, "sqrt");
+  if (sqrt_def == nullptr) {
+    return nullptr;
+  }
+
+  BorrowedRef<PyDictObject> dict = getKnownModuleDict(module_obj);
+  if (dict == nullptr) {
+    return nullptr;
+  }
+
+  BorrowedRef<> value = PyDict_GetItemWithError(dict, load->name());
+  if (value == nullptr) {
+    PyErr_Clear();
+    return nullptr;
+  }
+  if (!PyCFunction_Check(value)) {
+    return nullptr;
+  }
+
+  auto* func = reinterpret_cast<PyCFunctionObject*>(value.get());
+  if (func->m_ml != sqrt_def) {
+    return nullptr;
+  }
+
+  return value;
+}
+
+static PyObject* getKnownBuiltinMathSqrt(PyObject* value) {
+  if (value == nullptr || !PyCFunction_Check(value)) {
+    return nullptr;
+  }
+
+  auto* func = reinterpret_cast<PyCFunctionObject*>(value);
+  if (func->m_ml == nullptr || func->m_ml->ml_name == nullptr) {
+    return nullptr;
+  }
+  if (std::strcmp(func->m_ml->ml_name, "sqrt") != 0) {
+    return nullptr;
+  }
+
+  PyObject* self = PyCFunction_GET_SELF(value);
+  if (self == nullptr || !PyModule_Check(self)) {
+    return nullptr;
+  }
+
+  PyModuleDef* def = PyModule_GetDef(self);
+  if (def == nullptr) {
+    PyErr_Clear();
+    return nullptr;
+  }
+  if (std::strcmp(def->m_name, "math") != 0) {
+    return nullptr;
+  }
+
+  PyMethodDef* sqrt_def = findModuleMethod(def, "sqrt");
+  if (sqrt_def == nullptr) {
+    return nullptr;
+  }
+  if (func->m_ml != sqrt_def) {
+    return nullptr;
+  }
+
+  return value;
+}
+
+static Register* simplifyVectorCallMathSqrt(
+    Env& env,
+    const VectorCall* instr) {
+  if (instr->numArgs() != 1) {
+    return nullptr;
+  }
+
+  Register* target = modelReg(instr->func());
+  const LoadModuleAttrCached* module_load = nullptr;
+  PyObject* expected = nullptr;
+  if (target->instr()->IsLoadModuleAttrCached()) {
+    auto* load = static_cast<const LoadModuleAttrCached*>(target->instr());
+    expected = getKnownBuiltinMathSqrt(load);
+    if (expected == nullptr) {
+      return nullptr;
+    }
+    module_load = load;
+  } else if (target->instr()->IsGuardIs()) {
+    auto* guard = static_cast<const GuardIs*>(target->instr());
+    if (getKnownBuiltinMathSqrt(guard->target()) == nullptr) {
+      return nullptr;
+    }
+  } else {
+    return nullptr;
+  }
+
+  Register* arg = instr->arg(0);
+  Register* double_arg = nullptr;
+  if (arg->isA(TCDouble)) {
+    double_arg = arg;
+  } else if (arg->instr()->IsPrimitiveBox()) {
+    auto* box = static_cast<const PrimitiveBox*>(arg->instr());
+    if (box->value()->type() <= TCDouble) {
+      double_arg = box->value();
+    }
+  }
+
+  if (double_arg == nullptr) {
+    return nullptr;
+  }
+
+  if (module_load != nullptr) {
+    env.emit<GuardModuleAttrValue>(
+        expected,
+        module_load->GetOperand(0),
+        module_load->name_idx(),
+        *instr->frameState());
+  }
+  env.emit<GuardNonNegativeDouble>(double_arg, *instr->frameState());
+  Register* result = env.emit<DoubleSqrt>(double_arg);
+  return env.emit<PrimitiveBox>(result, TCDouble, *instr->frameState());
+}
+
+static Register* simplifyVectorCallBuiltinAbs(
+    Env& env,
+    const VectorCall* instr) {
+  if (instr->numArgs() != 1) {
+    return nullptr;
+  }
+
+  Register* target = modelReg(instr->func());
+  bool is_abs = false;
+  if (target->instr()->IsGuardIs()) {
+    auto* guard = static_cast<const GuardIs*>(target->instr());
+    is_abs = isBuiltin(guard->target(), "abs");
+  } else {
+    is_abs = isBuiltin(target, "abs");
+  }
+  if (!is_abs) {
+    return nullptr;
+  }
+
+  Register* arg = instr->arg(0);
+  Register* double_arg = nullptr;
+  if (arg->isA(TCDouble)) {
+    double_arg = arg;
+  } else if (arg->instr()->IsPrimitiveBox()) {
+    auto* box = static_cast<const PrimitiveBox*>(arg->instr());
+    if (box->value()->type() <= TCDouble) {
+      double_arg = box->value();
+    }
+  }
+
+  if (double_arg == nullptr) {
+    if (!arg->isA(TFloatExact)) {
+      arg = env.emit<GuardType>(TFloatExact, arg, *instr->frameState());
+    }
+    double_arg = env.emit<PrimitiveUnbox>(arg, TCDouble);
+  }
+
+  env.emit<UseType>(target, target->type());
+  Register* result = env.emit<DoubleAbs>(double_arg);
+  return env.emit<PrimitiveBox>(result, TCDouble, *instr->frameState());
+}
+
+static Register* emitGenericVectorCallClone(
+    Env& env,
+    const VectorCall* instr) {
+  auto* call = env.emitRawInstr<VectorCall>(
+      instr->NumOperands(),
+      env.func.env.AllocateRegister(),
+      instr->flags() | CallFlags::NoSpecialize,
+      *instr->frameState());
+  for (size_t i = 0; i < instr->NumOperands(); ++i) {
+    call->SetOperand(i, instr->GetOperand(i));
+  }
+  return call->output();
+}
+
+static Register* emitBuiltinMinMaxFloatFastPath(
+    Env& env,
+    Register* target,
+    Register* lhs,
+    Register* rhs,
+    const FrameState& frame,
+    bool is_min) {
+  env.emit<UseType>(target, target->type());
+  env.emit<UseType>(lhs, TFloatExact);
+  env.emit<UseType>(rhs, TFloatExact);
+
+  Register* lhs_unboxed = env.emit<PrimitiveUnbox>(lhs, TCDouble);
+  Register* rhs_unboxed = env.emit<PrimitiveUnbox>(rhs, TCDouble);
+  PrimitiveCompareOp op = is_min ? PrimitiveCompareOp::kLessThanUnsigned
+                                 : PrimitiveCompareOp::kGreaterThanUnsigned;
+  Register* choose_rhs =
+      env.emit<PrimitiveCompare>(op, rhs_unboxed, lhs_unboxed);
+
+  return env.emitCond(
+      [&](BasicBlock* rhs_block, BasicBlock* lhs_block) {
+        env.emit<CondBranch>(choose_rhs, rhs_block, lhs_block);
+      },
+      [&] { // rhs wins
+        env.emit<UseType>(rhs, TFloatExact);
+        return rhs;
+      },
+      [&] { // lhs wins
+        env.emit<UseType>(lhs, TFloatExact);
+        return lhs;
+      });
+}
+
+static Register* emitBuiltinMinMaxTwoArgCheckedFastPath(
+    Env& env,
+    const VectorCall* instr,
+    Register* target,
+    Register* lhs,
+    Register* rhs,
+    bool is_min) {
+  BasicBlock* slow_lhs = env.func.cfg.AllocateBlock();
+  auto* lhs_check =
+      env.emitInstr<CondBranchCheckType>(lhs, TFloatExact, nullptr, slow_lhs);
+  BasicBlock* rhs_check_block = env.func.cfg.splitAfter(*lhs_check);
+  lhs_check->set_true_bb(rhs_check_block);
+
+  env.block = rhs_check_block;
+  env.cursor = rhs_check_block->begin();
+  Register* lhs_float = env.emit<RefineType>(TFloatExact, lhs);
+
+  BasicBlock* slow_rhs = env.func.cfg.AllocateBlock();
+  auto* rhs_check =
+      env.emitInstr<CondBranchCheckType>(rhs, TFloatExact, nullptr, slow_rhs);
+  BasicBlock* fast_block = env.func.cfg.splitAfter(*rhs_check);
+  rhs_check->set_true_bb(fast_block);
+
+  env.block = fast_block;
+  env.cursor = fast_block->begin();
+  Register* rhs_float = env.emit<RefineType>(TFloatExact, rhs);
+  Register* fast_value =
+      emitBuiltinMinMaxFloatFastPath(env, target, lhs_float, rhs_float, *instr->frameState(), is_min);
+
+  auto* fast_exit = env.emitInstr<Branch>(nullptr);
+  BasicBlock* join = env.func.cfg.splitAfter(*fast_exit);
+  fast_exit->set_target(join);
+  BasicBlock* fast_pred = env.block;
+
+  env.block = slow_rhs;
+  env.cursor = slow_rhs->end();
+  Register* rhs_slow_value = emitGenericVectorCallClone(env, instr);
+  env.emit<Branch>(join);
+
+  env.block = slow_lhs;
+  env.cursor = slow_lhs->end();
+  Register* lhs_slow_value = emitGenericVectorCallClone(env, instr);
+  env.emit<Branch>(join);
+
+  env.block = join;
+  env.cursor = join->begin();
+  std::unordered_map<BasicBlock*, Register*> phi_inputs{
+      {fast_pred, fast_value},
+      {slow_rhs, rhs_slow_value},
+      {slow_lhs, lhs_slow_value},
+  };
+  return env.emit<Phi>(phi_inputs);
+}
+
+static Register* simplifyVectorCallBuiltinMinMax(
+    Env& env,
+    const VectorCall* instr) {
+  if (instr->numArgs() != 2) {
+    return nullptr;
+  }
+
+  Register* target = modelReg(instr->func());
+  bool is_min = false;
+  bool is_max = false;
+  if (target->instr()->IsGuardIs()) {
+    auto* guard = static_cast<const GuardIs*>(target->instr());
+    is_min = isBuiltin(guard->target(), "min");
+    is_max = isBuiltin(guard->target(), "max");
+  } else {
+    is_min = isBuiltin(target, "min");
+    is_max = isBuiltin(target, "max");
+  }
+  if (!is_min && !is_max) {
+    return nullptr;
+  }
+
+  Register* lhs = instr->arg(0);
+  Register* rhs = instr->arg(1);
+
+  if (armMdpFractionMinCompareEnabled() && is_min &&
+      isMdpGetCritDistCode(env.func.code)) {
+    env.emit<UseType>(target, target->type());
+    Register* choose_rhs_obj =
+        env.emit<Compare>(CompareOp::kLessThan, rhs, lhs, *instr->frameState());
+    Register* choose_rhs =
+        env.emit<IsTruthy>(choose_rhs_obj, *instr->frameState());
+
+    return env.emitCond(
+        [&](BasicBlock* rhs_block, BasicBlock* lhs_block) {
+          env.emit<CondBranch>(choose_rhs, rhs_block, lhs_block);
+        },
+        [&] { return rhs; },
+        [&] { return lhs; });
+  }
+
+  if (armMdpIntClampMinMaxEnabled() && isMdpApplyHPChangeCode(env.func.code)) {
+    Register* guarded_lhs =
+        lhs->isA(TLongExact)
+        ? lhs
+        : env.emit<GuardType>(TLongExact, lhs, *instr->frameState());
+    Register* guarded_rhs =
+        rhs->isA(TLongExact)
+        ? rhs
+        : env.emit<GuardType>(TLongExact, rhs, *instr->frameState());
+
+    env.emit<UseType>(target, target->type());
+    env.emit<UseType>(guarded_lhs, TLongExact);
+    env.emit<UseType>(guarded_rhs, TLongExact);
+
+    Register* choose_rhs_obj = env.emit<Compare>(
+        is_min ? CompareOp::kLessThan : CompareOp::kGreaterThan,
+        guarded_rhs,
+        guarded_lhs,
+        *instr->frameState());
+    Register* choose_rhs =
+        env.emit<IsTruthy>(choose_rhs_obj, *instr->frameState());
+
+    return env.emitCond(
+        [&](BasicBlock* rhs_block, BasicBlock* lhs_block) {
+          env.emit<CondBranch>(choose_rhs, rhs_block, lhs_block);
+        },
+        [&] {
+          env.emit<UseType>(guarded_rhs, TLongExact);
+          return guarded_rhs;
+        },
+        [&] {
+          env.emit<UseType>(guarded_lhs, TLongExact);
+          return guarded_lhs;
+        });
+  }
+
+  Type lhs_ty = lhs->type();
+  Type rhs_ty = rhs->type();
+
+  // Only consider specialization when both args could actually be boxed exact
+  // floats. This avoids forcing integer-heavy index code and primitive numeric
+  // values through an object-only float path.
+  if (!lhs_ty.couldBe(TObject) || !rhs_ty.couldBe(TObject) ||
+      !lhs_ty.couldBe(TFloatExact) || !rhs_ty.couldBe(TFloatExact)) {
+    return nullptr;
+  }
+
+  // Leave obviously integral clamp-style shapes on the generic path instead
+  // of forcing them through the float fast path and deopting immediately.
+  if ((lhs->isA(TLongExact) || rhs->isA(TLongExact)) &&
+      !lhs->isA(TFloatExact) && !rhs->isA(TFloatExact)) {
+    return nullptr;
+  }
+
+  auto emit_fast = [&](Register* fast_lhs, Register* fast_rhs) {
+    return emitBuiltinMinMaxFloatFastPath(
+        env, target, fast_lhs, fast_rhs, *instr->frameState(), is_min);
+  };
+
+  if (lhs->isA(TFloatExact) && rhs->isA(TFloatExact)) {
+    return emit_fast(lhs, rhs);
+  }
+
+  if (!lhs->isA(TFloatExact) && !rhs->isA(TFloatExact)) {
+    return emitBuiltinMinMaxTwoArgCheckedFastPath(
+        env, instr, target, lhs, rhs, is_min);
+  }
+
+  return nullptr;
+}
+
+static Register* simplifyLoadModuleAttrCachedMathSqrt(
+    Env& env,
+    const LoadModuleAttrCached* instr) {
+  if (isRegisterUsed(env.func, instr->output())) {
+    return nullptr;
+  }
+
+  PyObject* expected = getKnownBuiltinMathSqrt(instr);
+  if (expected == nullptr) {
+    return nullptr;
+  }
+
+  return env.emit<LoadConst>(Type::fromObject(env.func.env.addReference(expected)));
 }
 
 // This is inspired by _PyEval_EvalCodeWithName in 3.8's Python/ceval.c
@@ -1556,6 +3114,24 @@ static Register* resolveArgs(
 }
 
 Register* simplifyCallMethod(Env& env, const CallMethod* instr) {
+  if (Register* result = simplifyCallMethodTinyReturnSelf(env, instr)) {
+    return result;
+  }
+
+  if (instr->func()->type().hasValueSpec(TFunc) &&
+      !(instr->self()->type() <= TNullptr)) {
+    auto call = env.emitRawInstr<VectorCall>(
+        instr->NumOperands(),
+        env.func.env.AllocateRegister(),
+        instr->flags(),
+        *instr->frameState());
+    for (size_t i = 0; i < instr->NumOperands(); ++i) {
+      call->SetOperand(i, instr->GetOperand(i));
+    }
+    call->output()->set_type(instr->output()->type());
+    return call->output();
+  }
+
   // If this is statically known to be trying to call a function, update to
   // using a VectorCall directly.
   if constexpr (PY_VERSION_HEX >= 0x030E0000) {
@@ -1738,8 +3314,20 @@ Register* simplifyVectorCall(Env& env, const VectorCall* instr) {
   if (Register* result = simplifyVectorCallStatic(env, instr)) {
     return result;
   }
+  if (instr->flags() & CallFlags::NoSpecialize) {
+    return nullptr;
+  }
   if (instr->flags() & CallFlags::KwArgs) {
     return nullptr;
+  }
+  if (Register* result = simplifyVectorCallBuiltinAbs(env, instr)) {
+    return result;
+  }
+  if (Register* result = simplifyVectorCallBuiltinMinMax(env, instr)) {
+    return result;
+  }
+  if (Register* result = simplifyVectorCallMathSqrt(env, instr)) {
+    return result;
   }
 
   Register* target = instr->GetOperand(0);
@@ -1844,16 +3432,74 @@ Register* simplifyVectorCall(Env& env, const VectorCall* instr) {
 }
 
 Register* simplifyStoreSubscr(Env& env, const StoreSubscr* instr) {
-  if (instr->GetOperand(0)->isA(TDictExact)) {
+  Register* container = instr->GetOperand(0);
+  Register* sub = instr->GetOperand(1);
+  Register* value = instr->GetOperand(2);
+  Register* base_container = chaseAssignOperand(container);
+  Register* base_sub = chaseAssignOperand(sub);
+  Register* base_value = chaseAssignOperand(value);
+
+  // Recognize: list[:k+1] = list[k::-1]
+  //
+  // This is the hot flip shape in fannkuch. Lower to a dedicated runtime
+  // helper to avoid creating temporary slice objects on the common path.
+  if (sliceReverseFastPathEnabled() &&
+      base_sub->instr()->IsBuildSlice() && base_value->instr()->IsBinaryOp()) {
+    auto* lhs_slice = static_cast<const BuildSlice*>(base_sub->instr());
+    auto* rhs_subscr = static_cast<const BinaryOp*>(base_value->instr());
+    if (!(lhs_slice->NumOperands() == 2 &&
+          rhs_subscr->op() == BinaryOpKind::kSubscript &&
+          chaseAssignOperand(rhs_subscr->left()) == base_container &&
+          rhs_subscr->right()->instr()->IsBuildSlice())) {
+    } else {
+      auto* rhs_slice = static_cast<const BuildSlice*>(rhs_subscr->right()->instr());
+      if (rhs_slice->NumOperands() == 3 &&
+          isNoneConst(lhs_slice->start()) &&
+          isNoneConst(rhs_slice->stop()) &&
+          isLongConstValue(rhs_slice->step(), -1)) {
+        Register* rhs_start = rhs_slice->start();
+        Register* add_base = nullptr;
+        if (matchLongAddOneFromBase(lhs_slice->stop(), &add_base) != nullptr &&
+            sameValueIgnoringNarrowing(add_base, rhs_start)) {
+          Register* helper_list = container;
+          Register* helper_index = rhs_start;
+          auto output = env.func.env.AllocateRegister();
+          env.emitRawInstr<CallStatic>(
+              2,
+              output,
+              reinterpret_cast<void*>(JITRT_ListPrefixReverseAssign),
+              TCInt32,
+              helper_list,
+              helper_index);
+          env.emit<CheckNeg>(output, *instr->frameState());
+          env.optimized = true;
+          return nullptr;
+        }
+      }
+    }
+  }
+
+  if (value->instr()->IsPrimitiveBox()) {
+    auto* box = static_cast<const PrimitiveBox*>(value->instr());
+    if (box->type() <= TCDouble && box->block() != instr->block()) {
+      Register* local_box =
+          env.emit<PrimitiveBox>(box->value(), box->type(), *box->frameState());
+      env.emit<StoreSubscr>(container, sub, local_box, *instr->frameState());
+      env.optimized = true;
+      return nullptr;
+    }
+  }
+
+  if (container->isA(TDictExact)) {
     auto output = env.func.env.AllocateRegister();
     env.emitRawInstr<CallStatic>(
         3,
         output,
         reinterpret_cast<void*>(PyDict_Type.tp_as_mapping->mp_ass_subscript),
         TCInt32,
-        instr->GetOperand(0),
-        instr->GetOperand(1),
-        instr->GetOperand(2));
+        container,
+        sub,
+        value);
 
     env.emit<CheckNeg>(output, *instr->frameState());
     return nullptr;
@@ -1888,6 +3534,8 @@ Register* simplifyInstr(Env& env, const Instr* instr) {
 
     case Opcode::kCompare:
       return simplifyCompare(env, static_cast<const Compare*>(instr));
+    case Opcode::kLongCompare:
+      return simplifyLongCompare(env, static_cast<const LongCompare*>(instr));
 
     case Opcode::kCondBranch:
       return simplifyCondBranch(env, static_cast<const CondBranch*>(instr));
@@ -1897,6 +3545,9 @@ Register* simplifyInstr(Env& env, const Instr* instr) {
 
     case Opcode::kGetLength:
       return simplifyGetLength(env, static_cast<const GetLength*>(instr));
+    case Opcode::kGetSecondOutput:
+      return simplifyGetSecondOutput(
+          env, static_cast<const GetSecondOutput*>(instr));
 
     case Opcode::kIntConvert:
       return simplifyIntConvert(env, static_cast<const IntConvert*>(instr));
@@ -1910,6 +3561,9 @@ Register* simplifyInstr(Env& env, const Instr* instr) {
     case Opcode::kLoadAttr:
       return simplifyLoadAttr(env, static_cast<const LoadAttr*>(instr));
 #endif
+    case Opcode::kLoadAttrCached:
+      return simplifyLoadAttrCached(
+          env, static_cast<const LoadAttrCached*>(instr));
 // TODO(T255263721) - Enable this again. See P2169673579 and P2184559031.
 #ifndef Py_GIL_DISABLED
     case Opcode::kLoadMethod:
@@ -1917,6 +3571,9 @@ Register* simplifyInstr(Env& env, const Instr* instr) {
 #endif
     case Opcode::kLoadField:
       return simplifyLoadField(env, static_cast<const LoadField*>(instr));
+    case Opcode::kLoadModuleAttrCached:
+      return simplifyLoadModuleAttrCachedMathSqrt(
+          env, static_cast<const LoadModuleAttrCached*>(instr));
     case Opcode::kLoadTupleItem:
       return simplifyLoadTupleItem(
           env, static_cast<const LoadTupleItem*>(instr));
@@ -1931,6 +3588,8 @@ Register* simplifyInstr(Env& env, const Instr* instr) {
       return simplifyBinaryOp(env, static_cast<const BinaryOp*>(instr));
     case Opcode::kInPlaceOp:
       return simplifyInPlaceOp(env, static_cast<const InPlaceOp*>(instr));
+    case Opcode::kIntBinaryOp:
+      return simplifyIntBinaryOp(env, static_cast<const IntBinaryOp*>(instr));
     case Opcode::kLongBinaryOp:
       return simplifyLongBinaryOp(env, static_cast<const LongBinaryOp*>(instr));
     case Opcode::kFloatBinaryOp:

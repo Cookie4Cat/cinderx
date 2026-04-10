@@ -4,9 +4,16 @@
 
 #include "cinderx/Jit/context.h"
 #include "cinderx/Jit/hir/analysis.h"
+#include "cinderx/Jit/hir/preload.h"
 #include "cinderx/Jit/hir/printer.h"
 
 namespace jit::hir {
+
+Type outputTypeWithRecursiveCoroHint(
+    const Instr& instr,
+    const std::function<Type(std::size_t)>& get_op_type,
+    std::optional<Type> recursive_coro_result_type = std::nullopt,
+    const Function* current_func = nullptr);
 
 namespace {
 
@@ -87,6 +94,155 @@ Type returnType(Type callable) {
   return TObject;
 }
 
+BorrowedRef<PyFunctionObject> sendCalleeFunction(const Send& send) {
+  Register* iterable = chaseAssignOperand(send.GetOperand(0));
+  if (iterable == nullptr) {
+    return nullptr;
+  }
+  if (iterable->instr()->IsVectorCall()) {
+    Register* callable =
+        chaseAssignOperand(static_cast<VectorCall*>(iterable->instr())->func());
+    if (callable == nullptr || !callable->type().hasObjectSpec()) {
+      return nullptr;
+    }
+    PyObject* callable_obj = callable->type().objectSpec();
+    if (!PyFunction_Check(callable_obj)) {
+      return nullptr;
+    }
+    return reinterpret_cast<PyFunctionObject*>(callable_obj);
+  }
+  if (iterable->instr()->IsInvokeStaticFunction()) {
+    return static_cast<InvokeStaticFunction*>(iterable->instr())->func();
+  }
+  return nullptr;
+}
+
+Type inferRecursiveValueType(
+    Register* reg,
+    BorrowedRef<PyFunctionObject> self_func,
+    Type self_send_type,
+    std::unordered_set<Register*>& visiting);
+
+Type inferRecursiveInstrType(
+    const Instr& instr,
+    BorrowedRef<PyFunctionObject> self_func,
+    Type self_send_type,
+    std::unordered_set<Register*>& visiting) {
+  if (instr.IsSend()) {
+    auto callee = sendCalleeFunction(static_cast<const Send&>(instr));
+    if (callee != nullptr && callee == self_func) {
+      return self_send_type;
+    }
+  }
+  return outputTypeWithRecursiveCoroHint(instr, [&](std::size_t ind) {
+    return inferRecursiveValueType(
+        instr.GetOperand(ind), self_func, self_send_type, visiting);
+  });
+}
+
+Type inferRecursiveValueType(
+    Register* reg,
+    BorrowedRef<PyFunctionObject> self_func,
+    Type self_send_type,
+    std::unordered_set<Register*>& visiting) {
+  reg = chaseAssignOperand(reg);
+  if (reg == nullptr) {
+    return TBottom;
+  }
+  if (!visiting.insert(reg).second) {
+    return TBottom;
+  }
+  Type ty = inferRecursiveInstrType(*reg->instr(), self_func, self_send_type, visiting);
+  visiting.erase(reg);
+  return ty;
+}
+
+std::optional<Type> inferSelfRecursiveCoroutineResultType(Function& func) {
+  BorrowedRef<PyFunctionObject> self_func = nullptr;
+  for (auto& block : func.cfg.blocks) {
+    for (Instr& instr : block) {
+      if (!instr.IsSend()) {
+        continue;
+      }
+      auto callee = sendCalleeFunction(static_cast<const Send&>(instr));
+      if (callee == nullptr) {
+        continue;
+      }
+      auto* preloader = preloaderManager().find(callee);
+      if (preloader == nullptr || preloader->fullname() != func.fullname) {
+        continue;
+      }
+      self_func = callee;
+      break;
+    }
+    if (self_func != nullptr) {
+      break;
+    }
+  }
+  if (self_func == nullptr) {
+    return std::nullopt;
+  }
+
+  bool saw_return = false;
+  for (auto& block : func.cfg.blocks) {
+    for (Instr& instr : block) {
+      if (!instr.IsReturn()) {
+        continue;
+      }
+      saw_return = true;
+      std::unordered_set<Register*> visiting;
+      Type ty = inferRecursiveValueType(
+          instr.GetOperand(0), self_func, TLongExact, visiting);
+      if (!(ty <= TLongExact)) {
+        return std::nullopt;
+      }
+    }
+  }
+  if (!saw_return) {
+    return std::nullopt;
+  }
+  return TLongExact;
+}
+
+std::optional<Type> sendResultType(const Send& send) {
+  Register* iterable = chaseAssignOperand(send.GetOperand(0));
+  if (iterable == nullptr) {
+    return std::nullopt;
+  }
+
+  BorrowedRef<PyFunctionObject> func;
+  if (iterable->instr()->IsVectorCall()) {
+    Register* callable =
+        chaseAssignOperand(static_cast<VectorCall*>(iterable->instr())->func());
+    if (callable == nullptr || !callable->type().hasObjectSpec()) {
+      return std::nullopt;
+    }
+    PyObject* callable_obj = callable->type().objectSpec();
+    if (!PyFunction_Check(callable_obj)) {
+      return std::nullopt;
+    }
+    func = reinterpret_cast<PyFunctionObject*>(callable_obj);
+  } else if (iterable->instr()->IsInvokeStaticFunction()) {
+    func = static_cast<InvokeStaticFunction*>(iterable->instr())->func();
+  } else {
+    return std::nullopt;
+  }
+
+  auto* preloader = preloaderManager().find(func);
+  if (preloader == nullptr) {
+    return std::nullopt;
+  }
+  if ((preloader->code()->co_flags & CO_COROUTINE) == 0) {
+    return std::nullopt;
+  }
+
+  Type ret_type = preloader->returnType();
+  if (!(ret_type < TObject)) {
+    return std::nullopt;
+  }
+  return ret_type;
+}
+
 } // namespace
 
 Register* chaseAssignOperand(Register* value) {
@@ -108,9 +264,11 @@ RegUses collectDirectRegUses(Function& func) {
   return uses;
 }
 
-Type outputType(
+Type outputTypeWithRecursiveCoroHint(
     const Instr& instr,
-    const std::function<Type(std::size_t)>& get_op_type) {
+    const std::function<Type(std::size_t)>& get_op_type,
+    std::optional<Type> recursive_coro_result_type,
+    const Function* current_func) {
   switch (instr.opcode()) {
     case Opcode::kCallEx:
       return returnType(static_cast<const CallEx&>(instr).func()->type());
@@ -129,7 +287,9 @@ Type outputType(
 
     case Opcode::kInPlaceOp: {
       auto& op = static_cast<const InPlaceOp&>(instr);
-      if (op.left()->type() <= TLongExact && op.right()->type() <= TLongExact) {
+      Type left_ty = get_op_type(0);
+      Type right_ty = get_op_type(1);
+      if (left_ty <= TLongExact && right_ty <= TLongExact) {
         switch (op.op()) {
           case InPlaceOpKind::kAdd:
           case InPlaceOpKind::kAnd:
@@ -157,7 +317,9 @@ Type outputType(
 
     case Opcode::kBinaryOp: {
       auto& op = static_cast<const BinaryOp&>(instr);
-      if (op.left()->type() <= TLongExact && op.right()->type() <= TLongExact) {
+      Type left_ty = get_op_type(0);
+      Type right_ty = get_op_type(1);
+      if (left_ty <= TLongExact && right_ty <= TLongExact) {
         switch (op.op()) {
           case BinaryOpKind::kAdd:
           case BinaryOpKind::kAnd:
@@ -195,6 +357,7 @@ Type outputType(
     case Opcode::kDictSubscr:
     case Opcode::kEagerImportName:
     case Opcode::kFillTypeAttrCache:
+    case Opcode::kFillMethodCache:
     case Opcode::kFillTypeMethodCache:
     case Opcode::kGetAIter:
     case Opcode::kGetANext:
@@ -215,7 +378,21 @@ Type outputType(
     case Opcode::kLoadSpecial:
     case Opcode::kLoadTupleItem:
     case Opcode::kMatchKeys:
-    case Opcode::kSend:
+      return TObject;
+    case Opcode::kSend: {
+      JIT_DCHECK(instr.IsSend(), "expected Send opcode, got {}", instr.opname());
+      if (recursive_coro_result_type.has_value() && current_func != nullptr) {
+        auto callee = sendCalleeFunction(static_cast<const Send&>(instr));
+        if (callee != nullptr) {
+          auto* preloader = preloaderManager().find(callee);
+          if (preloader != nullptr && preloader->fullname() == current_func->fullname) {
+            return *recursive_coro_result_type;
+          }
+        }
+      }
+      auto ret_type = sendResultType(static_cast<const Send&>(instr));
+      return ret_type.value_or(TObject);
+    }
     case Opcode::kWaitHandleLoadCoroOrResult:
     case Opcode::kYieldAndYieldFrom:
     case Opcode::kYieldFrom:
@@ -226,6 +403,8 @@ Type outputType(
       return TMortalUnicode;
     case Opcode::kGetLength:
       return TLongExact;
+    case Opcode::kGetLengthInt64:
+      return TCInt64;
     case Opcode::kCopyDictWithoutKeys:
       return TDictExact;
     case Opcode::kUnaryOp: {
@@ -287,9 +466,21 @@ Type outputType(
       }
       return binop.left()->type().unspecialized();
     }
+    case Opcode::kCheckedIntBinaryOp: {
+      auto& binop = static_cast<const CheckedIntBinaryOp&>(instr);
+      return binop.left()->type().unspecialized();
+    }
     case Opcode::kDoubleBinaryOp: {
       return TCDouble;
     }
+    case Opcode::kDoubleAbs: {
+      return TCDouble;
+    }
+    case Opcode::kDoubleSqrt: {
+      return TCDouble;
+    }
+    case Opcode::kLongUnboxCompact:
+      return TCInt64;
     case Opcode::kPrimitiveCompare:
       return TCBool;
     case Opcode::kPrimitiveUnaryOp:
@@ -369,6 +560,8 @@ Type outputType(
     // directly.
     case Opcode::kListExtend:
       return TNoneType;
+    case Opcode::kListSlice:
+      return TMortalListExact;
 
     case Opcode::kListAppend:
     case Opcode::kMergeSetUnpack:
@@ -390,8 +583,10 @@ Type outputType(
       // that this will return a non-null object.
       return TObject;
     case Opcode::kLoadTypeMethodCacheEntryType:
+    case Opcode::kLoadMethodCacheEntryType:
       return TOptType;
     case Opcode::kLoadTypeMethodCacheEntryValue:
+    case Opcode::kLoadMethodCacheEntryValue:
       return TObject;
     case Opcode::kAssign:
       return get_op_type(0);
@@ -521,6 +716,8 @@ Type outputType(
     case Opcode::kDeoptPatchpoint:
     case Opcode::kEndInlinedFunction:
     case Opcode::kGuard:
+    case Opcode::kGuardModuleAttrValue:
+    case Opcode::kGuardNonNegativeDouble:
     case Opcode::kHintType:
     case Opcode::kIncref:
     case Opcode::kInitFrameCellVars:
@@ -550,8 +747,14 @@ Type outputType(
 }
 
 Type outputType(const Instr& instr) {
-  return outputType(
+  return outputTypeWithRecursiveCoroHint(
       instr, [&](std::size_t ind) { return instr.GetOperand(ind)->type(); });
+}
+
+Type outputType(
+    const Instr& instr,
+    const std::function<Type(std::size_t)>& get_op_type) {
+  return outputTypeWithRecursiveCoroHint(instr, get_op_type);
 }
 
 void reflowTypes(Function& func) {
@@ -569,6 +772,7 @@ void reflowTypes(Function& func, BasicBlock* start) {
   auto rpo_blocks = CFG::GetRPOTraversal(start);
   for (bool changed = true; changed;) {
     changed = false;
+    auto recursive_coro_result_type = inferSelfRecursiveCoroutineResultType(func);
     for (auto block : rpo_blocks) {
       for (auto& instr : *block) {
         if (instr.opcode() == Opcode::kReturn) {
@@ -588,7 +792,11 @@ void reflowTypes(Function& func, BasicBlock* start) {
           continue;
         }
 
-        auto new_ty = outputType(instr);
+        auto new_ty = outputTypeWithRecursiveCoroHint(
+            instr,
+            [&](std::size_t ind) { return instr.GetOperand(ind)->type(); },
+            recursive_coro_result_type,
+            &func);
         if (new_ty == dst->type()) {
           continue;
         }

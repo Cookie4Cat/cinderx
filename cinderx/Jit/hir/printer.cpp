@@ -260,8 +260,10 @@ static std::string format_immediates(const Function* func, const Instr& instr) {
     case Opcode::kGetANext:
     case Opcode::kGetIter:
     case Opcode::kGetLength:
+    case Opcode::kGetLengthInt64:
     case Opcode::kGetTuple:
     case Opcode::kGuard:
+    case Opcode::kGuardNonNegativeDouble:
     case Opcode::kIncref:
     case Opcode::kInitialYield:
     case Opcode::kInvokeIterNext:
@@ -515,6 +517,9 @@ static std::string format_immediates(const Function* func, const Instr& instr) {
       const auto& bin_op = static_cast<const DoubleBinaryOp&>(instr);
       return std::string{GetBinaryOpName(bin_op.op())};
     }
+    case Opcode::kDoubleAbs:
+    case Opcode::kDoubleSqrt:
+      return "";
     case Opcode::kLoadArg: {
       const auto& load = static_cast<const LoadArg&>(instr);
       auto varname = format_varname(func, load, load.arg_idx());
@@ -561,6 +566,10 @@ static std::string format_immediates(const Function* func, const Instr& instr) {
     }
     case Opcode::kIntBinaryOp: {
       const auto& bin_op = static_cast<const IntBinaryOp&>(instr);
+      return std::string{GetBinaryOpName(bin_op.op())};
+    }
+    case Opcode::kCheckedIntBinaryOp: {
+      const auto& bin_op = static_cast<const CheckedIntBinaryOp&>(instr);
       return std::string{GetBinaryOpName(bin_op.op())};
     }
     case Opcode::kPrimitiveCompare: {
@@ -648,6 +657,9 @@ static std::string format_immediates(const Function* func, const Instr& instr) {
       const auto& build_slice = static_cast<const BuildSlice&>(instr);
       return fmt::format("{}", build_slice.NumOperands());
     }
+    case Opcode::kLongUnboxCompact:
+    case Opcode::kListSlice:
+      return "";
     case Opcode::kLoadTypeAttrCacheEntryType: {
       const auto& i = static_cast<const LoadTypeAttrCacheEntryType&>(instr);
       return fmt::format("{}", i.cache_id());
@@ -664,13 +676,25 @@ static std::string format_immediates(const Function* func, const Instr& instr) {
       const auto& i = static_cast<const LoadTypeMethodCacheEntryValue&>(instr);
       return fmt::format("{}", i.cache_id());
     }
+    case Opcode::kLoadMethodCacheEntryValue: {
+      const auto& i = static_cast<const LoadMethodCacheEntryValue&>(instr);
+      return fmt::format("{}", i.cache_id());
+    }
     case Opcode::kLoadTypeMethodCacheEntryType: {
       const auto& i = static_cast<const LoadTypeMethodCacheEntryType&>(instr);
+      return fmt::format("{}", i.cache_id());
+    }
+    case Opcode::kLoadMethodCacheEntryType: {
+      const auto& i = static_cast<const LoadMethodCacheEntryType&>(instr);
       return fmt::format("{}", i.cache_id());
     }
     case Opcode::kFillTypeMethodCache: {
       const auto& ftmc = static_cast<const FillTypeMethodCache&>(instr);
       return fmt::format("{}, {}", ftmc.cache_id(), ftmc.name_idx());
+    }
+    case Opcode::kFillMethodCache: {
+      const auto& fmc = static_cast<const FillMethodCache&>(instr);
+      return fmt::format("{}, {}", fmc.cache_id(), fmc.name_idx());
     }
     case Opcode::kSetFunctionAttr: {
       const auto& set_fn_attr = static_cast<const SetFunctionAttr&>(instr);
@@ -685,6 +709,10 @@ static std::string format_immediates(const Function* func, const Instr& instr) {
     case Opcode::kGuardIs: {
       const auto& gs = static_cast<const GuardIs&>(instr);
       return fmt::format("{}", getStablePointer(gs.target()));
+    }
+    case Opcode::kGuardModuleAttrValue: {
+      const auto& guard = static_cast<const GuardModuleAttrValue&>(instr);
+      return format_name(func, guard, guard.name_idx());
     }
     case Opcode::kGuardType: {
       const auto& gs = static_cast<const GuardType&>(instr);

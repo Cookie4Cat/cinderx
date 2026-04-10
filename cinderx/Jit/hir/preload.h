@@ -147,10 +147,23 @@ class Preloader {
   // TObject
   Type checkArgType(long local_idx) const;
 
+  // Candidate exact type for the first "self" argument of an inferred
+  // instance method. This is metadata only and not yet safe to feed directly
+  // into runtime specialization.
+  std::optional<Type> inferredSelfType() const;
+
+  // Candidate exact type for a selected non-self argument inferred from the
+  // same owner type as self().
+  std::optional<Type> inferredArgType(long local_idx) const;
+
   // get value for global at given name index
   BorrowedRef<> global(int name_idx) const;
 
   std::unique_ptr<Function> makeFunction() const;
+
+  bool allowAggressiveSplitDictLoads() const {
+    return allow_aggressive_split_dict_loads_;
+  }
 
   BorrowedRef<PyCodeObject> code() const {
     return code_;
@@ -242,6 +255,9 @@ class Preloader {
   // keyed by locals index
   std::unordered_map<long, Type> check_arg_types_;
   std::map<long, OwnedType> check_arg_pytypes_;
+  std::optional<OwnedType> inferred_self_type_;
+  std::map<long, OwnedType> inferred_arg_types_;
+  bool allow_aggressive_split_dict_loads_{false};
   // keyed by name index, names borrowed from code object
   GlobalNamesMap global_names_;
   Type return_type_{TObject};

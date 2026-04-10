@@ -429,6 +429,49 @@ void LinearScanAllocator::calculateLiveIntervals() {
         }
       }
 
+#if defined(CINDER_AARCH64)
+      // Favor return registers for short call chains on ARM. This is a soft
+      // hint: linear-scan can still pick another register when needed.
+      //
+      // Restrict the hint to a tight pattern to avoid inflating call-heavy
+      // kernels:
+      //   call -> (single immediate use) -> call(arg0 = previous result)
+      auto should_prefer_return_register =
+          [&](const Operand* def_opnd) -> bool {
+        auto uses_iter = vreg_last_use_.find(def_opnd);
+        if (uses_iter == vreg_last_use_.end() || uses_iter->second.size() != 1) {
+          return false;
+        }
+        const auto& use_pair = *uses_iter->second.begin();
+        const auto* use_opnd = use_pair.first;
+        LIRLocation use_loc = use_pair.second;
+        if (use_loc != instr_id + kIdsPerInstr) {
+          return false;
+        }
+
+        const auto* use_instr = use_opnd->instr();
+        if (use_instr == nullptr || !use_instr->isCall()) {
+          return false;
+        }
+
+        // For regular call instructions, input 0 is callee, input 1 is arg0.
+        return use_instr->getNumInputs() >= 2 &&
+            use_instr->getInput(1) == use_opnd;
+      };
+
+      if (
+          output_opnd->isVreg() && should_prefer_return_register(output_opnd) &&
+          (instr_opcode == Instruction::kCall ||
+           instr_opcode == Instruction::kVarArgCall ||
+           instr_opcode == Instruction::kVectorCall)) {
+        auto& interval = getInterval(output_opnd);
+        auto return_reg = output_opnd->isFp() ? arch::reg_double_return_loc
+                                              : arch::reg_general_return_loc;
+        interval.allocateTo(
+            PhyLocation{return_reg.loc, output_opnd->sizeInBits()});
+      }
+#endif
+
       auto register_input = [&](const OperandBase* operand, bool reguse) {
         auto def = operand->getDefine();
 
@@ -587,6 +630,7 @@ void LinearScanAllocator::computeInitialYieldSpillSize(
   JIT_CHECK(
       initial_yield_spill_size_ == -1,
       "Already computed InitialYield spill size");
+  initial_yield_spill_size_ = 0;
 
   for (auto& pair : mapping) {
     const LiveInterval* interval = pair.second;

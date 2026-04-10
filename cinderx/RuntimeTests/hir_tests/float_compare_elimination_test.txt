@@ -1,0 +1,165 @@
+--- Test Suite Name ---
+FloatCompareEliminationTest
+--- Passes ---
+FloatCompareElimination
+--- Test Name ---
+EliminateFloatCompareComparedWithTrue
+--- Input ---
+# HIR
+fun test {
+  bb 0 {
+    v0 = LoadArg<0>
+    v1 = LoadArg<1>
+    v2 = GuardType<FloatExact> v0
+    v3 = GuardType<FloatExact> v1
+    v4 = FloatCompare<GreaterThan> v2 v3
+    Decref v2
+    Decref v3
+    v5 = LoadConst<ImmortalBool[True]>
+    v6 = PrimitiveCompare<Equal> v4 v5
+    Decref v4
+    CondBranch<1, 2> v6
+  }
+
+  bb 1 {
+    v7 = LoadConst<ImmortalBool[True]>
+    Return v7
+  }
+
+  bb 2 {
+    v8 = LoadConst<ImmortalBool[False]>
+    Return v8
+  }
+}
+--- Expected 3.10 ---
+fun test {
+  bb 0 {
+    v0:Object = LoadArg<0>
+    v1:Object = LoadArg<1>
+    v2:FloatExact = GuardType<FloatExact> v0 {
+      FrameState {
+        CurInstrOffset -2
+      }
+    }
+    v3:FloatExact = GuardType<FloatExact> v1 {
+      FrameState {
+        CurInstrOffset -2
+      }
+    }
+    v9:CDouble = PrimitiveUnbox<CDouble> v2
+    v10:CDouble = PrimitiveUnbox<CDouble> v3
+    v6:CBool = PrimitiveCompare<GreaterThanUnsigned> v9 v10
+    Decref v2
+    Decref v3
+    CondBranch<1, 2> v6
+  }
+
+  bb 1 (preds 0) {
+    v7:ImmortalBool[True] = LoadConst<ImmortalBool[True]>
+    Return v7
+  }
+
+  bb 2 (preds 0) {
+    v8:ImmortalBool[False] = LoadConst<ImmortalBool[False]>
+    Return v8
+  }
+}
+--- Expected 3.12 ---
+fun test {
+  bb 0 {
+    v0:Object = LoadArg<0>
+    v1:Object = LoadArg<1>
+    v2:FloatExact = GuardType<FloatExact> v0 {
+      FrameState {
+        CurInstrOffset -2
+      }
+    }
+    v3:FloatExact = GuardType<FloatExact> v1 {
+      FrameState {
+        CurInstrOffset -2
+      }
+    }
+    v9:CDouble = PrimitiveUnbox<CDouble> v2
+    v10:CDouble = PrimitiveUnbox<CDouble> v3
+    v6:CBool = PrimitiveCompare<GreaterThanUnsigned> v9 v10
+    Decref v2
+    Decref v3
+    CondBranch<1, 2> v6
+  }
+
+  bb 1 (preds 0) {
+    v7:ImmortalBool[True] = LoadConst<ImmortalBool[True]>
+    Return v7
+  }
+
+  bb 2 (preds 0) {
+    v8:ImmortalBool[False] = LoadConst<ImmortalBool[False]>
+    Return v8
+  }
+}
+--- Expected 3.14 ---
+fun test {
+  bb 0 {
+    v0:Object = LoadArg<0>
+    v1:Object = LoadArg<1>
+    v2:FloatExact = GuardType<FloatExact> v0 {
+      FrameState {
+        CurInstrOffset -2
+      }
+    }
+    v3:FloatExact = GuardType<FloatExact> v1 {
+      FrameState {
+        CurInstrOffset -2
+      }
+    }
+    v9:CDouble = PrimitiveUnbox<CDouble> v2
+    v10:CDouble = PrimitiveUnbox<CDouble> v3
+    v6:CBool = PrimitiveCompare<GreaterThanUnsigned> v9 v10
+    Decref v2
+    Decref v3
+    CondBranch<1, 2> v6
+  }
+
+  bb 1 (preds 0) {
+    v7:ImmortalBool[True] = LoadConst<ImmortalBool[True]>
+    Return v7
+  }
+
+  bb 2 (preds 0) {
+    v8:ImmortalBool[False] = LoadConst<ImmortalBool[False]>
+    Return v8
+  }
+}
+--- Expected 3.15 ---
+fun test {
+  bb 0 {
+    v0:Object = LoadArg<0>
+    v1:Object = LoadArg<1>
+    v2:FloatExact = GuardType<FloatExact> v0 {
+      FrameState {
+        CurInstrOffset -2
+      }
+    }
+    v3:FloatExact = GuardType<FloatExact> v1 {
+      FrameState {
+        CurInstrOffset -2
+      }
+    }
+    v9:CDouble = PrimitiveUnbox<CDouble> v2
+    v10:CDouble = PrimitiveUnbox<CDouble> v3
+    v6:CBool = PrimitiveCompare<GreaterThanUnsigned> v9 v10
+    Decref v2
+    Decref v3
+    CondBranch<1, 2> v6
+  }
+
+  bb 1 (preds 0) {
+    v7:ImmortalBool[True] = LoadConst<ImmortalBool[True]>
+    Return v7
+  }
+
+  bb 2 (preds 0) {
+    v8:ImmortalBool[False] = LoadConst<ImmortalBool[False]>
+    Return v8
+  }
+}

@@ -3,6 +3,7 @@
 import asyncio
 import faulthandler
 import gc
+import platform
 import subprocess
 import sys
 import tempfile
@@ -1540,6 +1541,58 @@ class RegressionTests(StaticTestBase):
 
 @skip_unless_jit("Requires cinderjit module")
 class CinderJitModuleTests(StaticTestBase):
+    def test_dump_elf_machine_matches_runtime_arch(self) -> None:
+        # dump_elf is only exported on non-Windows builds.
+        if sys.platform == "win32":
+            self.skipTest("dump_elf is not available on Windows")
+
+        import cinderjit
+
+        if not hasattr(cinderjit, "dump_elf"):
+            self.skipTest("cinderjit.dump_elf is unavailable")
+
+        def f(x: int) -> int:
+            return x + 1
+
+        force_compile(f)
+        self.assertTrue(is_jit_compiled(f))
+
+        with tempfile.TemporaryDirectory() as tmp:
+            elf_path = Path(tmp) / "jit_dump.elf"
+            cinderjit.dump_elf(str(elf_path))
+            data = elf_path.read_bytes()
+
+        self.assertGreaterEqual(len(data), 20)
+        self.assertEqual(data[0:4], b"\x7fELF")
+
+        ei_data = data[5]
+        if ei_data == 1:
+            byteorder = "little"
+        elif ei_data == 2:
+            byteorder = "big"
+        else:
+            self.fail(f"Unknown ELF data encoding: {ei_data}")
+
+        # ELF64 header: e_machine is bytes [18:20].
+        e_machine = int.from_bytes(data[18:20], byteorder)
+
+        expected_by_arch = {
+            "x86_64": 0x3E,  # EM_X86_64
+            "amd64": 0x3E,  # EM_X86_64
+            "aarch64": 0xB7,  # EM_AARCH64
+            "arm64": 0xB7,  # EM_AARCH64
+        }
+        arch = platform.machine().lower()
+        expected_machine = expected_by_arch.get(arch)
+        if expected_machine is None:
+            self.skipTest(f"Unsupported runtime architecture in test: {arch}")
+
+        self.assertEqual(
+            e_machine,
+            expected_machine,
+            f"ELF e_machine mismatch: arch={arch}, e_machine=0x{e_machine:04x}",
+        )
+
     def test_bad_disable(self) -> None:
         with self.assertRaises(TypeError):
             # pyre-ignore[19]: Intentionally testing type errors here.

@@ -61,8 +61,6 @@ TypeWatcher<LoadTypeAttrCache> ltac_watcher;
 TypeWatcher<LoadMethodCache> lm_watcher;
 TypeWatcher<LoadTypeMethodCache> ltm_watcher;
 
-constexpr uintptr_t kKindMask = 0x07;
-
 // Sentinel PyTypeObject that must never escape into user code.
 #pragma clang diagnostic push
 #pragma clang diagnostic ignored "-Wmissing-field-initializers"
@@ -302,10 +300,13 @@ int SplitMutator::setAttrInlineKnownOffset(
         this, AttributeMutator::Kind::kSplitKnownOffset);
     return setAttr(obj, name, value);
   }
-  auto old_value = Ref<>::steal(values->values[val_offset]);
-  values->values[val_offset] = Py_NewRef(value);
-  if (!old_value) {
+  PyObject* old_value = values->values[val_offset];
+  Py_INCREF(value);
+  values->values[val_offset] = value;
+  if (old_value == nullptr) {
     _PyDictValues_AddToInsertionOrder(values, val_offset);
+  } else {
+    Py_DECREF(old_value);
   }
   return 0;
 }
@@ -577,7 +578,7 @@ AttributeMutator::AttributeMutator() {
 
 PyTypeObject* AttributeMutator::type() const {
   // clear tagged bits and return
-  return reinterpret_cast<PyTypeObject*>(type_ & ~kKindMask);
+  return reinterpret_cast<PyTypeObject*>(type_ & ~kindMask());
 }
 
 void AttributeMutator::reset() {
@@ -700,13 +701,17 @@ inline PyObject* AttributeMutator::getAttr(PyObject* obj, PyObject* name) {
 
 void AttributeMutator::set_type(PyTypeObject* type, Kind kind) {
   auto raw = reinterpret_cast<uintptr_t>(type);
-  JIT_CHECK((raw & kKindMask) == 0, "PyTypeObject* expected to be aligned");
+  JIT_CHECK((raw & kindMask()) == 0, "PyTypeObject* expected to be aligned");
   auto mask = static_cast<uintptr_t>(kind);
   type_ = raw | mask;
 }
 
 AttributeMutator::Kind AttributeMutator::get_kind() const {
-  return static_cast<Kind>(type_ & kKindMask);
+  return static_cast<Kind>(type_ & kindMask());
+}
+
+bool AttributeMutator::isSplitInlineKnownOffset() const {
+  return !isEmpty() && get_kind() == Kind::kSplitInlineKnownOffset;
 }
 
 AttributeCache::AttributeCache() {
@@ -876,7 +881,14 @@ int StoreAttrCache::invoke(
 
 int StoreAttrCache::doInvoke(PyObject* obj, PyObject* name, PyObject* value) {
   BorrowedRef<PyTypeObject> tp = Py_TYPE(obj);
-  for (auto& entry : entries()) {
+  auto cache_entries = entries();
+  if (!cache_entries.empty() && cache_entries[0].type() == tp) {
+    return cache_entries[0].setAttr(obj, name, value);
+  }
+  for (auto it = cache_entries.begin() + std::min<size_t>(1, cache_entries.size());
+       it != cache_entries.end();
+       ++it) {
+    auto& entry = *it;
     if (entry.type() == tp) {
       return entry.setAttr(obj, name, value);
     }
@@ -1071,6 +1083,10 @@ std::string_view cacheMissReason(CacheMissReason reason) {
   return kCacheMissReasons[static_cast<size_t>(reason)];
 }
 
+#if PY_VERSION_HEX >= 0x030C0000
+bool isValidKeysVersion(uint32_t keys_version, BorrowedRef<> obj);
+#endif
+
 LoadMethodCache::~LoadMethodCache() {
   for (auto& entry : entries_) {
     if (entry.type != nullptr) {
@@ -1086,6 +1102,32 @@ LoadMethodResult LoadMethodCache::lookupHelper(
     BorrowedRef<> obj,
     BorrowedRef<> name) {
   return cache->lookup(obj, name);
+}
+
+LoadMethodResult LoadMethodCache::getValueHelper(
+    LoadMethodCache* cache,
+    PyObject* obj) {
+  auto& entry = cache->entries_[0];
+  if (entry.type != Py_TYPE(obj)) {
+    JIT_DCHECK(cache->cached_name_ != nullptr, "expected cached method name");
+    return cache->lookup(obj, cache->cached_name_);
+  }
+#if PY_VERSION_HEX >= 0x030C0000
+  if (!isValidKeysVersion(entry.keys_version, obj)) {
+    JIT_DCHECK(cache->cached_name_ != nullptr, "expected cached method name");
+    return cache->lookup(obj, cache->cached_name_);
+  }
+#endif
+  PyObject* result = entry.value;
+  JIT_DCHECK(result != nullptr, "expected cached method value");
+  Py_INCREF(result);
+  Py_INCREF(obj);
+  return {result, obj};
+}
+
+PyTypeObject** LoadMethodCache::typeAddr() {
+  static_assert(sizeof(BorrowedRef<PyTypeObject>) == sizeof(PyTypeObject*));
+  return reinterpret_cast<PyTypeObject**>(&entries_[0].type);
 }
 
 #if PY_VERSION_HEX >= 0x030C0000
@@ -1117,19 +1159,39 @@ LoadMethodResult LoadMethodCache::lookup(
     BorrowedRef<> name) {
   BorrowedRef<PyTypeObject> tp = Py_TYPE(obj);
 
-  for (auto& entry : entries_) {
-    if (entry.type == tp) {
+  auto return_cached = [&](const Entry& entry) -> LoadMethodResult {
+    PyObject* result = entry.value;
+    Py_INCREF(result);
+    Py_INCREF(obj);
+    return {result, obj};
+  };
+
+  auto& first_entry = entries_[0];
+  if (first_entry.type == tp) {
 #if PY_VERSION_HEX >= 0x030C0000
-      if (!isValidKeysVersion(entry.keys_version, obj)) {
-        continue;
-      }
+    if (isValidKeysVersion(first_entry.keys_version, obj)) {
+      return return_cached(first_entry);
+    }
+#else
+    return return_cached(first_entry);
+#endif
+  }
+
+  for (auto it = std::next(entries_.begin()); it != entries_.end(); ++it) {
+    auto& entry = *it;
+    if (entry.type != tp) {
+      continue;
+    }
+#if PY_VERSION_HEX >= 0x030C0000
+    if (!isValidKeysVersion(entry.keys_version, obj)) {
+      continue;
+    }
 #endif
 
-      PyObject* result = entry.value;
-      Py_INCREF(result);
-      Py_INCREF(obj);
-      return {result, obj};
-    }
+    // Promote the hottest exact receiver to slot 0 so monomorphic wrappers
+    // stay on the shortest helper path.
+    std::swap(first_entry, entry);
+    return return_cached(first_entry);
   }
 
   return lookupSlowPath(obj, name);
@@ -1255,6 +1317,7 @@ void LoadMethodCache::fill(
     return;
   }
 
+  cached_name_ = name;
   for (auto& entry : entries_) {
     if (entry.type == nullptr) {
       uint32_t keys_version = 0;

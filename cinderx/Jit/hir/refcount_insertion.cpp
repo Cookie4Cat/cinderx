@@ -15,6 +15,7 @@
 #include <fmt/ostream.h>
 
 #include <algorithm>
+#include <cstring>
 #include <set>
 #include <vector>
 
@@ -366,6 +367,10 @@ struct fmt::formatter<jit::hir::StateMap> : fmt::ostream_formatter {};
 namespace jit::hir {
 
 namespace {
+
+int countUses(const Function& func, const Register* reg);
+bool isBuiltinMathSqrtLoad(const LoadModuleAttrCached& instr);
+void elideDeadBuiltinMathSqrtLoads(Function& irfunc);
 
 // Global state used by the analysis.
 struct Env {
@@ -1285,6 +1290,89 @@ void optimizeLongDecrefRuns(Function& irfunc) {
   }
 }
 
+int countUses(const Function& func, const Register* reg) {
+  int uses = 0;
+  for (auto& block : func.cfg.blocks) {
+    for (const auto& instr : block) {
+      instr.visitUses([&](Register* use) {
+        if (use == reg) {
+          uses++;
+        }
+        return true;
+      });
+    }
+  }
+  return uses;
+}
+
+bool isBuiltinMathSqrtLoad(const LoadModuleAttrCached& instr) {
+  Register* receiver = instr.GetOperand(0);
+  Type receiver_type = receiver->type();
+  if (!receiver_type.hasObjectSpec()) {
+    return false;
+  }
+
+  BorrowedRef<> module_obj = receiver_type.objectSpec();
+  if (!PyModule_Check(module_obj)) {
+    return false;
+  }
+
+  PyModuleDef* def = PyModule_GetDef(module_obj);
+  if (def == nullptr) {
+    PyErr_Clear();
+    return false;
+  }
+  if (std::strcmp(def->m_name, "math") != 0) {
+    return false;
+  }
+  if (PyUnicode_CompareWithASCIIString(instr.name(), "sqrt") != 0) {
+    PyErr_Clear();
+    return false;
+  }
+
+  BorrowedRef<> value =
+      PyDict_GetItemWithError(PyModule_GetDict(module_obj), instr.name());
+  if (value == nullptr) {
+    PyErr_Clear();
+    return false;
+  }
+  return PyCFunction_Check(value);
+}
+
+void elideDeadBuiltinMathSqrtLoads(Function& irfunc) {
+  std::vector<Instr*> to_delete;
+
+  for (auto& block : irfunc.cfg.blocks) {
+    for (auto& instr : block) {
+      if (!instr.IsDecref()) {
+        continue;
+      }
+
+      Register* value = instr.GetOperand(0);
+      if (value == nullptr || value->instr() == nullptr ||
+          !value->instr()->IsLoadModuleAttrCached()) {
+        continue;
+      }
+
+      auto* load = static_cast<LoadModuleAttrCached*>(value->instr());
+      if (!isBuiltinMathSqrtLoad(*load) || countUses(irfunc, value) != 1) {
+        continue;
+      }
+
+      to_delete.push_back(&instr);
+      to_delete.push_back(load);
+    }
+  }
+
+  for (Instr* instr : to_delete) {
+    if (instr->block() == nullptr) {
+      continue;
+    }
+    instr->unlink();
+    delete instr;
+  }
+}
+
 } // namespace
 
 void RefcountInsertion::Run(Function& func) {
@@ -1360,6 +1448,7 @@ void RefcountInsertion::Run(Function& func) {
 
   // Optimize long decref runs
   optimizeLongDecrefRuns(func);
+  elideDeadBuiltinMathSqrtLoads(func);
 }
 
 } // namespace jit::hir

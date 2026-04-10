@@ -1,0 +1,22 @@
+services:
+  cpython-baseline:
+    image: ${BASE_IMAGE:-cinderx-cpython-baseline:arm64}
+    build: .
+    platform: linux/arm64
+    hostname: cpython-baseline
+
+    volumes:
+      # Stock CPython source tree for JIT-enabled baseline build
+      - ${CPYTHON_ROOT:-${HOME}/Repo/cpython}:/cpython:ro
+      # CinderX wheel files
+      - ../../dist:/dist:ro
+      # Benchmark scripts
+      - ./scripts:/scripts:ro
+      # Results
+      - ${RESULTS_DIR:-./results}:/results
+      # Experiment configs
+      - ./configs:/scripts/configs:ro
+
+    # Keep container running
+    stdin_open: true
+    tty: true

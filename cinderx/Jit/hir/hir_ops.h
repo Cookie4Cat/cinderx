@@ -34,6 +34,7 @@ namespace jit::hir {
   V(CheckVar)                          \
   V(CheckFreevar)                      \
   V(CheckField)                        \
+  V(CheckedIntBinaryOp)                \
   V(CIntToCBool)                       \
   V(Compare)                           \
   V(CompareBool)                       \
@@ -50,9 +51,12 @@ namespace jit::hir {
   V(DictMerge)                         \
   V(DictSubscr)                        \
   V(DictUpdate)                        \
+  V(DoubleAbs)                         \
   V(DoubleBinaryOp)                    \
+  V(DoubleSqrt)                        \
   V(EagerImportName)                   \
   V(EndInlinedFunction)                \
+  V(FillMethodCache)                   \
   V(FillTypeAttrCache)                 \
   V(FillTypeMethodCache)               \
   V(FloatBinaryOp)                     \
@@ -63,10 +67,13 @@ namespace jit::hir {
   V(GetANext)                          \
   V(GetIter)                           \
   V(GetLength)                         \
+  V(GetLengthInt64)                    \
   V(GetSecondOutput)                   \
   V(GetTuple)                          \
   V(Guard)                             \
   V(GuardIs)                           \
+  V(GuardModuleAttrValue)              \
+  V(GuardNonNegativeDouble)            \
   V(GuardType)                         \
   V(HintType)                          \
   V(ImportFrom)                        \
@@ -90,6 +97,7 @@ namespace jit::hir {
   V(IsTruthy)                          \
   V(ListAppend)                        \
   V(ListExtend)                        \
+  V(ListSlice)                         \
   V(LoadArrayItem)                     \
   V(LoadFieldAddress)                  \
   V(LoadArg)                           \
@@ -109,6 +117,8 @@ namespace jit::hir {
   V(LoadGlobal)                        \
   V(LoadMethod)                        \
   V(LoadMethodCached)                  \
+  V(LoadMethodCacheEntryType)          \
+  V(LoadMethodCacheEntryValue)         \
   V(LoadModuleAttrCached)              \
   V(LoadModuleMethodCached)            \
   V(LoadMethodSuper)                   \
@@ -123,6 +133,7 @@ namespace jit::hir {
   V(LongCompare)                       \
   V(LongBinaryOp)                      \
   V(LongInPlaceOp)                     \
+  V(LongUnboxCompact)                  \
   V(MakeCheckedDict)                   \
   V(MakeCheckedList)                   \
   V(MakeCell)                          \

@@ -2,9 +2,7 @@
 
 #include <gtest/gtest.h>
 
-#ifdef BUCK_BUILD
 #include "cinderx/_cinderx-lib.h"
-#endif
 
 #include "cinderx/Jit/compiler.h"
 #include "cinderx/Jit/hir/builtin_load_method_elimination.h"
@@ -12,9 +10,14 @@
 #include "cinderx/Jit/hir/copy_propagation.h"
 #include "cinderx/Jit/hir/dead_code_elimination.h"
 #include "cinderx/Jit/hir/dynamic_comparison_elimination.h"
+#include "cinderx/Jit/hir/float_compare_elimination.h"
 #include "cinderx/Jit/hir/guard_removal.h"
+#include "cinderx/Jit/hir/guarded_load_elimination.h"
 #include "cinderx/Jit/hir/inliner.h"
 #include "cinderx/Jit/hir/insert_update_prev_instr.h"
+#include "cinderx/Jit/hir/list_slice_cleanup.h"
+#include "cinderx/Jit/hir/long_loop_unboxing.h"
+#include "cinderx/Jit/hir/make_function_const_fold.h"
 #include "cinderx/Jit/hir/phi_elimination.h"
 #include "cinderx/Jit/hir/refcount_insertion.h"
 #include "cinderx/Jit/hir/simplify.h"
@@ -63,8 +66,13 @@ class TestPassRegistry {
     addPass(jit::hir::CopyPropagation::Factory);
     addPass(jit::hir::CleanCFG::Factory);
     addPass(jit::hir::DynamicComparisonElimination::Factory);
+    addPass(jit::hir::FloatCompareElimination::Factory);
     addPass(jit::hir::PhiElimination::Factory);
+    addPass(jit::hir::GuardedLoadElimination::Factory);
     addPass(jit::hir::InlineFunctionCalls::Factory);
+    addPass(jit::hir::ListSliceCleanup::Factory);
+    addPass(jit::hir::LongLoopUnboxing::Factory);
+    addPass(jit::hir::MakeFunctionConstFold::Factory);
     addPass(jit::hir::Simplify::Factory);
     addPass(jit::hir::DeadCodeElimination::Factory);
     addPass(jit::hir::GuardTypeRemoval::Factory);
@@ -169,11 +177,9 @@ void register_test(
 
 } // namespace
 
-#ifdef BUCK_BUILD
 PyMODINIT_FUNC PyInit__cinderx() {
   return _cinderx_lib_init();
 }
-#endif
 
 void registerCinderX() {
 #ifdef BUCK_BUILD
@@ -197,12 +203,12 @@ void registerCinderX() {
                  "build, re-running usually fixes the issue\n";
     throw;
   }
+#endif
 
   if (PyImport_AppendInittab("_cinderx", PyInit__cinderx) != 0) {
     PyErr_Print();
     throw std::runtime_error{"Could not add cinderx to inittab"};
   }
-#endif
 }
 
 int main(int argc, char* argv[]) {
@@ -220,8 +226,10 @@ int main(int argc, char* argv[]) {
 
   register_test("clean_cfg_test.txt");
   register_test("dynamic_comparison_elimination_test.txt");
+  register_test("float_compare_elimination_test.txt");
   register_test("hir_builder_static_test.txt", RuntimeTest::kStaticCompiler);
   register_test("guard_type_removal_test.txt");
+  register_test("guarded_load_elimination_test.txt");
   register_test("inliner_test.txt");
   register_test("inliner_elimination_test.txt");
   register_test("inliner_static_test.txt", RuntimeTest::kStaticCompiler);

@@ -186,6 +186,12 @@ Other optimization passes are implemented in
 [Jit/hir/optimization.cpp](hir/optimization.cpp), and run by
 `jit::Compiler::runPasses` (see [Jit/compiler.cpp](compiler.cpp)).
 
+Recent HIR cleanups include dedicated passes that sit between the main
+canonicalization phase and refcount insertion. For example,
+`GuardedLoadElimination` removes redundant dominated `GuardType`,
+`LoadField`, `LoadTupleItem`, and exact-receiver `LoadMethod`
+operations when no invalidating side effects intervene.
+
 The last pass, `RefcountInsertion`, automatically inserts reference counting
 operations into the optimized SSA HIR as needed based on metadata about the
 reference-handling and memory effects of each HIR opcode. Reference-count
@@ -238,18 +244,20 @@ fun __main__:f {
 The final HIR is then lowered to LIR, our lower-level intermediate
 representation, still in SSA form. Most of the LIR code lives in
 [Jit/lir/](lir/), and lowering to it is implemented in `jit::lir::Generator` in
-[Jit/lir/generator.cpp](lir/generator.cpp). Currently HIR is turned into a
-textual representation of LIR, which is then parsed into LIR instruction
-objects (in [Jit/lir/block_builder.cpp](lir/block_builder.cpp)), though we aim
-to eliminate the textual step.
+[Jit/lir/generator.cpp](lir/generator.cpp). The current implementation lowers
+directly into a `lir::Function`; it no longer goes through an intermediate
+textual LIR serialization step during normal compilation.
 
 ## Register allocation and LIR optimizations
 
 Register allocation is implemented in
 [Jit/lir/regalloc.cpp](lir/regalloc.cpp). Other optimizations on LIR (some
 before and some after register allocation) are also implemented in the
-[Jit/lir/](lir/) directory. These are mostly coordinated in
-`jit::codegen::NativeGenerator::GetEntryPoint()`.
+[Jit/lir/](lir/) directory. These are coordinated in the native codegen
+pipeline in [Jit/codegen/gen_asm.cpp](codegen/gen_asm.cpp), which runs direct
+HIR-to-LIR lowering, post-generation rewrites, LIR DCE, linear-scan register
+allocation, post-allocation rewrites, verification, and finally asmjit code
+emission.
 
 To see the final LIR for our function, you can run
 `./python -X jit-list-file=<(echo "__main__:f") -X jit-dump-lir f.py`.

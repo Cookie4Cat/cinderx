@@ -66,6 +66,9 @@ Instruction* BasicBlockBuilder::appendBranch(
     Instruction::Opcode opcode,
     BasicBlock* true_bb) {
   auto instr = appendInstr(opcode);
+  if (opcode == Instruction::kBranch) {
+    instr->allocateLabelInput(true_bb);
+  }
   cur_bb_->addSuccessor(true_bb);
   return instr;
 }

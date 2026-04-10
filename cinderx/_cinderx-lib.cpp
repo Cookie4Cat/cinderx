@@ -60,15 +60,23 @@
 
 namespace {
 
+#if defined(CINDER_ENABLE_STATIC_PYTHON)
+constexpr bool kStaticPythonEnabled = true;
+#else
+constexpr bool kStaticPythonEnabled = false;
+#endif
+
 /*
  * Misc. Python-facing utility functions.
  */
 
 PyObject* clear_caches(PyObject* mod, PyObject*) {
   auto state = cinderx::getModuleState(mod);
-  _PyCheckedDict_ClearCaches();
-  _PyCheckedList_ClearCaches();
-  _PyClassLoader_ClearValueCache();
+  if constexpr (kStaticPythonEnabled) {
+    _PyCheckedDict_ClearCaches();
+    _PyCheckedList_ClearCaches();
+    _PyClassLoader_ClearValueCache();
+  }
   if (auto* ctx = jit::getContext()) {
     ctx->clearDeoptStats();
   }
@@ -100,6 +108,12 @@ PyDoc_STRVAR(
 Patch a field in a strict module\n\
 Requires patching to be enabled");
 PyObject* strict_module_patch(PyObject*, PyObject* args) {
+  if constexpr (!kStaticPythonEnabled) {
+    PyErr_SetString(
+        PyExc_RuntimeError,
+        "Static Python is disabled at build time (ENABLE_STATIC_PYTHON=0)");
+    return nullptr;
+  }
   PyObject* mod;
   PyObject* name;
   PyObject* value;
@@ -118,6 +132,12 @@ PyDoc_STRVAR(
 Delete a field in a strict module\n\
 Requires patching to be enabled");
 PyObject* strict_module_patch_delete(PyObject*, PyObject* args) {
+  if constexpr (!kStaticPythonEnabled) {
+    PyErr_SetString(
+        PyExc_RuntimeError,
+        "Static Python is disabled at build time (ENABLE_STATIC_PYTHON=0)");
+    return nullptr;
+  }
   PyObject* mod;
   PyObject* name;
   if (!PyArg_ParseTuple(args, "OU", &mod, &name)) {
@@ -134,6 +154,9 @@ PyDoc_STRVAR(
     "strict_module_patch_enabled(mod)\n\
 Gets whether patching is enabled on the strict module");
 PyObject* strict_module_patch_enabled(PyObject*, PyObject* mod) {
+  if constexpr (!kStaticPythonEnabled) {
+    Py_RETURN_FALSE;
+  }
   if (!Ci_StrictModule_Check(mod)) {
     PyErr_SetString(PyExc_TypeError, "expected strict module object");
     return nullptr;
@@ -145,6 +168,9 @@ PyObject* strict_module_patch_enabled(PyObject*, PyObject* mod) {
 }
 
 PyObject* clear_classloader_caches(PyObject*, PyObject*) {
+  if constexpr (!kStaticPythonEnabled) {
+    Py_RETURN_NONE;
+  }
   _PyClassLoader_ClearVtables();
   _PyClassLoader_ClearCache();
   _PyClassLoader_ClearGenericTypes();
@@ -152,6 +178,9 @@ PyObject* clear_classloader_caches(PyObject*, PyObject*) {
 }
 
 PyObject* watch_sys_modules(PyObject*, PyObject*) {
+  if constexpr (!kStaticPythonEnabled) {
+    Py_RETURN_NONE;
+  }
   auto sys = Ref<>::steal(PyImport_ImportModule("sys"));
   if (sys == nullptr) {
     return nullptr;
@@ -392,6 +421,48 @@ PyObject* cinder_get_adaptive_delay(PyObject* mod, PyObject*) {
 }
 
 #endif
+
+PyDoc_STRVAR(
+    cinder_is_static_python_enabled_doc,
+    "is_static_python_enabled($module, /)\n"
+    "--\n"
+    "\n"
+    "Returns whether CINDER_ENABLE_STATIC_PYTHON was enabled at build time.");
+PyObject* cinder_is_static_python_enabled(PyObject*, PyObject*) {
+#ifdef CINDER_ENABLE_STATIC_PYTHON
+  Py_RETURN_TRUE;
+#else
+  Py_RETURN_FALSE;
+#endif
+}
+
+PyDoc_STRVAR(
+    cinder_is_adaptive_static_python_enabled_doc,
+    "is_adaptive_static_python_enabled($module, /)\n"
+    "--\n"
+    "\n"
+    "Returns whether ENABLE_ADAPTIVE_STATIC_PYTHON was enabled at build time.");
+PyObject* cinder_is_adaptive_static_python_enabled(PyObject*, PyObject*) {
+#ifdef ENABLE_ADAPTIVE_STATIC_PYTHON
+  Py_RETURN_TRUE;
+#else
+  Py_RETURN_FALSE;
+#endif
+}
+
+PyDoc_STRVAR(
+    cinder_is_lightweight_frames_enabled_doc,
+    "is_lightweight_frames_enabled($module, /)\n"
+    "--\n"
+    "\n"
+    "Returns whether ENABLE_LIGHTWEIGHT_FRAMES was enabled at build time.");
+PyObject* cinder_is_lightweight_frames_enabled(PyObject*, PyObject*) {
+#ifdef ENABLE_LIGHTWEIGHT_FRAMES
+  Py_RETURN_TRUE;
+#else
+  Py_RETURN_FALSE;
+#endif
+}
 
 // In 3.12+ we don't have a shadow-stack so there's no need for our own
 // stack-walking functions.
@@ -754,7 +825,9 @@ int cinderx_dict_watcher(
     case PyDict_EVENT_ADDED:
     case PyDict_EVENT_MODIFIED:
     case PyDict_EVENT_DELETED: {
-      _PyClassLoader_NotifyDictChange(dict, event, key_obj, new_value);
+      if constexpr (kStaticPythonEnabled) {
+        _PyClassLoader_NotifyDictChange(dict, event, key_obj, new_value);
+      }
 
       if (globalCaches == nullptr) {
         return 0;
@@ -787,7 +860,9 @@ int cinderx_dict_watcher(
       }
       break;
     case PyDict_EVENT_DEALLOCATED:
-      _PyClassLoader_NotifyDictChange(dict, event, key_obj, new_value);
+      if constexpr (kStaticPythonEnabled) {
+        _PyClassLoader_NotifyDictChange(dict, event, key_obj, new_value);
+      }
       if (globalCaches != nullptr) {
         globalCaches->notifyDictUnwatch(dict);
       }
@@ -988,8 +1063,10 @@ void module_free(void* raw_mod) {
   auto mod = reinterpret_cast<PyObject*>(raw_mod);
   auto state = cinderx::getModuleState(mod);
 
-  _PyClassLoader_ClearCache();
-  _PyClassLoader_ClearValueCache();
+  if constexpr (kStaticPythonEnabled) {
+    _PyClassLoader_ClearCache();
+    _PyClassLoader_ClearValueCache();
+  }
 
   // If any Python code is running we can't tell if JIT code is in use. Even if
   // every frame in the callstack is interpreter-owned, some of them could be
@@ -1057,6 +1134,9 @@ void module_free(void* raw_mod) {
 // cleanup. Currently this includes clearing out all strict modules which the
 // interpreter won't do because it only supports clearing normal module objects.
 static PyObject* clear_strict_modules(PyObject*, PyObject*) {
+  if constexpr (!kStaticPythonEnabled) {
+    Py_RETURN_NONE;
+  }
   BorrowedRef<> modules = PyImport_GetModuleDict();
   Ref<> clearing;
   if (PyDict_CheckExact(modules)) {
@@ -1204,6 +1284,18 @@ PyMethodDef _cinderx_methods[] = {
      METH_NOARGS,
      cinder_get_adaptive_delay_doc},
 #endif
+    {"is_adaptive_static_python_enabled",
+     cinder_is_adaptive_static_python_enabled,
+     METH_NOARGS,
+     cinder_is_adaptive_static_python_enabled_doc},
+    {"is_static_python_enabled",
+     cinder_is_static_python_enabled,
+     METH_NOARGS,
+     cinder_is_static_python_enabled_doc},
+    {"is_lightweight_frames_enabled",
+     cinder_is_lightweight_frames_enabled,
+     METH_NOARGS,
+     cinder_is_lightweight_frames_enabled_doc},
 #if PY_VERSION_HEX >= 0x030E0000 && defined(ENABLE_PARALLEL_GC)
     {"get_threshold",
      cinder_get_threshold,
@@ -1505,10 +1597,14 @@ int _cinderx_exec_impl(PyObject* m) {
   }
 #endif
 
+  // Keep _static module available for Python-level compatibility even when
+  // static-python optimization paths are disabled.
   if (_Ci_CreateStaticModule() < 0) {
     return -1;
   }
-
+  if (Ci_InitFrameEvalFunc() < 0) {
+    return -1;
+  }
   return 0;
 }
 

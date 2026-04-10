@@ -7,11 +7,30 @@
 #include "cinderx/Jit/config.h"
 #include "cinderx/Jit/threaded_compile.h"
 
+#include <cctype>
 #include <fstream>
 #include <stdexcept>
 #include <string>
 
 namespace jit {
+
+namespace {
+
+std::string_view trimWhitespace(std::string_view value) {
+  auto is_space = [](char ch) {
+    return std::isspace(static_cast<unsigned char>(ch)) != 0;
+  };
+
+  while (!value.empty() && is_space(value.front())) {
+    value.remove_prefix(1);
+  }
+  while (!value.empty() && is_space(value.back())) {
+    value.remove_suffix(1);
+  }
+  return value;
+}
+
+} // namespace
 
 std::unique_ptr<JITList> JITList::create() {
   JIT_DCHECK(
@@ -48,6 +67,7 @@ void JITList::parseFile(const char* filename) {
 }
 
 bool JITList::parseLine(std::string_view line) {
+  line = trimWhitespace(line);
   if (line.empty() || line.at(0) == '#') {
     return true;
   }

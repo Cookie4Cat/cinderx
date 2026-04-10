@@ -42,6 +42,7 @@ struct HIROptimizations {
   bool dead_code_elim{true};
   bool dynamic_comparison_elim{true};
   bool guard_type_removal{true};
+  bool guarded_load_elim{true};
   // TASK(T156009029): Inliner should be on by default.
   bool inliner{false};
   bool insert_update_prev_instr{true};

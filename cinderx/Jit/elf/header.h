@@ -6,6 +6,18 @@
 
 namespace jit::elf {
 
+// ELF e_machine values (from elf.h).
+constexpr uint16_t kMachineX86_64 = 0x3e;
+constexpr uint16_t kMachineAArch64 = 0xb7;
+
+#if defined(__x86_64__) || defined(_M_X64)
+constexpr uint16_t kFileMachine = kMachineX86_64;
+#elif defined(__aarch64__) || defined(_M_ARM64)
+constexpr uint16_t kFileMachine = kMachineAArch64;
+#else
+#error Please provide the ELF e_machine value for your architecture.
+#endif
+
 // See https://en.wikipedia.org/wiki/Executable_and_Linkable_Format#File_layout
 // for how the ELF 64-bit file layout is structured.
 
@@ -123,8 +135,8 @@ struct FileHeader {
   // Dynamic library.
   uint16_t type{3};
 
-  // AMD x86-64.
-  uint16_t machine{0x3e};
+  // Target architecture (e_machine).
+  uint16_t machine{kFileMachine};
 
   // Duplicate of the previous version field.
   const uint32_t version{1};

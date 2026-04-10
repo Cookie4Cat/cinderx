@@ -10,6 +10,8 @@
 
 #include <asmjit/asmjit.h>
 
+#include <cstdint>
+
 namespace jit::codegen {
 
 struct Environ {
@@ -70,10 +72,24 @@ struct Environ {
   // Location of incoming arguments
   std::vector<PhyLocation> arg_locations;
 
+  asmjit::Label store_attr_invoke_stub;
+  asmjit::Label load_module_attr_lookup_stub;
+
+  // AArch64 call target pool: one 64-bit literal per absolute target.
+  struct Aarch64CallTarget {
+    asmjit::Label literal{0};
+    asmjit::Label stub{};
+    bool has_shared_stub{false};
+    uint32_t hot_call_count{0};
+    bool use_shared_stub{false};
+  };
+  UnorderedMap<uint64_t, Aarch64CallTarget> call_target_literals;
+
   struct IndirectInfo {
     explicit IndirectInfo(void** indirect_ptr) : indirect(indirect_ptr) {}
 
     void** indirect;
+    asmjit::Label trampoline{0};
   };
   UnorderedMap<PyFunctionObject*, IndirectInfo> function_indirections;
 

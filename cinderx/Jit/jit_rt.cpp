@@ -42,6 +42,7 @@
 #endif
 
 #include <cmath>
+#include <mutex>
 
 // This is mostly taken from ceval.c _PyEval_EvalCodeWithName
 // We use the same logic to turn **args, nargsf, and kwnames into
@@ -200,6 +201,22 @@ static int JITRT_BindKeywordArgs(
   }
 
   return 1;
+}
+
+PyObject* JITRT_CallInterpretedVectorcall(
+    PyObject* func_obj,
+    PyObject* const* stack,
+    size_t nargsf,
+    PyObject* kwnames) {
+  // This helper is used by platform-specific stubs and should never recurse
+  // back into JIT entrypoints (which patch `func->vectorcall`).
+  if (!PyFunction_Check(func_obj)) {
+    return PyObject_Vectorcall(func_obj, stack, nargsf, kwnames);
+  }
+
+  auto func = reinterpret_cast<PyFunctionObject*>(func_obj);
+  vectorcallfunc entry = getInterpretedVectorcall(func);
+  return entry(func_obj, stack, nargsf, kwnames);
 }
 
 // This uses JITRT_BindKeywordArgs to get the newly bound keyword
@@ -800,6 +817,14 @@ void JITRT_DecrefFrame(PyFrameObject* frame) {
   }
 }
 
+void JITRT_Decref(PyObject* obj) {
+  Py_DECREF(obj);
+}
+
+void JITRT_XDecref(PyObject* obj) {
+  Py_XDECREF(obj);
+}
+
 #if PY_VERSION_HEX < 0x030C0000
 void JITRT_UnlinkPyFrame(PyThreadState* tstate) {
   PyFrameObject* f = tstate->frame;
@@ -880,6 +905,243 @@ PyObject* JITRT_LoadGlobalsDict(PyThreadState* tstate) {
   jit::RuntimeFrameState rtfs = jit::runtimeFrameStateFromThreadState(tstate);
   return rtfs.globals();
 }
+
+PyObject* JITRT_ListSlice(PyObject* list, PyObject* start, PyObject* stop) {
+  JIT_DCHECK(PyList_CheckExact(list), "Expected exact list");
+  JIT_DCHECK(
+      start == Py_None || PyLong_CheckExact(start),
+      "Expected exact int or None for slice start");
+  JIT_DCHECK(
+      stop == Py_None || PyLong_CheckExact(stop),
+      "Expected exact int or None for slice stop");
+
+  Py_ssize_t start_index = 0;
+  Py_ssize_t stop_index = PyList_GET_SIZE(list);
+
+  if (start != Py_None && !_PyEval_SliceIndexNotNone(start, &start_index)) {
+    return nullptr;
+  }
+  if (stop != Py_None && !_PyEval_SliceIndexNotNone(stop, &stop_index)) {
+    return nullptr;
+  }
+
+  PySlice_AdjustIndices(PyList_GET_SIZE(list), &start_index, &stop_index, 1);
+  return PyList_GetSlice(list, start_index, stop_index);
+}
+
+int JITRT_ListPrefixReverseAssign(PyObject* list, PyObject* index) {
+  if (!PyList_CheckExact(list) || !PyLong_CheckExact(index)) {
+    Ref<> minus_one = Ref<>::steal(PyLong_FromLong(-1));
+    if (minus_one == nullptr) {
+      return -1;
+    }
+    Ref<> one = Ref<>::steal(PyLong_FromLong(1));
+    if (one == nullptr) {
+      return -1;
+    }
+    Ref<> lhs_stop = Ref<>::steal(PyNumber_Add(index, one.get()));
+    if (lhs_stop == nullptr) {
+      return -1;
+    }
+    Ref<> rhs_slice =
+        Ref<>::steal(PySlice_New(index, Py_None, minus_one.get()));
+    if (rhs_slice == nullptr) {
+      return -1;
+    }
+    Ref<> lhs_slice = Ref<>::steal(PySlice_New(Py_None, lhs_stop.get(), Py_None));
+    if (lhs_slice == nullptr) {
+      return -1;
+    }
+    Ref<> rhs_value = Ref<>::steal(PyObject_GetItem(list, rhs_slice.get()));
+    if (rhs_value == nullptr) {
+      return -1;
+    }
+    return PyObject_SetItem(list, lhs_slice.get(), rhs_value.get());
+  }
+
+  Py_ssize_t idx = 0;
+  if (!_PyEval_SliceIndexNotNone(index, &idx)) {
+    return -1;
+  }
+
+  Py_ssize_t size = PyList_GET_SIZE(list);
+  if (size <= 1) {
+    return 0;
+  }
+
+  if (idx < 0) {
+    // Preserve full Python semantics for negative indices.
+    Ref<> minus_one = Ref<>::steal(PyLong_FromLong(-1));
+    if (minus_one == nullptr) {
+      return -1;
+    }
+    Ref<> one = Ref<>::steal(PyLong_FromLong(1));
+    if (one == nullptr) {
+      return -1;
+    }
+    Ref<> lhs_stop = Ref<>::steal(PyNumber_Add(index, one.get()));
+    if (lhs_stop == nullptr) {
+      return -1;
+    }
+    Ref<> rhs_slice =
+        Ref<>::steal(PySlice_New(index, Py_None, minus_one.get()));
+    if (rhs_slice == nullptr) {
+      return -1;
+    }
+    Ref<> lhs_slice = Ref<>::steal(PySlice_New(Py_None, lhs_stop.get(), Py_None));
+    if (lhs_slice == nullptr) {
+      return -1;
+    }
+    Ref<> rhs_value = Ref<>::steal(PyObject_GetItem(list, rhs_slice.get()));
+    if (rhs_value == nullptr) {
+      return -1;
+    }
+    return PyObject_SetItem(list, lhs_slice.get(), rhs_value.get());
+  }
+
+  if (idx >= size) {
+    idx = size - 1;
+  }
+
+  PyObject** items = reinterpret_cast<PyListObject*>(list)->ob_item;
+  Py_ssize_t lo = 0;
+  Py_ssize_t hi = idx;
+  while (lo < hi) {
+    PyObject* tmp = items[lo];
+    items[lo] = items[hi];
+    items[hi] = tmp;
+    ++lo;
+    --hi;
+  }
+  return 0;
+}
+
+#if PY_VERSION_HEX >= 0x030E0000 && PY_VERSION_HEX < 0x030F0000
+
+namespace {
+
+PyObject* get_dict_item_miss_sentinel() {
+  static std::once_flag once;
+  static PyObject* sentinel = nullptr;
+  std::call_once(once, []() {
+    sentinel = PyCapsule_New(
+        reinterpret_cast<void*>(get_dict_item_miss_sentinel),
+        "cinderx.jit.dict_item_miss",
+        nullptr);
+  });
+  return sentinel;
+}
+
+} // namespace
+
+PyObject* JITRT_GetDictItemMissSentinel(void) {
+  return get_dict_item_miss_sentinel();
+}
+
+PyObject* JITRT_GetDictItemOrSentinel(PyObject* dict, PyObject* key) {
+  JIT_DCHECK(PyDict_CheckExact(dict), "expected exact dict");
+
+  PyObject* value = nullptr;
+  int rc = PyDict_GetItemRef(dict, key, &value);
+  if (rc > 0) {
+    return value;
+  }
+  if (rc == 0) {
+    PyObject* sentinel = get_dict_item_miss_sentinel();
+    return sentinel == nullptr ? nullptr : Py_NewRef(sentinel);
+  }
+  return nullptr;
+}
+
+PyObject* JITRT_DeepcopyTuplePostMiss(PyObject* x, PyObject* y) {
+  if (PyTuple_CheckExact(x) && PyList_CheckExact(y)) {
+    Py_ssize_t size = PyTuple_GET_SIZE(x);
+    if (PyList_GET_SIZE(y) == size) {
+      for (Py_ssize_t i = 0; i < size; ++i) {
+        if (PyTuple_GET_ITEM(x, i) != PyList_GET_ITEM(y, i)) {
+          return PySequence_Tuple(y);
+        }
+      }
+      return Py_NewRef(x);
+    }
+  }
+
+  Ref<> iter_x = Ref<>::steal(PyObject_GetIter(x));
+  if (iter_x == nullptr) {
+    return nullptr;
+  }
+  Ref<> iter_y = Ref<>::steal(PyObject_GetIter(y));
+  if (iter_y == nullptr) {
+    return nullptr;
+  }
+
+  while (true) {
+    Ref<> item_x = Ref<>::steal(PyIter_Next(iter_x));
+    if (item_x == nullptr) {
+      if (PyErr_Occurred()) {
+        return nullptr;
+      }
+      return Py_NewRef(x);
+    }
+
+    Ref<> item_y = Ref<>::steal(PyIter_Next(iter_y));
+    if (item_y == nullptr) {
+      if (PyErr_Occurred()) {
+        return nullptr;
+      }
+      return Py_NewRef(x);
+    }
+
+    if (item_x != item_y) {
+      return PySequence_Tuple(y);
+    }
+  }
+}
+
+PyObject* JITRT_PickleUnpicklerPopStack(PyObject* self) {
+  if (self == nullptr) {
+    PyErr_SetString(
+        PyExc_SystemError, "pickle unpickler helper received null self");
+    return nullptr;
+  }
+
+  Ref<> stack = Ref<>::steal(PyObject_GetAttrString(self, "stack"));
+  if (stack == nullptr) {
+    return nullptr;
+  }
+
+  if (PyList_CheckExact(stack)) {
+    PyObject* stack_obj = stack.get();
+    Py_ssize_t size = PyList_GET_SIZE(stack_obj);
+    if (size <= 0) {
+      PyErr_SetString(PyExc_IndexError, "pop from empty list");
+      return nullptr;
+    }
+    PyObject* item = PyList_GET_ITEM(stack_obj, size - 1);
+    Py_INCREF(item);
+    if (PyList_SetSlice(stack_obj, size - 1, size, nullptr) < 0) {
+      Py_DECREF(item);
+      return nullptr;
+    }
+    return item;
+  }
+
+  Ref<> pop = Ref<>::steal(PyObject_GetAttrString(stack, "pop"));
+  if (pop == nullptr) {
+    return nullptr;
+  }
+
+  return PyObject_CallNoArgs(pop);
+}
+
+int JITRT_PickleIsStopKey(PyObject* key) {
+  if (!PyBytes_CheckExact(key) || PyBytes_GET_SIZE(key) != 1) {
+    return 0;
+  }
+  return PyBytes_AS_STRING(key)[0] == '.';
+}
+
+#endif
 
 PyObject* JITRT_LoadFunctionIndirect(PyObject** func, PyObject* descr) {
   PyObject* res = *func;
@@ -1038,6 +1300,15 @@ PyObject* JITRT_Call(
   }
 
   PyThreadState* tstate = _PyThreadState_GET();
+  if (PyFunction_Check(callable)) {
+    auto* func = reinterpret_cast<PyFunctionObject*>(callable);
+    return func->vectorcall(
+        callable,
+        const_cast<PyObject**>(args),
+        nargsf,
+        kwnames);
+  }
+
   PyObject* res =
       _PyObject_VectorcallTstate(tstate, callable, args, nargsf, kwnames);
 #if PY_VERSION_HEX >= 0x030C0000
@@ -1052,18 +1323,105 @@ PyObject* JITRT_Call(
   return res;
 }
 
+PyObject* JITRT_CallMethod(
+    PyObject* callable,
+    PyObject* const* args,
+    size_t nargsf,
+    PyObject* kwnames) {
+  JIT_DCHECK(
+      (nargsf & PY_VECTORCALL_ARGUMENTS_OFFSET),
+      "JITRT_CallMethod must always be called as a vectorcall");
+
+  // CallMethod always passes self-or-null in args[0].
+  if constexpr (PY_VERSION_HEX >= 0x030E0000) {
+    if (args[0] == nullptr) {
+      args += 1;
+      nargsf -= 1;
+    }
+  }
+
+  PyThreadState* tstate = _PyThreadState_GET();
+
+  if (PyFunction_Check(callable)) {
+    auto* func = reinterpret_cast<PyFunctionObject*>(callable);
+    return func->vectorcall(
+        callable,
+        const_cast<PyObject**>(args),
+        nargsf,
+        kwnames);
+  }
+
+  PyObject* res =
+      _PyObject_VectorcallTstate(tstate, callable, args, nargsf, kwnames);
+#if PY_VERSION_HEX >= 0x030C0000
+  if (handle_periodic_activities_on_call(tstate, res, callable)) {
+    Py_DECREF(res);
+    return nullptr;
+  }
+#endif
+  return res;
+}
+
 PyObject* JITRT_Vectorcall(
     PyObject* callable,
     PyObject* const* args,
     size_t nargsf,
     PyObject* kwnames) {
   PyThreadState* tstate = _PyThreadState_GET();
+  if (PyFunction_Check(callable)) {
+    auto* func = reinterpret_cast<PyFunctionObject*>(callable);
+    return func->vectorcall(
+        callable,
+        const_cast<PyObject**>(args),
+        nargsf,
+        kwnames);
+  }
+
   PyObject* res =
       _PyObject_VectorcallTstate(tstate, callable, args, nargsf, kwnames);
 #if PY_VERSION_HEX >= 0x030C0000
   // In 3.12 calls to non-Python functions will check for the eval breaker
   // We handle that here rather than bloat every function call w/ an extra
   // check.
+  if (handle_periodic_activities_on_call(tstate, res, callable)) {
+    Py_DECREF(res);
+    return nullptr;
+  }
+#endif
+  return res;
+}
+
+PyObject* JITRT_VectorcallExactPyFunc(
+    PyObject* callable,
+    PyObject* const* args,
+    size_t nargsf,
+    PyObject* kwnames) {
+  JIT_DCHECK(
+      Py_TYPE(callable) == &PyFunction_Type,
+      "Expected exact PyFunctionObject, got {}",
+      Py_TYPE(callable)->tp_name);
+  auto* func = reinterpret_cast<PyFunctionObject*>(callable);
+  return func->vectorcall(
+      callable, const_cast<PyObject**>(args), nargsf, kwnames);
+}
+
+PyObject* JITRT_CallMethodDescrFast1(
+    PyObject* callable,
+    PyObject* self,
+    PyObject* arg0) {
+  JIT_DCHECK(
+      Py_IS_TYPE(callable, &PyMethodDescr_Type),
+      "expected method descriptor");
+  auto* method = reinterpret_cast<PyMethodDescrObject*>(callable);
+  JIT_DCHECK(
+      method->d_method->ml_flags == METH_FASTCALL,
+      "expected METH_FASTCALL descriptor");
+
+  PyObject* args[1] = {arg0};
+  auto cfunc = _PyCFunctionFast_CAST(method->d_method->ml_meth);
+  PyObject* res = cfunc(self, args, /*nargs=*/1);
+#if PY_VERSION_HEX >= 0x030C0000
+  PyThreadState* tstate = _PyThreadState_GET();
   if (handle_periodic_activities_on_call(tstate, res, callable)) {
     Py_DECREF(res);
     return nullptr;
@@ -1412,6 +1770,10 @@ void JITRT_SetI64_InArray(char* arr, uint64_t val, int64_t idx) {
 
 void JITRT_SetU64_InArray(char* arr, uint64_t val, int64_t idx) {
   ((uint64_t*)arr)[idx] = (uint64_t)val;
+}
+
+void JITRT_SetDouble_InArray(char* arr, double_t val, int64_t idx) {
+  ((double_t*)arr)[idx] = val;
 }
 
 void JITRT_SetObj_InArray(char* arr, uint64_t val, int64_t idx) {
@@ -2094,6 +2456,10 @@ PyObject* JITRT_GetLength(PyObject* obj) {
     return nullptr;
   }
   return PyLong_FromSsize_t(len);
+}
+
+int64_t JITRT_GetLengthInt64(PyObject* obj) {
+  return PyObject_Length(obj);
 }
 
 int JITRT_DictUpdate(PyThreadState* tstate, PyObject* dict, PyObject* update) {

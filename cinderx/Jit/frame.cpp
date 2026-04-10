@@ -56,10 +56,23 @@ int reifyRunningFrame(_PyInterpreterFrame* frame, PyObject* reifier) {
 bool isJitFrame(_PyInterpreterFrame* frame) {
 #ifdef ENABLE_LIGHTWEIGHT_FRAMES
 
-#if PY_VERSION_HEX >= 0x030E0000
+#if PY_VERSION_HEX >= 0x030F0000
   PyObject* code = PyStackRef_AsPyObjectBorrow(frame->f_executable);
   return PyUnstable_JITExecutable_Check(code) &&
       ((PyUnstable_PyJitExecutable*)code)->je_reifier == &reifyRunningFrame;
+#elif PY_VERSION_HEX >= 0x030E0000
+  // OSS 3.14 does not expose the JIT executable APIs. Fall back to checking
+  // whether this frame's function has an associated compiled runtime.
+  PyObject* func_obj = frameFunction(frame);
+  if (func_obj == nullptr || !PyFunction_Check(func_obj)) {
+    return false;
+  }
+  auto* jit_ctx = cinderx::getModuleState()->jit_context.get();
+  if (jit_ctx == nullptr) {
+    return false;
+  }
+  return jit_ctx->lookupCodeRuntime(
+             reinterpret_cast<PyFunctionObject*>(func_obj)) != nullptr;
 #else
   return frameFunction(frame) == cinderx::getModuleState()->frame_reifier;
 #endif
@@ -300,6 +313,7 @@ PyType_Slot framereifier_type_slots[] = {
 Ref<> makeFrameReifier([[maybe_unused]] BorrowedRef<PyCodeObject> code) {
 #if PY_VERSION_HEX >= 0x030E0000 && defined(ENABLE_LIGHTWEIGHT_FRAMES)
   if (getConfig().frame_mode == FrameMode::kLightweight) {
+#if PY_VERSION_HEX >= 0x030F0000
     PyObject* reifier =
         PyUnstable_MakeJITExecutable(reifyRunningFrame, code, nullptr);
     if (reifier == nullptr) {
@@ -308,6 +322,11 @@ Ref<> makeFrameReifier([[maybe_unused]] BorrowedRef<PyCodeObject> code) {
           fmt::format("failed to make reifier {}", codeQualname(code)));
     }
     return Ref<>::steal(reifier);
+#else
+    // OSS 3.14 does not provide PyUnstable_MakeJITExecutable. Keep executable
+    // as the code object itself.
+    return Ref<>::create((PyObject*)code);
+#endif
   }
 #endif
   return nullptr;
@@ -409,7 +428,7 @@ void jitFramePopulateFrame([[maybe_unused]] _PyInterpreterFrame* frame) {
 // is going to be transferred there.
 void jitFrameRemoveReifier(_PyInterpreterFrame* frame) {
 #ifdef ENABLE_LIGHTWEIGHT_FRAMES
-#if PY_VERSION_HEX >= 0x030E0000
+#if PY_VERSION_HEX >= 0x030F0000
   PyObject* code = PyStackRef_AsPyObjectBorrow(frame->f_executable);
   if (PyUnstable_JITExecutable_Check(code)) {
     _PyStackRef existing = frame->f_executable;
@@ -417,6 +436,8 @@ void jitFrameRemoveReifier(_PyInterpreterFrame* frame) {
         ((PyUnstable_PyJitExecutable*)code)->je_code);
     PyStackRef_CLOSE(existing);
   }
+#elif PY_VERSION_HEX >= 0x030E0000
+  // No-op on OSS 3.14 fallback path: f_executable is already a code object.
 #else
   // We no longer own the frame and need to provide a proper function for the
   // interpreter.

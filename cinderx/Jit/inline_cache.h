@@ -119,6 +119,19 @@ class AttributeMutator {
   int setAttr(PyObject* obj, PyObject* name, PyObject* value);
 
   static void changeKindFromSplitInline(SplitMutator* split, Kind new_kind);
+  static constexpr uintptr_t kindMask() {
+    return 0x07;
+  }
+  static constexpr uintptr_t splitInlineKnownOffsetKind() {
+    return static_cast<uintptr_t>(Kind::kSplitInlineKnownOffset);
+  }
+  static constexpr size_t typeOffset() {
+    return offsetof(AttributeMutator, type_);
+  }
+  static constexpr size_t splitValOffsetOffset() {
+    return offsetof(AttributeMutator, split_) + offsetof(SplitMutator, val_offset);
+  }
+  bool isSplitInlineKnownOffset() const;
 
  private:
   void set_type(PyTypeObject* type, Kind kind);
@@ -142,6 +155,9 @@ class AttributeCache {
   ~AttributeCache();
 
   void typeChanged(PyTypeObject* type);
+  static constexpr size_t entriesOffset() {
+    return offsetof(AttributeCache, entries_);
+  }
 
  protected:
   std::span<AttributeMutator> entries();
@@ -278,7 +294,9 @@ class LoadMethodCache {
 
   static LoadMethodResult
   lookupHelper(LoadMethodCache* cache, BorrowedRef<> obj, BorrowedRef<> name);
+  static LoadMethodResult getValueHelper(LoadMethodCache* cache, PyObject* obj);
   LoadMethodResult lookup(BorrowedRef<> obj, BorrowedRef<> name);
+  PyTypeObject** typeAddr();
   void typeChanged(PyTypeObject* type);
 
   void initCacheStats(const char* filename, const char* method_name);
@@ -291,6 +309,7 @@ class LoadMethodCache {
   fill(BorrowedRef<PyTypeObject> type, BorrowedRef<> value, BorrowedRef<> name);
 
   std::array<Entry, 4> entries_;
+  BorrowedRef<> cached_name_;
   std::unique_ptr<CacheStats> cache_stats_;
 };
 
@@ -351,6 +370,16 @@ class LoadModuleAttrCache {
       BorrowedRef<> obj,
       BorrowedRef<> name);
   PyObject* lookup(BorrowedRef<> obj, BorrowedRef<> name);
+
+#if PY_VERSION_HEX >= 0x030E0000
+  static constexpr size_t moduleOffset() {
+    return offsetof(LoadModuleAttrCache, module_);
+  }
+
+  static constexpr size_t cacheOffset() {
+    return offsetof(LoadModuleAttrCache, cache_);
+  }
+#endif
 
  private:
   PyObject* lookupSlowPath(BorrowedRef<> obj, BorrowedRef<> name);

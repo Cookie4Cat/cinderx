@@ -11,14 +11,24 @@
 #include "cinderx/Jit/hir/clean_cfg.h"
 #include "cinderx/Jit/hir/dead_code_elimination.h"
 #include "cinderx/Jit/hir/dynamic_comparison_elimination.h"
+#include "cinderx/Jit/hir/float_accumulator_promotion.h"
+#include "cinderx/Jit/hir/float_compare_elimination.h"
 #include "cinderx/Jit/hir/guard_removal.h"
+#include "cinderx/Jit/hir/guarded_load_elimination.h"
 #include "cinderx/Jit/hir/hir_stats.h"
 #include "cinderx/Jit/hir/inliner.h"
+#include "cinderx/Jit/hir/inline_genexpr_makefunction_hoist.h"
 #include "cinderx/Jit/hir/insert_update_prev_instr.h"
+#include "cinderx/Jit/hir/list_slice_cleanup.h"
+#include "cinderx/Jit/hir/long_loop_unboxing.h"
+#include "cinderx/Jit/hir/make_function_const_fold.h"
 #include "cinderx/Jit/hir/phi_elimination.h"
 #include "cinderx/Jit/hir/printer.h"
+#include "cinderx/Jit/hir/primitive_box_remat.h"
+#include "cinderx/Jit/hir/primitive_unbox_cse.h"
 #include "cinderx/Jit/hir/refcount_insertion.h"
 #include "cinderx/Jit/hir/simplify.h"
+#include "cinderx/Jit/hir/slot_version_guard_elimination.h"
 #include "cinderx/Jit/hir/ssa.h"
 #include "cinderx/Jit/jit_time_log.h"
 
@@ -86,7 +96,16 @@ void Compiler::runPasses(
     }
   };
 
-  runPassIf(hir::Simplify{}, PassConfig::kSimplify);
+  auto runSimplifyPassesIfEnabled = [&]() {
+    if (config & PassConfig::kSimplify) {
+      runPass(hir::Simplify{}, irfunc, callback);
+      runPass(hir::FloatAccumulatorPromotion{}, irfunc, callback);
+      runPass(hir::SlotVersionGuardElimination{}, irfunc, callback);
+      runPass(hir::PrimitiveUnboxCSE{}, irfunc, callback);
+    }
+  };
+
+  runSimplifyPassesIfEnabled();
   runPassIf(
       hir::DynamicComparisonElimination{}, PassConfig::kDynamicComparisonElim);
   runPassIf(hir::GuardTypeRemoval{}, PassConfig::kGuardTypeRemoval);
@@ -95,7 +114,7 @@ void Compiler::runPasses(
   if (config & PassConfig::kInliner) {
     runPass(jit::hir::InlineFunctionCalls{}, irfunc, callback);
 
-    runPassIf(hir::Simplify{}, PassConfig::kSimplify);
+    runSimplifyPassesIfEnabled();
     runPassIf(
         hir::BeginInlinedFunctionElimination{},
         PassConfig::kBeginInlinedFunctionElim);
@@ -103,12 +122,19 @@ void Compiler::runPasses(
 
   runPassIf(
       hir::BuiltinLoadMethodElimination{}, PassConfig::kBuiltinLoadMethodElim);
-  runPassIf(hir::Simplify{}, PassConfig::kSimplify);
+  runSimplifyPassesIfEnabled();
+  runPass(jit::hir::LongLoopUnboxing{}, irfunc, callback);
+  runPassIf(hir::GuardedLoadElimination{}, PassConfig::kGuardedLoadElim);
   runPassIf(hir::CleanCFG{}, PassConfig::kCleanCFG);
   runPassIf(hir::DeadCodeElimination{}, PassConfig::kDeadCodeElim);
   runPassIf(hir::CleanCFG{}, PassConfig::kCleanCFG);
+  runPass(jit::hir::InlineGenexprMakeFunctionHoist{}, irfunc, callback);
 
   runPass(jit::hir::RefcountInsertion{}, irfunc, callback);
+  runPass(jit::hir::ListSliceCleanup{}, irfunc, callback);
+  runPass(jit::hir::FloatCompareElimination{}, irfunc, callback);
+  runPass(jit::hir::MakeFunctionConstFold{}, irfunc, callback);
+  runPass(jit::hir::PrimitiveBoxRemat{}, irfunc, callback);
 
   if (getConfig().dump_hir_stats) {
     jit::hir::HIRStats stats;
@@ -153,6 +179,7 @@ PassConfig createConfig() {
   set(hir_opts.clean_cfg, PassConfig::kCleanCFG);
   set(hir_opts.dynamic_comparison_elim, PassConfig::kDynamicComparisonElim);
   set(hir_opts.guard_type_removal, PassConfig::kGuardTypeRemoval);
+  set(hir_opts.guarded_load_elim, PassConfig::kGuardedLoadElim);
   // Inliner currently depends on code objects being stable.
   set(hir_opts.inliner && getConfig().stable_frame, PassConfig::kInliner);
   set(hir_opts.insert_update_prev_instr, PassConfig::kInsertUpdatePrevInstr);

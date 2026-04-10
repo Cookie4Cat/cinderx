@@ -13,8 +13,9 @@
 #ifdef Py_GIL_DISABLED
 #include <mutex>
 #endif
-#include <set>
+#include <optional>
 #include <unordered_map>
+#include <vector>
 
 namespace jit {
 
@@ -62,10 +63,36 @@ class GlobalCache {
   // the caller since it can involve complicated dances with iterators.
   void clear();
 
+  bool operator==(const GlobalCache& other) const;
   bool operator<(const GlobalCache& other) const;
 
  private:
   GlobalCacheMap::value_type* pair_;
+};
+
+class GlobalCacheWatchers {
+ public:
+  bool contains(GlobalCache cache) const;
+  bool empty() const;
+  void addUnchecked(GlobalCache cache);
+  void remove(GlobalCache cache);
+  void appendTo(std::vector<GlobalCache>& out) const;
+  std::vector<GlobalCache> snapshot() const;
+
+  template <typename Func>
+  void forEach(Func&& func) const {
+    if (single_.has_value()) {
+      func(*single_);
+      return;
+    }
+    for (GlobalCache cache : many_) {
+      func(cache);
+    }
+  }
+
+ private:
+  std::optional<GlobalCache> single_{};
+  std::vector<GlobalCache> many_{};
 };
 
 // Manages all memory and data structures for global cache values.
@@ -164,12 +191,15 @@ class GlobalCacheManager : public IGlobalCacheManager {
   // Map of all global value caches, keyed by (globals, builtins, name).
   GlobalCacheMap map_;
 
+  using DictWatchMap =
+      std::unordered_map<BorrowedRef<PyUnicodeObject>, GlobalCacheWatchers>;
+
   // Two-level map keeping track of which global value caches are subscribed to
-  // which keys in which dicts.
-  std::unordered_map<
-      BorrowedRef<PyDictObject>,
-      std::unordered_map<BorrowedRef<PyUnicodeObject>, std::set<GlobalCache>>>
-      watch_map_;
+  // which keys in which dicts. We keep the dict grouping so clear/unwatch can
+  // walk a single dict directly, keep the outer map conservative, and use a
+  // flat inner key map plus a small watcher vector to avoid std::set tree
+  // overhead on the hotter key path.
+  std::unordered_map<BorrowedRef<PyDictObject>, DictWatchMap> watch_map_;
 };
 
 } // namespace jit

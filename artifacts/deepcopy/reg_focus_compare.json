@@ -1,0 +1,37 @@
+{
+  "rows": [
+    {
+      "name": "comprehensions",
+      "base_median": 4.9094000132754445e-05,
+      "current_median": 5.100399903312791e-05,
+      "delta_pct": 3.890493533239625
+    },
+    {
+      "name": "logging_format",
+      "base_median": 2.555779992690077e-05,
+      "current_median": 2.582180004537804e-05,
+      "delta_pct": 1.0329532245825224
+    },
+    {
+      "name": "logging_silent",
+      "base_median": 9.759998647496104e-07,
+      "current_median": 1.056099972629454e-06,
+      "delta_pct": 8.206979403669589
+    },
+    {
+      "name": "logging_simple",
+      "base_median": 2.0623400087060872e-05,
+      "current_median": 2.0088400015083606e-05,
+      "delta_pct": -2.5941409744212107
+    }
+  ],
+  "warn_threshold_pct": 5.0,
+  "regressions": [
+    {
+      "name": "logging_silent",
+      "base_median": 9.759998647496104e-07,
+      "current_median": 1.056099972629454e-06,
+      "delta_pct": 8.206979403669589
+    }
+  ]
+}

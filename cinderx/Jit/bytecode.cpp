@@ -85,10 +85,32 @@ int BytecodeInstruction::specializedOpcode() const {
     case BINARY_SUBSCR_DICT:
     case BINARY_SUBSCR_LIST_INT:
     case BINARY_SUBSCR_TUPLE_INT:
+#if PY_VERSION_HEX >= 0x030E0000
+    case BINARY_OP_SUBSCR_DICT:
+    case BINARY_OP_SUBSCR_LIST_INT:
+    case BINARY_OP_SUBSCR_TUPLE_INT:
+#endif
     case COMPARE_OP_FLOAT:
     case COMPARE_OP_INT:
     case COMPARE_OP_STR:
+    case CALL_LIST_APPEND:
+    case CALL_METHOD_DESCRIPTOR_FAST:
+    case CALL_METHOD_DESCRIPTOR_FAST_WITH_KEYWORDS:
+    case CALL_METHOD_DESCRIPTOR_NOARGS:
+    case CALL_METHOD_DESCRIPTOR_O:
+#if PY_VERSION_HEX >= 0x030E0000
+    case TO_BOOL_BOOL:
+    case TO_BOOL_INT:
+    case TO_BOOL_LIST:
+    case TO_BOOL_NONE:
+    case TO_BOOL_STR:
+#endif
+    case LOAD_ATTR_INSTANCE_VALUE:
+    case LOAD_ATTR_METHOD_WITH_VALUES:
+    case LOAD_ATTR_SLOT:
     case LOAD_ATTR_MODULE:
+    case STORE_ATTR_INSTANCE_VALUE:
+    case STORE_ATTR_SLOT:
     case STORE_SUBSCR_DICT:
     case UNPACK_SEQUENCE_LIST:
     case UNPACK_SEQUENCE_TUPLE:
@@ -105,6 +127,33 @@ int BytecodeInstruction::specializedOpcode() const {
 int BytecodeInstruction::oparg() const {
   calcOpcodeOffsetAndOparg();
   return extendedOparg_;
+}
+
+PyObject* BytecodeInstruction::cacheObj(int instruction_offset) const {
+#if PY_VERSION_HEX >= 0x030C0000
+  auto idx = opcodeIndex().value() + instruction_offset;
+  return read_obj(&codeUnit(code_)[idx].cache);
+#else
+  JIT_ABORT("cacheObj() not supported before Python 3.12");
+#endif
+}
+
+uint16_t BytecodeInstruction::cacheU16(int instruction_offset) const {
+#if PY_VERSION_HEX >= 0x030C0000
+  auto idx = opcodeIndex().value() + instruction_offset;
+  return read_u16(&codeUnit(code_)[idx].cache);
+#else
+  JIT_ABORT("cacheU16() not supported before Python 3.12");
+#endif
+}
+
+uint32_t BytecodeInstruction::cacheU32(int instruction_offset) const {
+#if PY_VERSION_HEX >= 0x030C0000
+  auto idx = opcodeIndex().value() + instruction_offset;
+  return read_u32(&codeUnit(code_)[idx].cache);
+#else
+  JIT_ABORT("cacheU32() not supported before Python 3.12");
+#endif
 }
 
 bool BytecodeInstruction::isBranch() const {
@@ -146,6 +195,7 @@ bool BytecodeInstruction::isReturn() const {
 
 bool BytecodeInstruction::isTerminator() const {
   switch (opcode()) {
+    case CLEANUP_THROW:
     case RAISE_VARARGS:
     case RERAISE:
       return true;

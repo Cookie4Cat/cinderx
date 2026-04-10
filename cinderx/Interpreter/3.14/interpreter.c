@@ -6,6 +6,7 @@
 
 #include "cinderx/UpstreamBorrow/borrowed.h"
 #include "cinderx/Interpreter/cinder_opcode.h"
+#include "cinderx/Interpreter/interpreter.h"
 
 #include "cinderx/module_c_state.h"
 
@@ -204,8 +205,10 @@ static int ci_build_dict(_PyStackRef *map_items, Py_ssize_t map_size, PyObject *
     return 0;
 }
 
+static void _Ci_specialize(_Py_CODEUNIT *next_instr, int opcode);
+
 #if ENABLE_SPECIALIZATION && defined(ENABLE_ADAPTIVE_STATIC_PYTHON)
-static void specialize_with_value(_Py_CODEUNIT next_instr, PyObject *value, int opcode,
+static void specialize_with_value(_Py_CODEUNIT *next_instr, PyObject *value, int opcode,
                                   int shift, int bits)
 {
     int32_t index = _PyClassLoader_CacheValue(value);
@@ -386,13 +389,8 @@ Ci_EvalFrame(PyThreadState *tstate, _PyInterpreterFrame *frame, int throwflag);
 
 void Ci_InitOpcodes() {
 #ifdef ENABLE_ADAPTIVE_STATIC_PYTHON
-    // patch CPython's opcode data
-    for (int i = 0; i < sizeof(_CiOpcode_Caches) / sizeof(_CiOpcode_Caches[0]); i++) {
-        _PyOpcode_Caches[i] = _CiOpcode_Caches[i];
-    }
-    for (int i = 0; i < sizeof(_CiOpcode_Deopt) / sizeof(_CiOpcode_Deopt[0]); i++) {
-        _PyOpcode_Deopt[i] = _CiOpcode_Deopt[i];
-    }
+    // No runtime patching required for 3.14+ OSS builds because cinder opcode
+    // metadata is provided via generated headers at build time.
 #endif
 }
 

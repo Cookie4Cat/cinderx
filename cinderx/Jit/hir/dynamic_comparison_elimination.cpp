@@ -8,13 +8,26 @@ namespace jit::hir {
 
 namespace {
 
-Instr* replaceCompare(Compare* compare, IsTruthy* truthy) {
+template <typename CompareInstr>
+Instr* replaceCompare(CompareInstr* compare, IsTruthy* truthy) {
   return CompareBool::create(
       truthy->output(),
       compare->op(),
       compare->GetOperand(0),
       compare->GetOperand(1),
       *get_frame_state(*truthy));
+}
+
+Instr* replaceLongComparePrimitiveCompare(
+    LongCompare* compare,
+    PrimitiveCompare* prim_compare,
+    const FrameState& frame) {
+  return CompareBool::create(
+      prim_compare->output(),
+      compare->op(),
+      compare->GetOperand(0),
+      compare->GetOperand(1),
+      frame);
 }
 
 } // namespace
@@ -38,13 +51,86 @@ void DynamicComparisonElimination::Run(Function& irfunc) {
     }
 
     Instr* truthy = instr.GetOperand(0)->instr();
+
+    if (truthy->IsPrimitiveCompare()) {
+      auto prim_compare = static_cast<PrimitiveCompare*>(truthy);
+      LongCompare* long_compare = nullptr;
+      if (prim_compare->op() == PrimitiveCompareOp::kEqual) {
+        if (prim_compare->left()->instr()->IsLongCompare() &&
+            prim_compare->right()->type().asObject() == Py_True) {
+          long_compare = static_cast<LongCompare*>(prim_compare->left()->instr());
+        } else if (
+            prim_compare->right()->instr()->IsLongCompare() &&
+            prim_compare->left()->type().asObject() == Py_True) {
+          long_compare =
+              static_cast<LongCompare*>(prim_compare->right()->instr());
+        }
+      }
+
+      if (long_compare != nullptr && long_compare->block() == &block) {
+        auto& dying_regs = map_get(last_uses, prim_compare, kEmptyRegSet);
+        if (dying_regs.contains(long_compare->output())) {
+          std::vector<Instr*> dead_uses;
+          bool can_optimize = false;
+          for (auto it = std::next(block.rbegin()); it != block.rend(); ++it) {
+            if (&*it == long_compare) {
+              can_optimize = true;
+              break;
+            }
+            if (&*it == prim_compare) {
+              continue;
+            }
+            if (it->IsSnapshot() || it->IsUseType()) {
+              if (it->Uses(long_compare->output())) {
+                dead_uses.push_back(&*it);
+              }
+              continue;
+            }
+            if (!it->isReplayable() || it->Uses(long_compare->output())) {
+              can_optimize = false;
+              break;
+            }
+          }
+
+          const FrameState* frame = nullptr;
+          if (can_optimize) {
+            auto it = block.reverse_iterator_to(*long_compare);
+            while (++it != block.rend()) {
+              if (it->IsSnapshot()) {
+                frame = get_frame_state(*it);
+                break;
+              }
+            }
+          }
+
+          if (can_optimize && frame != nullptr) {
+            Instr* replacement = replaceLongComparePrimitiveCompare(
+                long_compare, prim_compare, *frame);
+            replacement->copyBytecodeOffset(instr);
+            prim_compare->ReplaceWith(*replacement);
+
+            long_compare->unlink();
+            delete long_compare;
+            delete prim_compare;
+
+            for (auto dead_use : dead_uses) {
+              dead_use->unlink();
+              delete dead_use;
+            }
+            continue;
+          }
+        }
+      }
+    }
+
     if (!truthy->IsIsTruthy() || truthy->block() != &block) {
       continue;
     }
 
     Instr* truthy_target = truthy->GetOperand(0)->instr();
     if (truthy_target->block() != &block ||
-        (!truthy_target->IsCompare() && !truthy_target->IsVectorCall())) {
+        (!truthy_target->IsCompare() && !truthy_target->IsLongCompare() &&
+         !truthy_target->IsVectorCall())) {
       continue;
     }
 
@@ -86,6 +172,10 @@ void DynamicComparisonElimination::Run(Function& irfunc) {
     Instr* replacement = nullptr;
     if (truthy_target->IsCompare()) {
       auto compare = static_cast<Compare*>(truthy_target);
+
+      replacement = replaceCompare(compare, static_cast<IsTruthy*>(truthy));
+    } else if (truthy_target->IsLongCompare()) {
+      auto compare = static_cast<LongCompare*>(truthy_target);
 
       replacement = replaceCompare(compare, static_cast<IsTruthy*>(truthy));
     }

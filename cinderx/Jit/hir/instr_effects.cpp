@@ -35,10 +35,14 @@ MemoryEffects memoryEffects(const Instr& inst) {
     case Opcode::kBuildInterpolation:
     case Opcode::kBuildTemplate:
     case Opcode::kCast:
+    case Opcode::kCheckedIntBinaryOp:
     case Opcode::kCIntToCBool:
     case Opcode::kDeopt:
     case Opcode::kDeoptPatchpoint:
+    case Opcode::kDoubleAbs:
     case Opcode::kDoubleBinaryOp:
+    case Opcode::kDoubleSqrt:
+    case Opcode::kLongUnboxCompact:
     case Opcode::kFloatCompare:
     case Opcode::kGetSecondOutput:
     case Opcode::kHintType:
@@ -46,6 +50,7 @@ MemoryEffects memoryEffects(const Instr& inst) {
     case Opcode::kIntBinaryOp:
     case Opcode::kIntConvert:
     case Opcode::kIsNegativeAndErrOccurred:
+    case Opcode::kListSlice:
     case Opcode::kLoadEvalBreaker:
     case Opcode::kLoadVarObjectSize:
     case Opcode::kLongCompare:
@@ -98,6 +103,8 @@ MemoryEffects memoryEffects(const Instr& inst) {
     case Opcode::kCheckSequenceBounds:
     case Opcode::kCheckVar:
     case Opcode::kGuard:
+    case Opcode::kGuardModuleAttrValue:
+    case Opcode::kGuardNonNegativeDouble:
     case Opcode::kGuardType:
       return commonEffects(inst, AEmpty);
 
@@ -121,6 +128,7 @@ MemoryEffects memoryEffects(const Instr& inst) {
     case Opcode::kDictUpdate:
     case Opcode::kDictSubscr:
     case Opcode::kEagerImportName:
+    case Opcode::kFillMethodCache:
     case Opcode::kFillTypeAttrCache:
     case Opcode::kFillTypeMethodCache:
     case Opcode::kFloatBinaryOp:
@@ -130,6 +138,7 @@ MemoryEffects memoryEffects(const Instr& inst) {
     case Opcode::kGetANext:
     case Opcode::kGetIter:
     case Opcode::kGetLength:
+    case Opcode::kGetLengthInt64:
     case Opcode::kImportFrom:
     case Opcode::kImportName:
     case Opcode::kInPlaceOp:
@@ -284,7 +293,11 @@ MemoryEffects memoryEffects(const Instr& inst) {
       // produce borrowed reference here to be consistent with
       // GetLoadMethodInstance's memory effects for simplicity
       return commonEffects(inst, AEmpty);
+    case Opcode::kLoadMethodCacheEntryValue:
+      return commonEffects(inst, AEmpty);
     case Opcode::kLoadTypeMethodCacheEntryType:
+      return borrowFrom(inst, ATypeMethodCache);
+    case Opcode::kLoadMethodCacheEntryType:
       return borrowFrom(inst, ATypeMethodCache);
 
     case Opcode::kReturn:
@@ -365,6 +378,8 @@ bool hasArbitraryExecution(const Instr& inst) {
     case Opcode::kCIntToCBool:
     case Opcode::kDeopt:
     case Opcode::kGuard:
+    case Opcode::kGuardModuleAttrValue:
+    case Opcode::kGuardNonNegativeDouble:
     case Opcode::kGuardType:
     case Opcode::kRaise:
     case Opcode::kRaiseAwaitableError:
@@ -384,11 +399,14 @@ bool hasArbitraryExecution(const Instr& inst) {
     case Opcode::kBuildInterpolation:
     case Opcode::kBuildTemplate:
     case Opcode::kCast:
+    case Opcode::kCheckedIntBinaryOp:
     case Opcode::kCondBranch:
     case Opcode::kCondBranchCheckType:
     case Opcode::kCondBranchIterNotDone:
     case Opcode::kDeoptPatchpoint:
+    case Opcode::kDoubleAbs:
     case Opcode::kDoubleBinaryOp:
+    case Opcode::kDoubleSqrt:
     case Opcode::kEndInlinedFunction:
     case Opcode::kFloatCompare:
     case Opcode::kGetSecondOutput:
@@ -400,8 +418,10 @@ bool hasArbitraryExecution(const Instr& inst) {
     case Opcode::kIntBinaryOp:
     case Opcode::kIntConvert:
     case Opcode::kIsNegativeAndErrOccurred:
+    case Opcode::kLongUnboxCompact:
     case Opcode::kListAppend:
     case Opcode::kListExtend:
+    case Opcode::kListSlice:
     case Opcode::kLoadArg:
     case Opcode::kLoadArrayItem:
     case Opcode::kLoadCellItem:
@@ -419,6 +439,8 @@ bool hasArbitraryExecution(const Instr& inst) {
     case Opcode::kLoadTypeAttrCacheEntryValue:
     case Opcode::kLoadTypeMethodCacheEntryType:
     case Opcode::kLoadTypeMethodCacheEntryValue:
+    case Opcode::kLoadMethodCacheEntryType:
+    case Opcode::kLoadMethodCacheEntryValue:
     case Opcode::kLoadVarObjectSize:
     case Opcode::kLongCompare:
     case Opcode::kMakeCell:
@@ -481,6 +503,7 @@ bool hasArbitraryExecution(const Instr& inst) {
     case Opcode::kEagerImportName:
     case Opcode::kFillTypeAttrCache:
     case Opcode::kFillTypeMethodCache:
+    case Opcode::kFillMethodCache:
     case Opcode::kFloatBinaryOp:
     case Opcode::kFormatValue:
     case Opcode::kFormatWithSpec:
@@ -488,6 +511,7 @@ bool hasArbitraryExecution(const Instr& inst) {
     case Opcode::kGetANext:
     case Opcode::kGetIter:
     case Opcode::kGetLength:
+    case Opcode::kGetLengthInt64:
     case Opcode::kGetTuple:
     case Opcode::kImportFrom:
     case Opcode::kImportName:

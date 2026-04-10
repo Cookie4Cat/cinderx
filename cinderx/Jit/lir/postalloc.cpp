@@ -990,11 +990,41 @@ class RegisterToMemoryMoves {
   }
 };
 
+bool isZeroingXorOnRegister(const Instruction* instr, PhyLocation reg) {
+  if (!instr->isXor() || !instr->output()->isNone() ||
+      instr->getNumInputs() != 2) {
+    return false;
+  }
+
+  auto lhs = instr->getInput(0);
+  auto rhs = instr->getInput(1);
+  return lhs->isReg() && rhs->isReg() && lhs->getPhyRegister() == reg &&
+      rhs->getPhyRegister() == reg;
+}
+
 // Replace memory input with register when possible within a basic block and
 // remove the unnecessary moves after the replacement.
 RewriteResult optimizeMoveSequence(BasicBlock* basicblock) {
   auto changed = kUnchanged;
   RegisterToMemoryMoves registerMemoryMoves;
+
+  auto isArgumentRegister = [](PhyLocation reg, bool is_fp) {
+    if (is_fp) {
+      for (auto arg_reg : FP_ARGUMENT_REGS) {
+        if (arg_reg == reg) {
+          return true;
+        }
+      }
+      return false;
+    }
+
+    for (auto arg_reg : ARGUMENT_REGS) {
+      if (arg_reg == reg) {
+        return true;
+      }
+    }
+    return false;
+  };
 
   for (auto instr_iter = basicblock->instructions().begin();
        instr_iter != basicblock->instructions().end();
@@ -1002,6 +1032,90 @@ RewriteResult optimizeMoveSequence(BasicBlock* basicblock) {
     auto& instr = *instr_iter;
     // TODO: do not optimize for yield for now. They need to be special cased.
     if (!instr->isAnyYield()) {
+      // Fold a very specific call-result copy chain:
+      //   Move tmp, <retreg>
+      //   Move <argreg>, tmp
+      // into:
+      //   Move <argreg>, <retreg>
+      //
+      // This targets hot call-lowering paths and avoids broader register-copy
+      // propagation side effects.
+      if (
+          instr->isMove() &&
+          instr_iter != basicblock->instructions().begin()) {
+        auto out = instr->output();
+        auto in = instr->getInput(0);
+
+        if (out->isReg() && in->isReg()) {
+          const bool is_fp = out->isFp();
+          PhyLocation out_reg = out->getPhyRegister();
+          if (isArgumentRegister(out_reg, is_fp)) {
+            auto ret_reg = is_fp ? arch::reg_double_return_loc
+                                 : arch::reg_general_return_loc;
+
+            // Find the defining Move tmp <- retreg for the current input.
+            // We can fold across nearby non-clobber instructions (for example
+            // Guard/metadata updates), but must stop once either tmp or retreg
+            // is overwritten, or once we cross a call.
+            bool found_chain = false;
+            auto chain_iter = instr_iter;
+            auto scan_iter = instr_iter;
+            const auto block_begin = basicblock->instructions().begin();
+            while (scan_iter != block_begin) {
+              --scan_iter;
+              auto scan = scan_iter->get();
+
+              if (scan->isCall() || scan->isVectorCall() || scan->isVarArgCall()) {
+                break;
+              }
+
+              auto scan_out = scan->output();
+              if (scan_out->isReg()) {
+                PhyLocation out_phy_reg = scan_out->getPhyRegister();
+                if (out_phy_reg == in->getPhyRegister()) {
+                  if (scan->isMove()) {
+                    auto scan_in = scan->getInput(0);
+                    if (scan_in->isReg() &&
+                        scan_in->getPhyRegister() == ret_reg) {
+                      found_chain = true;
+                      chain_iter = scan_iter;
+                    }
+                  }
+                  break;
+                }
+                if (out_phy_reg == ret_reg) {
+                  break;
+                }
+              }
+
+              if (isZeroingXorOnRegister(scan, in->getPhyRegister()) ||
+                  isZeroingXorOnRegister(scan, ret_reg)) {
+                break;
+              }
+            }
+
+            if (found_chain) {
+              auto opnd = static_cast<Operand*>(in);
+              auto data_type = opnd->dataType();
+              auto old_opnd = fmt::to_string(*opnd);
+              opnd->setPhyRegister(ret_reg);
+              JIT_CHECK(
+                  bitSize(data_type) == bitSize(opnd->dataType()),
+                  "Incorrectly changed data type from {} to {} in "
+                  "{}",
+                  old_opnd,
+                  *opnd,
+                  *instr);
+              changed = kChanged;
+
+              if (opnd->isLastUse()) {
+                basicblock->instructions().erase(chain_iter);
+              }
+            }
+          }
+        }
+      }
+
       auto out_reg = instr->output()->isReg()
           ? instr->output()->getPhyRegister()
           : PhyLocation::REG_INVALID;

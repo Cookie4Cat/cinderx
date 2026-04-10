@@ -1,4 +1,62 @@
+# Build outputs
 scratch
 cinderx.egg-info
 dist
+build
 
+# IDE and editor configurations
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+.DS_Store
+
+# Local Claude Code configuration
+.claude/
+
+# Python bytecode and cache (all paths)
+**/__pycache__/
+*.py[cod]
+*$py.class
+*.so
+*.dylib
+
+# CinderX specific build artifacts
+cinderx/PythonLib/cinderx/.dev_build
+cinderx/PythonLib/cinderx/opcode.py
+
+# Test and coverage
+.coverage/
+.pytest_cache/
+htmlcov/
+.tox/
+.hypothesis/
+
+# Virtual environments
+.venv/
+venv/
+env/
+ENV/
+
+# Documentation builds
+docs/_build/
+
+# Distribution
+*.egg
+*.egg-info/
+.eggs/
+MANIFEST
+
+# Profiling and performance
+*.prof
+*.lprof
+
+# Temporary files
+*.tmp
+*.bak
+*.log
+
+# Local development tools
+opencode.json
+uv.lock

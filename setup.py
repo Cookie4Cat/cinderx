@@ -11,11 +11,13 @@ import datetime
 import glob
 import os
 import os.path
+import platform
 import re
 import shutil
 import subprocess
 import sys
 import sysconfig
+import textwrap
 from enum import Enum
 from functools import lru_cache
 from typing import Callable
@@ -31,6 +33,27 @@ SOURCE_DIR = "cinderx"
 PYTHON_LIB_DIR = "cinderx/PythonLib"
 
 MIN_GCC_VERSION = 13
+GCC_PGO_AUDITED_TARGETS = {
+    "_cinderx": os.path.join("CMakeFiles", "_cinderx.dir"),
+    "borrowed": os.path.join("CMakeFiles", "borrowed.dir"),
+    "cached-properties": os.path.join("CMakeFiles", "cached-properties.dir"),
+    "common": os.path.join("CMakeFiles", "common.dir"),
+    "immortalize": os.path.join("CMakeFiles", "immortalize.dir"),
+    "interpreter": os.path.join("CMakeFiles", "interpreter.dir"),
+    "jit": os.path.join("CMakeFiles", "jit.dir"),
+    "parallel-gc": os.path.join("CMakeFiles", "parallel-gc.dir"),
+    "static-python": os.path.join("CMakeFiles", "static-python.dir"),
+}
+GCC_PGO_REQUIRED_TARGETS = {
+    "_cinderx": os.path.join("CMakeFiles", "_cinderx.dir"),
+    "interpreter": os.path.join("CMakeFiles", "interpreter.dir"),
+    "jit": os.path.join("CMakeFiles", "jit.dir"),
+}
+GCC_PGO_IGNORED_PROFILE_SUFFIXES = (
+    os.path.join("cinderx", "Jit", "codegen", "arch", "unknown.cpp.gcda"),
+    os.path.join("cinderx", "Jit", "codegen", "arch", "x86_64.cpp.gcda"),
+    os.path.join("generated", "dummy-parallel-gc.c.gcda"),
+)
 
 
 def compute_package_version() -> str:
@@ -133,15 +156,205 @@ def compute_py_version() -> str:
     return f"{sys.version_info.major}.{sys.version_info.minor}"
 
 
+def should_enable_adaptive_static_python(
+    py_version: str,
+    meta_python: bool,
+    machine: str | None = None,
+) -> bool:
+    if meta_python and py_version == "3.12":
+        return True
+
+    if machine is None:
+        machine = platform.machine()
+    machine = machine.lower()
+
+    return py_version == "3.14" and machine in {"aarch64", "arm64"}
+
+
+def should_enable_lightweight_frames(
+    py_version: str,
+    meta_python: bool,
+    machine: str | None = None,
+) -> bool:
+    if meta_python and py_version == "3.12":
+        return True
+
+    if machine is None:
+        machine = platform.machine()
+    machine = machine.lower()
+
+    # Stage A rollout:
+    # - keep existing meta 3.12 behavior
+    # - enable by default for OSS 3.14 ARM only
+    return py_version == "3.14" and machine in {"aarch64", "arm64"}
+
+
+def is_env_flag_enabled(var: str, default: bool = False) -> bool:
+    raw_value = os.environ.get(var)
+    if raw_value is None:
+        return default
+
+    value = raw_value.strip().lower()
+    if value in {"", "0", "false", "off", "no"}:
+        return False
+    if value in {"1", "true", "on", "yes"}:
+        return True
+
+    # Preserve historical behavior: any unknown non-empty value means enabled.
+    return True
+
+
+def validate_pgo_runtime(cinderx_module: object) -> None:
+    import_error_getter = getattr(cinderx_module, "get_import_error", None)
+    if not callable(import_error_getter):
+        raise RuntimeError(
+            "PGO workload validation failed: cinderx.get_import_error() is unavailable"
+        )
+
+    import_error = import_error_getter()
+    if import_error is not None:
+        raise RuntimeError(
+            "PGO workload validation failed: _cinderx failed to import: "
+            f"{import_error!r}"
+        )
+
+    is_initialized = getattr(cinderx_module, "is_initialized", None)
+    if not callable(is_initialized):
+        raise RuntimeError(
+            "PGO workload validation failed: cinderx.is_initialized() is unavailable"
+        )
+
+    if not is_initialized():
+        raise RuntimeError(
+            "PGO workload validation failed: cinderx imported but _cinderx did not initialize"
+        )
+
+
+def build_pgo_workload_command() -> list[str]:
+    workload_script = textwrap.dedent(
+        """
+        import sys
+
+        import cinderx
+        from setup import validate_pgo_runtime
+
+        validate_pgo_runtime(cinderx)
+        sys.argv.append("--pgo")
+
+        def main():
+            # This import must not be in the module body as it will start the tests
+            # running, and those using multiprocessing will fail because the initial
+            # process does not have "freeze support".
+            import test.__main__
+
+        if __name__ == "__main__":
+            main()
+        """
+    )
+    return [sys.executable, "-c", workload_script]
+
+
+def collect_gcc_pgo_profile_counts(
+    build_temp: str,
+    required_targets: dict[str, str] | None = None,
+) -> dict[str, int]:
+    required_targets = required_targets or GCC_PGO_REQUIRED_TARGETS
+    profile_counts = {}
+
+    for target, relative_dir in required_targets.items():
+        gcda_count = 0
+        target_dir = os.path.join(build_temp, relative_dir)
+        if os.path.isdir(target_dir):
+            for root, _dirs, files in os.walk(target_dir):
+                gcda_count += sum(1 for file_name in files if file_name.endswith(".gcda"))
+        profile_counts[target] = gcda_count
+
+    return profile_counts
+
+
+def collect_gcc_pgo_missing_profile_files(
+    build_temp: str,
+    audited_targets: dict[str, str] | None = None,
+) -> dict[str, list[str]]:
+    audited_targets = audited_targets or GCC_PGO_AUDITED_TARGETS
+    missing_profiles = {}
+
+    for target, relative_dir in audited_targets.items():
+        missing_target_profiles = []
+        target_dir = os.path.join(build_temp, relative_dir)
+        if os.path.isdir(target_dir):
+            for root, _dirs, files in os.walk(target_dir):
+                existing_files = set(files)
+                for file_name in files:
+                    if not file_name.endswith(".o"):
+                        continue
+                    expected_gcda = file_name[:-2] + ".gcda"
+                    if expected_gcda in existing_files:
+                        continue
+                    expected_gcda_path = os.path.join(root, expected_gcda)
+                    normalized_path = os.path.normpath(expected_gcda_path)
+                    if any(
+                        normalized_path.endswith(os.path.normpath(suffix))
+                        for suffix in GCC_PGO_IGNORED_PROFILE_SUFFIXES
+                    ):
+                        continue
+                    missing_target_profiles.append(expected_gcda_path)
+        if missing_target_profiles:
+            missing_profiles[target] = sorted(missing_target_profiles)
+
+    return missing_profiles
+
+
+def require_gcc_pgo_profiles(
+    build_temp: str,
+    profile_counts: dict[str, int],
+    required_targets: dict[str, str] | None = None,
+) -> None:
+    required_targets = required_targets or GCC_PGO_REQUIRED_TARGETS
+    audit_failures = []
+    missing_targets = []
+
+    for target, relative_dir in required_targets.items():
+        if profile_counts.get(target, 0) == 0:
+            target_dir = os.path.join(build_temp, relative_dir)
+            missing_targets.append(f"{target} ({target_dir})")
+
+    if missing_targets:
+        audit_failures.append(
+            "missing .gcda files for required targets: " + ", ".join(missing_targets)
+        )
+
+    if audit_failures:
+        raise RuntimeError("GCC PGO profile audit failed: " + " | ".join(audit_failures))
+
+
+def run_pgo_workload(workload_cmd: list[str], workload_args: dict[str, object]) -> None:
+    # CPython's --pgo test workload can fail intermittently; retry once to
+    # avoid aborting an otherwise healthy instrumented build on a flaky run.
+    max_attempts = 2
+    for attempt in range(1, max_attempts + 1):
+        try:
+            subprocess.run(workload_cmd, **workload_args)
+            return
+        except subprocess.CalledProcessError as exc:
+            if attempt == max_attempts:
+                raise
+            print(
+                "PGO workload failed "
+                f"(attempt {attempt}/{max_attempts}, exit={exc.returncode}); "
+                "retrying..."
+            )
+
+
 class BuildCommand(build):
     # Don't use the setuptools default under "build/" as this clashes with
     # "build/fbcode_builder/" (auto-added to the OSS view of CinderX).
     def initialize_options(self):
         build.initialize_options(self)
-        self.build_base = "scratch"
+        self.build_base = os.environ.get("CINDERX_BUILD_BASE", "scratch")
 
     def run(self) -> None:
-        enable_pgo = os.environ.get("CINDERX_ENABLE_PGO", None) is not None
+        enable_pgo = is_env_flag_enabled("CINDERX_ENABLE_PGO")
 
         if enable_pgo:
             self._run_with_pgo()
@@ -181,33 +394,14 @@ class BuildCommand(build):
 
         # Add build output to PYTHONPATH so workload can import cinderx
         cinderx_so_dir = os.path.join(os.getcwd(), self.build_lib)
-        if "PYTHONPATH" in workload_env:
-            workload_env["PYTHONPATH"] = (
-                f"{cinderx_so_dir}:{workload_env['PYTHONPATH']}"
-            )
-        else:
-            workload_env["PYTHONPATH"] = cinderx_so_dir
+        pythonpath_entries = [cinderx_so_dir, CHECKOUT_ROOT_DIR]
+        existing_pythonpath = workload_env.get("PYTHONPATH")
+        if existing_pythonpath:
+            pythonpath_entries.append(existing_pythonpath)
+        workload_env["PYTHONPATH"] = os.pathsep.join(pythonpath_entries)
 
-        # Uses the same default workload as CPython's PGO
-        workload_cmd = [
-            sys.executable,
-            "-c",
-            """
-import cinderx
-
-import sys
-sys.argv.append("--pgo")
-
-def main():
-    # This import must not be in the module body as it will start the tests
-    # running, and those using multiprocessing will fail because the initial
-    # doesn't have "freeze support".
-    import test.__main__
-
-if __name__ == "__main__":
-    main()
-            """,
-        ]
+        # Uses the same default workload as CPython's PGO.
+        workload_cmd = build_pgo_workload_command()
 
         print(f"Running workload with PYTHONPATH={workload_env['PYTHONPATH']}")
         workload_args = {
@@ -216,7 +410,7 @@ if __name__ == "__main__":
         }
         if is_clang:
             workload_args["cwd"] = clang_pgo_dir
-        subprocess.run(workload_cmd, **workload_args)
+        run_pgo_workload(workload_cmd, workload_args)
 
         if is_clang:
             print_section("PGO STAGE 2b: Merging profile data")
@@ -240,6 +434,33 @@ if __name__ == "__main__":
             ] + profraw_files
             subprocess.run(merge_cmd, check=True)
             print(f"Merged profile written to {clang_merged_profile}")
+        else:
+            print_section("PGO STAGE 2b: Auditing GCC profile data")
+            build_temp_dir = os.path.join(os.getcwd(), self.build_temp)
+            profile_counts = collect_gcc_pgo_profile_counts(
+                build_temp_dir,
+                GCC_PGO_AUDITED_TARGETS,
+            )
+            missing_profile_files = collect_gcc_pgo_missing_profile_files(
+                build_temp_dir,
+                GCC_PGO_AUDITED_TARGETS,
+            )
+            for target, count in profile_counts.items():
+                missing_count = len(missing_profile_files.get(target, []))
+                print(
+                    f"  {target}: found {count} .gcda files, "
+                    f"missing {missing_count} expected profiles"
+                )
+            if missing_profile_files:
+                missing_summary = ", ".join(
+                    f"{target}={len(file_paths)}"
+                    for target, file_paths in sorted(missing_profile_files.items())
+                )
+                print(
+                    "  Note: some per-object profiles are missing "
+                    f"({missing_summary}); GCC will use partial-training PGO."
+                )
+            require_gcc_pgo_profiles(build_temp_dir, profile_counts)
 
         print_section("PGO STAGE 3/3: Rebuilding with profile-guided optimizations")
 
@@ -317,11 +538,22 @@ class BuildPy(build_py):
 
         # Copy opcodes/${PY_VERSION}/opcode.py to cinderx/opcode.py.
         py_version = compute_py_version()
+        opcode_src = os.path.join(PYTHON_LIB_DIR, f"opcodes/{py_version}/opcode.py")
         out_path = self.get_module_outfile(self.build_lib, ["cinderx"], "opcode")
         os.makedirs(os.path.dirname(out_path), exist_ok=True)
         self.copy_file(
-            os.path.join(PYTHON_LIB_DIR, f"opcodes/{py_version}/opcode.py"),
+            opcode_src,
             out_path,
+            preserve_mode=False,
+        )
+
+        # Editable installs extend sys.path with the source tree rather than the
+        # temporary build output, so keep the generated opcode module alongside
+        # the package sources as well.
+        source_opcode_path = os.path.join(self.get_package_dir("cinderx"), "opcode.py")
+        self.copy_file(
+            opcode_src,
+            source_opcode_path,
             preserve_mode=False,
         )
 
@@ -330,7 +562,11 @@ class BuildPy(build_py):
         print(f"Writing .dev_build file to {dev_build_file}")
         with open(dev_build_file, "w") as f:
             f.write("\n")
-
+        # Copy .pth file to build_lib root for auto-import on Python startup
+        pth_source = os.path.join(PYTHON_LIB_DIR, "cinderx.pth")
+        pth_dest = os.path.join(self.build_lib, "cinderx.pth")
+        print(f"Copying .pth file to {pth_dest}")
+        self.copy_file(pth_source, pth_dest, preserve_mode=False)
 
 class CMakeExtension(Extension):
     """
@@ -397,8 +633,8 @@ class BuildExt(build_ext):
                 cmake_args.append(f"-DPGO_PROFILE_FILE={self.cinderx_pgo_profile_path}")
 
         # LTO configuration
-        enable_lto = os.environ.get("CINDERX_ENABLE_LTO", None)
-        if enable_lto is not None:
+        enable_lto = is_env_flag_enabled("CINDERX_ENABLE_LTO")
+        if enable_lto:
             cmake_args.append("-DENABLE_LTO=ON")
             print("Building with LTO enabled (full LTO)")
         else:
@@ -428,7 +664,15 @@ class BuildExt(build_ext):
         is_314plus = py_version == "3.14" or py_version == "3.15"
 
         set_option("META_PYTHON", meta_python)
-        set_option("ENABLE_ADAPTIVE_STATIC_PYTHON", meta_312)
+        enable_static_python = is_env_flag_enabled("ENABLE_STATIC_PYTHON", True)
+        set_option("ENABLE_STATIC_PYTHON", enable_static_python)
+        set_option(
+            "ENABLE_ADAPTIVE_STATIC_PYTHON",
+            enable_static_python
+            and should_enable_adaptive_static_python(py_version, meta_python),
+        )
+        if not enable_static_python:
+            options["ENABLE_ADAPTIVE_STATIC_PYTHON"] = "0"
         set_option("ENABLE_DISASSEMBLER", False)
         set_option("ENABLE_ELF_READER", linux)
         set_option("ENABLE_EVAL_HOOK", meta_312)
@@ -436,7 +680,10 @@ class BuildExt(build_ext):
         set_option("ENABLE_GENERATOR_AWAITER", meta_312)
         set_option("ENABLE_INTERPRETER_LOOP", meta_312 or is_314plus)
         set_option("ENABLE_LAZY_IMPORTS", meta_312)
-        set_option("ENABLE_LIGHTWEIGHT_FRAMES", meta_312)
+        set_option(
+            "ENABLE_LIGHTWEIGHT_FRAMES",
+            should_enable_lightweight_frames(py_version, meta_python),
+        )
         set_option("ENABLE_PARALLEL_GC", meta_312)
         set_option("ENABLE_PEP523_HOOK", meta_312 or is_314plus)
         set_option("ENABLE_PERF_TRAMPOLINE", meta_312)
@@ -446,12 +693,14 @@ class BuildExt(build_ext):
         for name, value in options.items():
             cmake_args.append(f"-D{name}={value}")
 
+        build_jobs = int(os.environ.get("CINDERX_BUILD_JOBS", os.cpu_count() or 1))
+
         build_args = [
             "--config",
             build_type,
             "--",
             "-j",
-            str(os.cpu_count() or 1),
+            str(build_jobs),
         ]
 
         # pyre-ignore[16]: No pyre types for build_ext.
@@ -459,6 +708,9 @@ class BuildExt(build_ext):
         self.spawn(["cmake", "--build", build_dir] + build_args)
 
     def _find_python(self) -> str:
+        override = os.environ.get("Python_ROOT_DIR")
+        if override:
+            return override
         # Normally this would use "data", but that goes to a temporary build directory
         # under uv.  Work off of the include directory instead.
         include_dir = sysconfig.get_path("include")

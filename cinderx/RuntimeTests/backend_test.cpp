@@ -18,6 +18,7 @@
 #include "cinderx/module_state.h"
 
 #include <regex>
+#include <limits>
 #include <sstream>
 
 #ifdef BUCK_BUILD
@@ -373,10 +374,7 @@ TEST_F(BackendTest, FPArithmetic) {
 }
 
 TEST_F(BackendTest, FPCompare) {
-  double a = 3.12;
-  double b = 1.1616;
-
-  auto test = [&](Instruction::Opcode opcode) -> double {
+  auto test = [&](double a, double b, Instruction::Opcode opcode) -> bool {
     auto lirfunc = std::make_unique<Function>();
     auto bb = lirfunc->allocateBasicBlock();
 
@@ -410,12 +408,31 @@ TEST_F(BackendTest, FPCompare) {
     return func();
   };
 
-  ASSERT_DOUBLE_EQ(test(Instruction::kEqual), a == b);
-  ASSERT_DOUBLE_EQ(test(Instruction::kNotEqual), a != b);
-  ASSERT_DOUBLE_EQ(test(Instruction::kGreaterThanUnsigned), a > b);
-  ASSERT_DOUBLE_EQ(test(Instruction::kLessThanUnsigned), a < b);
-  ASSERT_DOUBLE_EQ(test(Instruction::kGreaterThanEqualUnsigned), a >= b);
-  ASSERT_DOUBLE_EQ(test(Instruction::kLessThanEqualUnsigned), a <= b);
+  double a = 3.12;
+  double b = 1.1616;
+
+  ASSERT_EQ(test(a, b, Instruction::kEqual), a == b);
+  ASSERT_EQ(test(a, b, Instruction::kNotEqual), a != b);
+  ASSERT_EQ(test(a, b, Instruction::kGreaterThanUnsigned), a > b);
+  ASSERT_EQ(test(a, b, Instruction::kLessThanUnsigned), a < b);
+  ASSERT_EQ(test(a, b, Instruction::kGreaterThanEqualUnsigned), a >= b);
+  ASSERT_EQ(test(a, b, Instruction::kLessThanEqualUnsigned), a <= b);
+
+  double nan = std::numeric_limits<double>::quiet_NaN();
+
+  ASSERT_EQ(test(nan, b, Instruction::kEqual), nan == b);
+  ASSERT_EQ(test(nan, b, Instruction::kNotEqual), nan != b);
+  ASSERT_EQ(test(nan, b, Instruction::kGreaterThanUnsigned), nan > b);
+  ASSERT_EQ(test(nan, b, Instruction::kLessThanUnsigned), nan < b);
+  ASSERT_EQ(test(nan, b, Instruction::kGreaterThanEqualUnsigned), nan >= b);
+  ASSERT_EQ(test(nan, b, Instruction::kLessThanEqualUnsigned), nan <= b);
+
+  ASSERT_EQ(test(a, nan, Instruction::kEqual), a == nan);
+  ASSERT_EQ(test(a, nan, Instruction::kNotEqual), a != nan);
+  ASSERT_EQ(test(a, nan, Instruction::kGreaterThanUnsigned), a > nan);
+  ASSERT_EQ(test(a, nan, Instruction::kLessThanUnsigned), a < nan);
+  ASSERT_EQ(test(a, nan, Instruction::kGreaterThanEqualUnsigned), a >= nan);
+  ASSERT_EQ(test(a, nan, Instruction::kLessThanEqualUnsigned), a <= nan);
 }
 
 namespace {

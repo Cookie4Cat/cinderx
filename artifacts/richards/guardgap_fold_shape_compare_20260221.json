@@ -1,0 +1,57 @@
+{
+  "benchmark_shape": "sqrt_then_pow_duplicate_arg_chain",
+  "source": "cinderx/PythonLib/test_cinderx/test_arm_runtime.py::test_aarch64_duplicate_call_result_arg_chain_is_compact",
+  "before_commit": "18d9c4d5",
+  "after_commit": "c7330521",
+  "rows": [
+    {
+      "n_calls": 1,
+      "before_size": 1080,
+      "after_size": 1072,
+      "delta_bytes": -8,
+      "delta_pct": -0.7407407407407408
+    },
+    {
+      "n_calls": 2,
+      "before_size": 1776,
+      "after_size": 1760,
+      "delta_bytes": -16,
+      "delta_pct": -0.9009009009009009
+    },
+    {
+      "n_calls": 4,
+      "before_size": 3136,
+      "after_size": 3104,
+      "delta_bytes": -32,
+      "delta_pct": -1.0204081632653061
+    },
+    {
+      "n_calls": 8,
+      "before_size": 5904,
+      "after_size": 5840,
+      "delta_bytes": -64,
+      "delta_pct": -1.084010840108401
+    },
+    {
+      "n_calls": 16,
+      "before_size": 11440,
+      "after_size": 11312,
+      "delta_bytes": -128,
+      "delta_pct": -1.118881118881119
+    },
+    {
+      "n_calls": 32,
+      "before_size": 22512,
+      "after_size": 22256,
+      "delta_bytes": -256,
+      "delta_pct": -1.1371712864250179
+    },
+    {
+      "n_calls": 64,
+      "before_size": 44656,
+      "after_size": 44144,
+      "delta_bytes": -512,
+      "delta_pct": -1.146542457900394
+    }
+  ]
+}

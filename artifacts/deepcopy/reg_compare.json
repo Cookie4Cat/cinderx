@@ -1,0 +1,163 @@
+{
+  "rows": [
+    {
+      "name": "chaos",
+      "base_median": 0.09174307050034258,
+      "current_median": 0.09223197599931154,
+      "delta_pct": 0.532907277141037
+    },
+    {
+      "name": "comprehensions",
+      "base_median": 4.8193000111496076e-05,
+      "current_median": 5.267849974188721e-05,
+      "delta_pct": 9.307367501532958
+    },
+    {
+      "name": "coroutines",
+      "base_median": 0.051175782999962394,
+      "current_median": 0.048330720500416646,
+      "delta_pct": -5.559392221801152
+    },
+    {
+      "name": "coverage",
+      "base_median": 0.12373676949982837,
+      "current_median": 0.1132633844999873,
+      "delta_pct": -8.464246353106542
+    },
+    {
+      "name": "deltablue",
+      "base_median": 0.005088131499633164,
+      "current_median": 0.005060334000518196,
+      "delta_pct": -0.5463203755046719
+    },
+    {
+      "name": "fannkuch",
+      "base_median": 0.594647066500329,
+      "current_median": 0.5899588615011453,
+      "delta_pct": -0.788401265775196
+    },
+    {
+      "name": "float",
+      "base_median": 0.10007704850067967,
+      "current_median": 0.10075611100091919,
+      "delta_pct": 0.6785396955775624
+    },
+    {
+      "name": "generators",
+      "base_median": 0.056231011998988834,
+      "current_median": 0.05546055099966907,
+      "delta_pct": -1.37017096426012
+    },
+    {
+      "name": "go",
+      "base_median": 0.14940247949971308,
+      "current_median": 0.14748207750108122,
+      "delta_pct": -1.2853883048410508
+    },
+    {
+      "name": "logging_format",
+      "base_median": 2.551284997025505e-05,
+      "current_median": 2.5889799962897088e-05,
+      "delta_pct": 1.4774907275412863
+    },
+    {
+      "name": "logging_silent",
+      "base_median": 1.0271000064676627e-06,
+      "current_median": 1.5605998669343534e-06,
+      "delta_pct": 51.94234807781471
+    },
+    {
+      "name": "logging_simple",
+      "base_median": 2.0120900035180967e-05,
+      "current_median": 2.014345000134199e-05,
+      "delta_pct": 0.11207235323267284
+    },
+    {
+      "name": "nbody",
+      "base_median": 0.16236468549959682,
+      "current_median": 0.16163831149970065,
+      "delta_pct": -0.44737191320952663
+    },
+    {
+      "name": "nqueens",
+      "base_median": 0.1797587725000085,
+      "current_median": 0.17732583999986673,
+      "delta_pct": -1.3534429871241205
+    },
+    {
+      "name": "raytrace",
+      "base_median": 0.4441591149998203,
+      "current_median": 0.45236995150025905,
+      "delta_pct": 1.8486250136827698
+    },
+    {
+      "name": "richards",
+      "base_median": 0.06251148849969468,
+      "current_median": 0.06481200950111088,
+      "delta_pct": 3.680157130520789
+    },
+    {
+      "name": "richards_super",
+      "base_median": 0.07132368949942247,
+      "current_median": 0.0714104184989992,
+      "delta_pct": 0.12159914915428338
+    },
+    {
+      "name": "scimark_fft",
+      "base_median": 0.5587031915001717,
+      "current_median": 0.5567326330010474,
+      "delta_pct": -0.35270220916998607
+    },
+    {
+      "name": "scimark_lu",
+      "base_median": 0.18543215000045166,
+      "current_median": 0.19045966250087076,
+      "delta_pct": 2.711241012093568
+    },
+    {
+      "name": "scimark_monte_carlo",
+      "base_median": 0.10222015550016295,
+      "current_median": 0.09873592749954696,
+      "delta_pct": -3.408552827539413
+    },
+    {
+      "name": "scimark_sor",
+      "base_median": 0.19489340249992892,
+      "current_median": 0.1919993869996688,
+      "delta_pct": -1.4849222514144333
+    },
+    {
+      "name": "scimark_sparse_mat_mult",
+      "base_median": 0.008508919999712816,
+      "current_median": 0.00855796199903125,
+      "delta_pct": 0.5763598590665886
+    },
+    {
+      "name": "spectral_norm",
+      "base_median": 0.19452976200045669,
+      "current_median": 0.1951778970005762,
+      "delta_pct": 0.33318037993486094
+    },
+    {
+      "name": "unpack_sequence",
+      "base_median": 1.228337498559995e-07,
+      "current_median": 1.2554500017358805e-07,
+      "delta_pct": 2.2072519326056694
+    }
+  ],
+  "warn_threshold_pct": 5.0,
+  "regressions": [
+    {
+      "name": "comprehensions",
+      "base_median": 4.8193000111496076e-05,
+      "current_median": 5.267849974188721e-05,
+      "delta_pct": 9.307367501532958
+    },
+    {
+      "name": "logging_silent",
+      "base_median": 1.0271000064676627e-06,
+      "current_median": 1.5605998669343534e-06,
+      "delta_pct": 51.94234807781471
+    }
+  ]
+}

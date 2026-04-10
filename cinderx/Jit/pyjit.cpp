@@ -189,6 +189,10 @@ PyObject* forcedJitVectorcall(
   return interp_entry(func_obj, stack, nargsf, kwnames);
 }
 
+// Exposed to the interpreter loop (C code) so it can check whether a function
+// is pending JIT compilation without pulling in C++ headers.
+extern "C" vectorcallfunc Ci_jit_vectorcall = nullptr;
+
 // Python function entry point when the JIT is enabled.
 PyObject* jitVectorcall(
     PyObject* func_obj,
@@ -3597,6 +3601,7 @@ int initialize() {
   }
 
   getMutableConfig().state = State::kRunning;
+  ::Ci_jit_vectorcall = reinterpret_cast<vectorcallfunc>(jitVectorcall);
 
   mod_state->jit_list = std::move(jit_list);
 
@@ -3624,6 +3629,7 @@ void finalize() {
   // Disable the JIT first so nothing we do in here ends up attempting to
   // invoke the JIT while we're finalizing our data structures.
   getMutableConfig().state = State::kFinalizing;
+  ::Ci_jit_vectorcall = nullptr;
 
   // Deopt all JIT generators, since JIT generators reference code and other
   // metadata that we will be freeing later in this function.

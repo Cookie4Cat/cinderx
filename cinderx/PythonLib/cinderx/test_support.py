@@ -43,9 +43,14 @@ def subprocess_env() -> dict[str, str]:
     # library is generated on a per-version basis and ends up being thrown into cinderx
     # at build time. When we run tests with sys.path we can end up with PythonLib on the
     # path first and we can pick up the version which doesn't have it injected.
-    return {
+    env = {
         "PYTHONPATH": CINDERX_PATH + os.path.pathsep + os.path.pathsep.join(sys.path)
     }
+    for key in ("LD_LIBRARY_PATH", "PATH", "HOME", "TMPDIR", "TEMP", "TMP"):
+        value = os.environ.get(key)
+        if value:
+            env[key] = value
+    return env
 
 
 def get_cinderjit_xargs() -> list[str]:

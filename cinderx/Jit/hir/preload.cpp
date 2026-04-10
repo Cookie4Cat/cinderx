@@ -2,6 +2,7 @@
 
 #include "cinderx/Jit/hir/preload.h"
 
+#include "cinderx/Common/code.h"
 #include "cinderx/Common/dict.h"
 #include "cinderx/Common/extra-py-flags.h"
 #include "cinderx/Common/util.h"
@@ -10,13 +11,182 @@
 #include "cinderx/StaticPython/classloader.h"
 #include "cinderx/StaticPython/strictmoduleobject.h"
 #include "cinderx/StaticPython/vtable_builder.h"
+#include "cinderx/UpstreamBorrow/borrowed.h"
 #include "cinderx/module_state.h"
 
+#include <cstring>
+#include <cctype>
+#include <string_view>
 #include <utility>
 
 namespace jit::hir {
 
 namespace {
+
+static std::optional<OwnedType> infer_method_self_type_candidate(
+    BorrowedRef<PyCodeObject> code,
+    BorrowedRef<PyDictObject> globals) {
+  if (code->co_argcount < 1 || !PyUnicode_CheckExact(code->co_qualname)) {
+    return std::nullopt;
+  }
+
+  BorrowedRef<> arg0_name_obj{jit::getVarname(code, 0)};
+  if (!PyUnicode_CheckExact(arg0_name_obj)) {
+    return std::nullopt;
+  }
+  const char* arg0_name = PyUnicode_AsUTF8(arg0_name_obj);
+  if (arg0_name == nullptr || std::strcmp(arg0_name, "self") != 0) {
+    PyErr_Clear();
+    return std::nullopt;
+  }
+
+  const char* qualname = PyUnicode_AsUTF8(code->co_qualname);
+  if (qualname == nullptr) {
+    PyErr_Clear();
+    return std::nullopt;
+  }
+  std::string_view qualname_view{qualname};
+  std::size_t dot = qualname_view.find('.');
+  if (
+      dot == std::string_view::npos || dot == 0 ||
+      qualname_view.rfind('.') != dot ||
+      qualname_view.find('<') != std::string_view::npos) {
+    return std::nullopt;
+  }
+
+  std::string owner_name{qualname_view.substr(0, dot)};
+  BorrowedRef<> owner_obj{PyDict_GetItemString(globals, owner_name.c_str())};
+  if (owner_obj == nullptr || !PyType_Check(owner_obj)) {
+    return std::nullopt;
+  }
+  auto owner_type = reinterpret_cast<PyTypeObject*>(owner_obj.get());
+
+  PyObject* subclasses = reinterpret_cast<PyObject*>(owner_type->tp_subclasses);
+#if PY_VERSION_HEX >= 0x030C0000
+  if (owner_type->tp_flags & _Py_TPFLAGS_STATIC_BUILTIN) {
+    PyInterpreterState* interp = PyInterpreterState_Get();
+    if (interp == nullptr) {
+      PyErr_Clear();
+      return std::nullopt;
+    }
+    managed_static_type_state* state =
+        Cix_PyStaticType_GetState(interp, owner_type);
+    if (state == nullptr) {
+      return std::nullopt;
+    }
+    subclasses = state->tp_subclasses;
+  }
+#endif
+  if (subclasses != nullptr) {
+    if (!PyDict_Check(subclasses) || PyDict_Size(subclasses) != 0) {
+      return std::nullopt;
+    }
+  }
+
+  return OwnedType{
+      Ref<PyTypeObject>::create(owner_type),
+      false,
+      true};
+}
+
+static bool is_named_other_arg(BorrowedRef<PyCodeObject> code, int arg_idx) {
+  BorrowedRef<> arg_name_obj{jit::getVarname(code, arg_idx)};
+  if (!PyUnicode_CheckExact(arg_name_obj)) {
+    return false;
+  }
+  const char* arg_name = PyUnicode_AsUTF8(arg_name_obj);
+  if (arg_name == nullptr) {
+    PyErr_Clear();
+    return false;
+  }
+  return std::strcmp(arg_name, "other") == 0;
+}
+
+static bool is_direct_arg_load(const BytecodeInstruction& bc_instr, int arg_idx) {
+  switch (bc_instr.opcode()) {
+    case LOAD_FAST:
+    case LOAD_FAST_BORROW:
+    case LOAD_FAST_CHECK:
+      return bc_instr.oparg() == arg_idx;
+    default:
+      return false;
+  }
+}
+
+static bool is_direct_local_load(const BytecodeInstruction& bc_instr) {
+  switch (bc_instr.opcode()) {
+    case LOAD_FAST:
+    case LOAD_FAST_BORROW:
+    case LOAD_FAST_CHECK:
+      return true;
+    default:
+      return false;
+  }
+}
+
+static bool arg_is_only_used_for_plain_attr_reads(
+    BorrowedRef<PyCodeObject> code,
+    int arg_idx) {
+  std::vector<BytecodeInstruction> body;
+  for (auto bc_instr : BytecodeInstructionBlock{code}) {
+    if (bc_instr.opcode() == RESUME) {
+      continue;
+    }
+    body.push_back(bc_instr);
+  }
+
+  bool saw_arg_use = false;
+  for (size_t i = 0; i < body.size(); i++) {
+    if (!is_direct_arg_load(body[i], arg_idx)) {
+      continue;
+    }
+    saw_arg_use = true;
+    if (i + 1 >= body.size()) {
+      return false;
+    }
+    const auto& next = body[i + 1];
+    if (next.opcode() != LOAD_ATTR) {
+      return false;
+    }
+#if PY_VERSION_HEX >= 0x030C0000
+    if ((next.oparg() & 1) != 0) {
+      return false;
+    }
+#endif
+  }
+  return saw_arg_use;
+}
+
+static bool has_local_method_style_load_attr(BorrowedRef<PyCodeObject> code) {
+  std::vector<BytecodeInstruction> body;
+  for (auto bc_instr : BytecodeInstructionBlock{code}) {
+    if (bc_instr.opcode() == RESUME) {
+      continue;
+    }
+    body.push_back(bc_instr);
+  }
+
+  for (size_t i = 0; i < body.size(); i++) {
+    const auto& bc_instr = body[i];
+    if (bc_instr.opcode() != LOAD_ATTR) {
+      continue;
+    }
+#if PY_VERSION_HEX >= 0x030C0000
+    if ((bc_instr.oparg() & 1) == 0) {
+      continue;
+    }
+#else
+    continue;
+#endif
+    if (i == 0) {
+      continue;
+    }
+    if (is_direct_local_load(body[i - 1])) {
+      return true;
+    }
+  }
+  return false;
+}
 
 static OwnedType resolve_type_descr(BorrowedRef<> descr) {
   int optional, exact;
@@ -259,6 +429,21 @@ Type Preloader::checkArgType(long local_idx) const {
   return map_get(check_arg_types_, local_idx, TObject);
 }
 
+std::optional<Type> Preloader::inferredSelfType() const {
+  if (!inferred_self_type_) {
+    return std::nullopt;
+  }
+  return inferred_self_type_->toHir();
+}
+
+std::optional<Type> Preloader::inferredArgType(long local_idx) const {
+  auto it = inferred_arg_types_.find(local_idx);
+  if (it == inferred_arg_types_.end()) {
+    return std::nullopt;
+  }
+  return it->second.toHir();
+}
+
 PyObject** Preloader::getGlobalCache(BorrowedRef<> name_obj) const {
   JIT_DCHECK(
       canCacheGlobals(),
@@ -293,6 +478,8 @@ std::unique_ptr<Function> Preloader::makeFunction() const {
   irfunc->return_type = return_type_;
   irfunc->has_primitive_args = has_primitive_args_;
   irfunc->has_primitive_first_arg = has_primitive_first_arg_;
+  irfunc->inferred_self_type = inferredSelfType();
+  irfunc->allow_aggressive_split_dict_loads = allowAggressiveSplitDictLoads();
   for (auto& [local, preloaded_type] : check_arg_pytypes_) {
     irfunc->typed_args.emplace_back(
         local,
@@ -312,6 +499,25 @@ bool Preloader::preload() {
   bool is_static = code_->co_flags & CI_CO_STATICALLY_COMPILED;
   if (is_static && !preloadStatic()) {
     return false;
+  }
+
+  inferred_self_type_ = infer_method_self_type_candidate(code_, globals_);
+  allow_aggressive_split_dict_loads_ = !has_local_method_style_load_attr(code_);
+  if (inferred_self_type_.has_value()) {
+    for (int arg_idx = 1; arg_idx < numArgs(); arg_idx++) {
+      if (!is_named_other_arg(code_, arg_idx)) {
+        continue;
+      }
+      if (!arg_is_only_used_for_plain_attr_reads(code_, arg_idx)) {
+        continue;
+      }
+      inferred_arg_types_.emplace(
+          arg_idx,
+          OwnedType{
+              Ref<PyTypeObject>::create(inferred_self_type_->type),
+              inferred_self_type_->optional,
+              inferred_self_type_->exact});
+    }
   }
 
   jit::BytecodeInstructionBlock bc_instrs{code_};

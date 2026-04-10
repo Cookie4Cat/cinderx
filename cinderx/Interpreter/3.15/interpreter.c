@@ -6,6 +6,7 @@
 
 #include "cinderx/UpstreamBorrow/borrowed.h"
 #include "cinderx/Interpreter/cinder_opcode.h"
+#include "cinderx/Interpreter/interpreter.h"
 
 #include "cinderx/module_c_state.h"
 
@@ -446,16 +447,23 @@ Py_ssize_t load_method_static_cached_oparg_slot(int oparg) {
 
 #define CI_UPDATE_CALL_COUNT                                                 \
   do {                                                                       \
-    PyObject* executable = PyStackRef_AsPyObjectBorrow(frame->f_executable); \
-    if (PyCode_Check(executable)) {                                          \
-      PyCodeObject* code = (PyCodeObject*)executable;                        \
-      if (!(code->co_flags & CO_NO_MONITORING_EVENTS)) {                     \
-        CodeExtra* extra = codeExtra(code);                                  \
-        if (extra == NULL) {                                                 \
-          adaptive_enabled = false;                                          \
-        } else {                                                             \
-          Ci_code_extra_incr_calls(extra);                                   \
-          adaptive_enabled = is_adaptive_enabled(extra);                     \
+    if (Ci_jit_vectorcall != NULL) {                                         \
+      PyObject* fobj = PyStackRef_AsPyObjectBorrow(frame->f_funcobj);        \
+      if (PyFunction_Check(fobj) &&                                          \
+          ((PyFunctionObject*)fobj)->vectorcall == Ci_jit_vectorcall) {      \
+        PyObject* executable =                                               \
+            PyStackRef_AsPyObjectBorrow(frame->f_executable);                \
+        if (PyCode_Check(executable)) {                                      \
+          PyCodeObject* code = (PyCodeObject*)executable;                    \
+          if (!(code->co_flags & CO_NO_MONITORING_EVENTS)) {                 \
+            CodeExtra* extra = codeExtra(code);                              \
+            if (extra == NULL) {                                             \
+              adaptive_enabled = false;                                      \
+            } else {                                                         \
+              Ci_code_extra_incr_calls(extra);                               \
+              adaptive_enabled = is_adaptive_enabled(extra);                 \
+            }                                                                \
+          }                                                                  \
         }                                                                    \
       }                                                                      \
     }                                                                        \

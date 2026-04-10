@@ -11,6 +11,14 @@
 #include <unordered_map>
 #include <unordered_set>
 
+namespace jit {
+namespace optimizer {
+struct DataFlowBlock;
+template <typename T>
+class DataFlowAnalyzer;
+} // namespace optimizer
+} // namespace jit
+
 namespace jit::hir {
 
 class BasicBlock;

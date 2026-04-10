@@ -109,6 +109,8 @@ enum OperandSizeType {
   X(Fsub, true, FlagEffects::kNone, kAlways64, 1, {1, 1})                     \
   X(Fmul, false, FlagEffects::kNone, kAlways64, 1, {1, 1})                    \
   X(Fdiv, true, FlagEffects::kNone, kAlways64, 1, {1, 1})                     \
+  X(Fabs, false, FlagEffects::kNone, kAlways64, 1, {1})                       \
+  X(Fsqrt, false, FlagEffects::kNone, kAlways64, 1, {1})                      \
   X(LShift, false, FlagEffects::kSet)                                         \
   X(RShift, false, FlagEffects::kSet)                                         \
   X(RShiftUn, false, FlagEffects::kSet)                                       \
@@ -435,6 +437,7 @@ class Instruction {
 // Kind of condition that a Guard instruction will execute.
 enum InstrGuardKind {
   kAlwaysFail,
+  kCompactLong,
   kHasType,
   kIs,
   kNotNegative,

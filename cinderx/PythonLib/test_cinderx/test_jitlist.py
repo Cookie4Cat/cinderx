@@ -257,6 +257,74 @@ class JitListTest(unittest.TestCase):
                 jit_list_file.flush()
                 cinderx.jit.read_jit_list(jit_list_file.name)
 
+    def test_read_jit_list_trims_crlf_and_trailing_whitespace(self) -> None:
+        def victim() -> None:
+            pass
+
+        entry = f"{victim.__module__}:{victim.__qualname__}".replace("victim", "func")
+        payload = f"   # comment with leading spaces\r\n\r\n{entry}   \r\n".encode(
+            ENCODING
+        )
+
+        with tempfile.TemporaryDirectory() as tmp:
+            jit_list_path = Path(tmp) / "jitlist.txt"
+            jit_list_path.write_bytes(payload)
+            cinderx.jit.read_jit_list(str(jit_list_path))
+
+        def func() -> int:
+            return 71
+
+        def func_nojit() -> int:
+            return 99
+
+        entries = cinderx.jit.get_jit_list()[0]
+        self.assertIn(func.__module__, entries)
+        self.assertIn(func.__qualname__, entries[func.__module__])
+        self.assertNotIn(func_nojit.__qualname__, entries[func.__module__])
+
+        self.assertEqual(func(), 71)
+        self.assertTrue(cinderx.jit.is_jit_compiled(func))
+        self.assertEqual(func_nojit(), 99)
+        self.assertFalse(cinderx.jit.is_jit_compiled(func_nojit))
+
+    def test_startup_jit_list_file_trims_crlf_and_trailing_whitespace(self) -> None:
+        code = textwrap.dedent(
+            """
+            import cinderx.jit
+
+            def func():
+                return 35
+
+            def func_nojit():
+                return 47
+
+            print(func())
+            print(cinderx.jit.is_jit_compiled(func))
+            print(func_nojit())
+            print(cinderx.jit.is_jit_compiled(func_nojit))
+            """
+        )
+
+        with tempfile.TemporaryDirectory() as tmp:
+            dirpath = Path(tmp)
+            codepath = dirpath / "mod.py"
+            jitlistpath = dirpath / "jitlist.txt"
+            codepath.write_text(code)
+            jitlistpath.write_bytes(b"  # comment\r\n__main__:func   \r\n")
+
+            env = subprocess_env()
+            env["PYTHONJITLISTFILE"] = str(jitlistpath)
+            proc = subprocess.run(
+                [sys.executable, "mod.py"],
+                capture_output=True,
+                cwd=tmp,
+                encoding=ENCODING,
+                env=env,
+            )
+
+        self.assertEqual(proc.returncode, 0, proc)
+        self.assertEqual(proc.stdout.strip().splitlines(), ["35", "True", "47", "False"])
+
     def test_precompile_all_bad_args(self) -> None:
         with self.assertRaises(ValueError):
             cinderx.jit.precompile_all(workers=-1)

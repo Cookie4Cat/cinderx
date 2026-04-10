@@ -10,6 +10,8 @@
 #include "internal/pycore_intrinsics.h"
 #endif
 
+#include "internal/pycore_long.h"
+
 #if PY_VERSION_HEX >= 0x030D0000
 #include "internal/pycore_setobject.h"
 #endif
@@ -127,6 +129,13 @@ int bytes_from_cint_type(Type type) {
   // NOTREACHED
 }
 
+BorrowedRef<PyDictObject> getKnownModuleDict(BorrowedRef<> obj) {
+  if (PyModule_Check(obj)) {
+    return reinterpret_cast<PyModuleObject*>(obj.get())->md_dict;
+  }
+  return nullptr;
+}
+
 #define FOREACH_FAST_BUILTIN(V) \
   V(Long)                       \
   V(List)                       \
@@ -205,6 +214,9 @@ LIRGenerator::LIRGenerator(
     const jit::hir::Function* func,
     jit::codegen::Environ* env)
     : func_(func), env_(env) {
+  for (int i = 0, n = func->env.numLoadMethodCaches(); i < n; i++) {
+    load_method_caches_.emplace_back(getContext()->allocateLoadMethodCache());
+  }
   for (int i = 0, n = func->env.numLoadTypeAttrCaches(); i < n; i++) {
     load_type_attr_caches_.emplace_back(
         getContext()->allocateLoadTypeAttrCache());
@@ -377,6 +389,35 @@ bool LIRGenerator::TranslateSpecializedCall(
   // will not have their vectorcall entry points modified by the JIT, so it
   // always makes sense to load them at JIT-time and burn them directly into
   // code.
+  if (type == &PyMethodDescr_Type) {
+    auto* method = reinterpret_cast<PyMethodDescrObject*>(callee);
+    if ((hir_instr.flags() & CallFlags::Static) &&
+        method->d_method->ml_flags == METH_FASTCALL &&
+        hir_instr.numArgs() == 2) {
+      bbb.appendCallInstruction(
+          hir_instr.output(),
+          JITRT_CallMethodDescrFast1,
+          hir_instr.func(),
+          hir_instr.arg(0),
+          hir_instr.arg(1));
+      return true;
+    }
+    return false;
+  }
+
+  if (type == &PyFunction_Type) {
+    Instruction* instr = bbb.appendInstr(
+        hir_instr.output(),
+        Instruction::kVectorCall,
+        Imm{reinterpret_cast<uint64_t>(JITRT_VectorcallExactPyFunc)},
+        Imm{0});
+    for (hir::Register* arg : hir_instr.GetOperands()) {
+      instr->addOperands(VReg{bbb.getDefInstr(arg)});
+    }
+    instr->addOperands(Imm{0});
+    return true;
+  }
+
   if (type != &PyCFunction_Type) {
     return false;
   }
@@ -514,6 +555,12 @@ void LIRGenerator::MakeDecref(
     [[maybe_unused]] std::optional<destructor> destructor,
     bool xdecref,
     [[maybe_unused]] bool possible_immortal) {
+  if (func_->code->co_flags & kCoFlagsAnyGenerator) {
+    auto helper = xdecref ? JITRT_XDecref : JITRT_Decref;
+    bbb.appendInvokeInstruction(helper, instr);
+    return;
+  }
+
   auto end_decref = bbb.allocateBlock();
   if (xdecref) {
     auto cont = bbb.allocateBlock();
@@ -961,6 +1008,16 @@ LIRGenerator::TranslatedBlock LIRGenerator::TranslateOneBasicBlock(
         bbb.appendInstr(instr->output(), op, instr->left(), instr->right());
         break;
       }
+      case Opcode::kDoubleSqrt: {
+        auto instr = static_cast<const DoubleSqrt*>(&i);
+        bbb.appendInstr(instr->output(), Instruction::kFsqrt, instr->GetOperand(0));
+        break;
+      }
+      case Opcode::kDoubleAbs: {
+        auto instr = static_cast<const DoubleAbs*>(&i);
+        bbb.appendInstr(instr->output(), Instruction::kFabs, instr->GetOperand(0));
+        break;
+      }
       case Opcode::kPrimitiveCompare: {
         auto instr = static_cast<const PrimitiveCompare*>(&i);
         Instruction::Opcode op;
@@ -999,6 +1056,28 @@ LIRGenerator::TranslatedBlock LIRGenerator::TranslateOneBasicBlock(
             JIT_ABORT("Not implemented {}", static_cast<int>(instr->op()));
         }
         bbb.appendInstr(instr->output(), op, instr->left(), instr->right());
+        break;
+      }
+      case Opcode::kCheckedIntBinaryOp: {
+        auto instr = static_cast<const CheckedIntBinaryOp*>(&i);
+        Instruction::Opcode op;
+        switch (instr->op()) {
+          case BinaryOpKind::kAdd:
+            op = Instruction::kAdd;
+            break;
+          case BinaryOpKind::kSubtract:
+            op = Instruction::kSub;
+            break;
+          default:
+            JIT_ABORT("Unsupported checked int binary op {}", (int)instr->op());
+        }
+        bbb.appendInstr(instr->output(), op, instr->left(), instr->right());
+        auto done_block = bbb.allocateBlock();
+        auto deopt_block = bbb.allocateBlock();
+        bbb.appendBranch(Instruction::kBranchNO, done_block);
+        bbb.appendBlock(deopt_block);
+        appendGuardAlwaysFail(bbb, *instr);
+        bbb.switchBlock(done_block);
         break;
       }
       case Opcode::kPrimitiveBoxBool: {
@@ -1390,6 +1469,27 @@ LIRGenerator::TranslatedBlock LIRGenerator::TranslateOneBasicBlock(
             name);
         break;
       }
+      case Opcode::kFillMethodCache: {
+        JIT_DCHECK(
+            getConfig().attr_caches,
+            "Inline caches must be enabled to use FillMethodCache");
+        auto instr = static_cast<const FillMethodCache*>(&i);
+        Instruction* name = getNameFromIdx(bbb, instr);
+        auto cache_entry = load_method_caches_.at(instr->cache_id());
+        if (getConfig().collect_attr_cache_stats) {
+          BorrowedRef<PyCodeObject> code = instr->frameState()->code;
+          cache_entry->initCacheStats(
+              PyUnicode_AsUTF8(code->co_filename),
+              PyUnicode_AsUTF8(code->co_name));
+        }
+        bbb.appendCallInstruction(
+            instr->output(),
+            LoadMethodCache::lookupHelper,
+            cache_entry,
+            instr->receiver(),
+            name);
+        break;
+      }
       case Opcode::kLoadTypeMethodCacheEntryType: {
         JIT_DCHECK(
             getConfig().attr_caches,
@@ -1413,6 +1513,28 @@ LIRGenerator::TranslatedBlock LIRGenerator::TranslateOneBasicBlock(
         bbb.appendCallInstruction(
             instr->output(),
             LoadTypeMethodCache::getValueHelper,
+            cache,
+            instr->receiver());
+        break;
+      }
+      case Opcode::kLoadMethodCacheEntryType: {
+        JIT_DCHECK(
+            getConfig().attr_caches,
+            "Inline caches must be enabled to use LoadMethodCacheEntryType");
+        auto instr = static_cast<const LoadMethodCacheEntryType*>(&i);
+        LoadMethodCache* cache = load_method_caches_.at(instr->cache_id());
+        bbb.appendInstr(instr->output(), Instruction::kMove, MemImm{cache->typeAddr()});
+        break;
+      }
+      case Opcode::kLoadMethodCacheEntryValue: {
+        JIT_DCHECK(
+            getConfig().attr_caches,
+            "Inline caches must be enabled to use LoadMethodCacheEntryValue");
+        auto instr = static_cast<const LoadMethodCacheEntryValue*>(&i);
+        LoadMethodCache* cache = load_method_caches_.at(instr->cache_id());
+        bbb.appendCallInstruction(
+            instr->output(),
+            LoadMethodCache::getValueHelper,
             cache,
             instr->receiver());
         break;
@@ -1682,6 +1804,42 @@ LIRGenerator::TranslatedBlock LIRGenerator::TranslateOneBasicBlock(
             static_cast<int>(instr->op()));
         break;
       }
+      case Opcode::kLongUnboxCompact: {
+        auto instr = static_cast<const LongUnboxCompact*>(&i);
+        Instruction* value = bbb.getDefInstr(instr->value());
+        appendGuard(bbb, InstrGuardKind::kCompactLong, *instr, value);
+        auto tag = bbb.appendInstr(
+            OutVReg{OperandBase::k64bit},
+            Instruction::kMove,
+            Ind{
+                value,
+                offsetof(PyLongObject, long_value.lv_tag),
+                DataType::k64bit});
+        auto sign_bits = bbb.appendInstr(
+            OutVReg{OperandBase::k64bit},
+            Instruction::kAnd,
+            tag,
+            Imm{_PyLong_SIGN_MASK});
+        auto one = bbb.appendInstr(
+            Instruction::kMove, OutVReg{OperandBase::k64bit}, int64_t{1});
+        auto sign = bbb.appendInstr(
+            OutVReg{OperandBase::k64bit},
+            Instruction::kSub,
+            one,
+            sign_bits);
+        auto digit32 = bbb.appendInstr(
+            OutVReg{OperandBase::k32bit},
+            Instruction::kMove,
+            Ind{
+                value,
+                offsetof(PyLongObject, long_value.ob_digit),
+                DataType::k32bit});
+        auto digit =
+            bbb.appendInstr(
+                OutVReg{OperandBase::k64bit}, Instruction::kZext, digit32);
+        bbb.appendInstr(instr->output(), Instruction::kMul, digit, sign);
+        break;
+      }
       case Opcode::kUnicodeCompare: {
         auto instr = static_cast<const UnicodeCompare*>(&i);
 
@@ -1746,6 +1904,15 @@ LIRGenerator::TranslatedBlock LIRGenerator::TranslateOneBasicBlock(
               JITRT_NotContainsBool,
               instr->right(),
               instr->left());
+        } else if (
+            instr->left()->type() <= TLongExact &&
+            instr->right()->type() <= TLongExact) {
+          call_instr = bbb.appendCallInstruction(
+              instr->output(),
+              PyObject_RichCompareBool,
+              instr->left(),
+              instr->right(),
+              static_cast<int>(instr->op()));
         } else if (
             (instr->op() == CompareOp::kEqual ||
              instr->op() == CompareOp::kNotEqual) &&
@@ -1867,15 +2034,36 @@ LIRGenerator::TranslatedBlock LIRGenerator::TranslateOneBasicBlock(
       case Opcode::kCheckNeg:
       case Opcode::kCheckVar:
       case Opcode::kGuard:
+      case Opcode::kGuardNonNegativeDouble:
       case Opcode::kGuardIs: {
         const auto& instr = static_cast<const DeoptBase&>(i);
         auto kind = InstrGuardKind::kNotZero;
-        if (instr.IsCheckNeg()) {
+        if (instr.IsCheckNeg() || instr.IsGuardNonNegativeDouble()) {
           kind = InstrGuardKind::kNotNegative;
         } else if (instr.IsGuardIs()) {
           kind = InstrGuardKind::kIs;
         }
         appendGuard(bbb, kind, instr, bbb.getDefInstr(instr.GetOperand(0)));
+        break;
+      }
+      case Opcode::kGuardModuleAttrValue: {
+        auto instr = static_cast<const GuardModuleAttrValue*>(&i);
+        Type receiver_type = instr->receiver()->type();
+        JIT_CHECK(
+            receiver_type.hasObjectSpec(),
+            "GuardModuleAttrValue requires a constant module receiver");
+        BorrowedRef<> module = receiver_type.objectSpec();
+        BorrowedRef<PyDictObject> dict = getKnownModuleDict(module);
+        JIT_CHECK(
+            dict != nullptr,
+            "GuardModuleAttrValue requires a builtin module receiver");
+        BorrowedRef<PyUnicodeObject> name{instr->name()};
+        auto cache =
+            cinderx::getModuleState()->cache_manager->getGlobalCache(
+                dict, dict, name);
+        Instruction* value = bbb.appendInstr(
+            OutVReg{OperandBase::k64bit}, Instruction::kMove, MemImm{cache});
+        appendGuard(bbb, InstrGuardKind::kIs, *instr, value);
         break;
       }
       case Opcode::kGuardType: {
@@ -2117,7 +2305,7 @@ LIRGenerator::TranslatedBlock LIRGenerator::TranslateOneBasicBlock(
             hir_instr.output(),
             Instruction::kVectorCall,
             // TASK(T140174965): This should be MemImm.
-            Imm{reinterpret_cast<uint64_t>(JITRT_Call)},
+            Imm{reinterpret_cast<uint64_t>(JITRT_CallMethod)},
             Imm{flags});
         for (hir::Register* arg : hir_instr.GetOperands()) {
           instr->addOperands(VReg{bbb.getDefInstr(arg)});
@@ -2390,6 +2578,15 @@ LIRGenerator::TranslatedBlock LIRGenerator::TranslateOneBasicBlock(
       case Opcode::kStoreArrayItem: {
         auto instr = static_cast<const StoreArrayItem*>(&i);
         auto type = instr->type();
+        if (type <= TCDouble) {
+          bbb.appendInvokeInstruction(
+              JITRT_SetDouble_InArray,
+              instr->ob_item(),
+              instr->value(),
+              instr->idx());
+          break;
+        }
+
         decltype(JITRT_SetI8_InArray)* func = nullptr;
 
         if (type <= TCInt8) {
@@ -2573,6 +2770,16 @@ LIRGenerator::TranslatedBlock LIRGenerator::TranslateOneBasicBlock(
             instr->GetOperand(1));
         break;
       }
+      case Opcode::kListSlice: {
+        auto instr = static_cast<const ListSlice*>(&i);
+        bbb.appendCallInstruction(
+            instr->output(),
+            JITRT_ListSlice,
+            instr->GetOperand(0),
+            instr->GetOperand(1),
+            instr->GetOperand(2));
+        break;
+      }
       case Opcode::kInPlaceOp: {
         auto instr = static_cast<const InPlaceOp*>(&i);
 
@@ -2637,6 +2844,13 @@ LIRGenerator::TranslatedBlock LIRGenerator::TranslateOneBasicBlock(
         auto instr = static_cast<const GetLength*>(&i);
         bbb.appendCallInstruction(
             instr->output(), JITRT_GetLength, instr->GetOperand(0));
+        break;
+      }
+      case Opcode::kGetLengthInt64: {
+        auto instr = static_cast<const GetLengthInt64*>(&i);
+        Instruction* result = bbb.appendCallInstruction(
+            instr->output(), JITRT_GetLengthInt64, instr->GetOperand(0));
+        appendGuard(bbb, InstrGuardKind::kNotNegative, *instr, result);
         break;
       }
       case Opcode::kPhi: {
@@ -3143,11 +3357,19 @@ LIRGenerator::TranslatedBlock LIRGenerator::TranslateOneBasicBlock(
         auto reifier = inline_code_to_reifier_.at(code.get());
         Instruction* reifier_reg =
             bbb.appendInstr(OutVReg{}, Instruction::kMove, reifier.get());
+#if PY_VERSION_HEX >= 0x030F0000
         MakeDecref(
             bbb,
             reifier_reg,
             std::optional<destructor>(
                 PyUnstable_JITExecutable_Type.tp_dealloc));
+#else
+        // OSS 3.14 fallback keeps the code object in f_executable.
+        MakeDecref(
+            bbb,
+            reifier_reg,
+            std::optional<destructor>(PyCode_Type.tp_dealloc));
+#endif
 #if PY_VERSION_HEX < 0x030F0000
         // On 3.14, we stored the function object in f_funcobj and incref'd it.
         // Need to decref it here since the frame was not materialized.
@@ -3176,9 +3398,176 @@ LIRGenerator::TranslatedBlock LIRGenerator::TranslateOneBasicBlock(
       }
       case Opcode::kIsTruthy: {
         auto is_truthy = static_cast<const IsTruthy*>(&i);
+        auto* src_reg = i.GetOperand(0);
+        Instruction* src = bbb.getDefInstr(src_reg);
+
+        if (src_reg->type() <= TBool) {
+          bbb.appendInstr(
+              i.output(),
+              Instruction::kEqual,
+              src,
+              Imm{reinterpret_cast<uint64_t>(Py_True), OperandBase::kObject});
+          break;
+        }
+
+        auto none_check = bbb.allocateBlock();
+        auto bool_fast = bbb.allocateBlock();
+        auto bool_check = bbb.allocateBlock();
+        auto number_slot_check = bbb.allocateBlock();
+        auto mapping_check = bbb.allocateBlock();
+        auto mapping_slot_check = bbb.allocateBlock();
+        auto sequence_check = bbb.allocateBlock();
+        auto sequence_slot_check = bbb.allocateBlock();
+        auto none_fast = bbb.allocateBlock();
+        auto default_true_fast = bbb.allocateBlock();
+        auto slow_path = bbb.allocateBlock();
+        auto done = bbb.allocateBlock();
+
+        Instruction* is_none = bbb.appendInstr(
+            Instruction::kEqual,
+            OutVReg{OperandBase::k8bit},
+            src,
+            Imm{reinterpret_cast<uint64_t>(Py_None), OperandBase::kObject});
+        bbb.appendBranch(
+            Instruction::kCondBranch, is_none, none_fast, none_check);
+
+        bbb.switchBlock(none_check);
+        Instruction* obj_type = bbb.appendInstr(
+            Instruction::kMove, OutVReg{}, Ind{src, offsetof(PyObject, ob_type)});
+        Instruction* is_bool = bbb.appendInstr(
+            Instruction::kEqual,
+            OutVReg{OperandBase::k8bit},
+            obj_type,
+            Imm{reinterpret_cast<uint64_t>(&PyBool_Type), OperandBase::kObject});
+        bbb.appendBranch(
+            Instruction::kCondBranch, is_bool, bool_fast, bool_check);
+
+        bbb.switchBlock(bool_check);
+        Instruction* as_number = bbb.appendInstr(
+            Instruction::kMove,
+            OutVReg{},
+            Ind{obj_type, offsetof(PyTypeObject, tp_as_number)});
+        Instruction* has_no_number = bbb.appendInstr(
+            Instruction::kEqual,
+            OutVReg{OperandBase::k8bit},
+            as_number,
+            Imm{0});
+        bbb.appendBranch(
+            Instruction::kCondBranch,
+            has_no_number,
+            mapping_check,
+            number_slot_check);
+
+        bbb.switchBlock(number_slot_check);
+        Instruction* nb_bool = bbb.appendInstr(
+            Instruction::kMove,
+            OutVReg{},
+            Ind{as_number, offsetof(PyNumberMethods, nb_bool)});
+        Instruction* has_no_nb_bool = bbb.appendInstr(
+            Instruction::kEqual,
+            OutVReg{OperandBase::k8bit},
+            nb_bool,
+            Imm{0});
+        bbb.appendBranch(
+            Instruction::kCondBranch,
+            has_no_nb_bool,
+            mapping_check,
+            slow_path);
+
+        bbb.switchBlock(mapping_check);
+        Instruction* as_mapping = bbb.appendInstr(
+            Instruction::kMove,
+            OutVReg{},
+            Ind{obj_type, offsetof(PyTypeObject, tp_as_mapping)});
+        Instruction* has_no_mapping = bbb.appendInstr(
+            Instruction::kEqual,
+            OutVReg{OperandBase::k8bit},
+            as_mapping,
+            Imm{0});
+        bbb.appendBranch(
+            Instruction::kCondBranch,
+            has_no_mapping,
+            sequence_check,
+            mapping_slot_check);
+
+        bbb.switchBlock(mapping_slot_check);
+        Instruction* mp_length = bbb.appendInstr(
+            Instruction::kMove,
+            OutVReg{},
+            Ind{as_mapping, offsetof(PyMappingMethods, mp_length)});
+        Instruction* has_no_mp_length = bbb.appendInstr(
+            Instruction::kEqual,
+            OutVReg{OperandBase::k8bit},
+            mp_length,
+            Imm{0});
+        bbb.appendBranch(
+            Instruction::kCondBranch,
+            has_no_mp_length,
+            sequence_check,
+            slow_path);
+
+        bbb.switchBlock(sequence_check);
+        Instruction* as_sequence = bbb.appendInstr(
+            Instruction::kMove,
+            OutVReg{},
+            Ind{obj_type, offsetof(PyTypeObject, tp_as_sequence)});
+        Instruction* has_no_sequence = bbb.appendInstr(
+            Instruction::kEqual,
+            OutVReg{OperandBase::k8bit},
+            as_sequence,
+            Imm{0});
+        bbb.appendBranch(
+            Instruction::kCondBranch,
+            has_no_sequence,
+            default_true_fast,
+            sequence_slot_check);
+
+        bbb.switchBlock(sequence_slot_check);
+        Instruction* sq_length = bbb.appendInstr(
+            Instruction::kMove,
+            OutVReg{},
+            Ind{as_sequence, offsetof(PySequenceMethods, sq_length)});
+        Instruction* has_no_sq_length = bbb.appendInstr(
+            Instruction::kEqual,
+            OutVReg{OperandBase::k8bit},
+            sq_length,
+            Imm{0});
+        bbb.appendBranch(
+            Instruction::kCondBranch,
+            has_no_sq_length,
+            default_true_fast,
+            slow_path);
+
+        bbb.switchBlock(bool_fast);
+        Instruction* bool_result = bbb.appendInstr(
+            Instruction::kEqual,
+            OutVReg{OperandBase::k8bit},
+            src,
+            Imm{reinterpret_cast<uint64_t>(Py_True), OperandBase::kObject});
+        bbb.appendBranch(Instruction::kBranch, done);
+
+        bbb.switchBlock(none_fast);
+        Instruction* none_result =
+            bbb.appendInstr(Instruction::kMove, OutVReg{OperandBase::k8bit}, Imm{0});
+        bbb.appendBranch(Instruction::kBranch, done);
+
+        bbb.switchBlock(default_true_fast);
+        Instruction* default_true_result =
+            bbb.appendInstr(Instruction::kMove, OutVReg{OperandBase::k8bit}, Imm{1});
+        bbb.appendBranch(Instruction::kBranch, done);
+
+        bbb.switchBlock(slow_path);
         Instruction* call_instr = bbb.appendCallInstruction(
-            i.output(), PyObject_IsTrue, i.GetOperand(0));
+            OutVReg{OperandBase::k8bit}, PyObject_IsTrue, src_reg);
         appendGuard(bbb, InstrGuardKind::kNotNegative, *is_truthy, call_instr);
+        bbb.appendBranch(Instruction::kBranch, done);
+
+        bbb.switchBlock(done);
+        Instruction* phi = bbb.appendInstr(i.output(), Instruction::kPhi);
+        phi->addOperands(Lbl(bool_fast), VReg(bool_result));
+        phi->addOperands(Lbl(none_fast), VReg(none_result));
+        phi->addOperands(Lbl(default_true_fast), VReg(default_true_result));
+        phi->addOperands(Lbl(slow_path), VReg(call_instr));
         break;
       }
       case Opcode::kImportFrom: {
@@ -3515,6 +3904,8 @@ LIRGenerator::TranslatedBlock LIRGenerator::TranslateOneBasicBlock(
         case Opcode::kDeoptPatchpoint:
         case Opcode::kGuard:
         case Opcode::kGuardIs:
+        case Opcode::kGuardModuleAttrValue:
+        case Opcode::kGuardNonNegativeDouble:
         case Opcode::kGuardType:
         case Opcode::kInvokeStaticFunction:
         case Opcode::kIsInstance:
@@ -3557,6 +3948,9 @@ void LIRGenerator::resolvePhiOperands(
 
   for (auto& block : basic_blocks_) {
     block->foreachPhiInstr([&](Instruction* instr) {
+      if (instr->origin() == nullptr || !instr->origin()->IsPhi()) {
+        return;
+      }
       auto hir_instr = static_cast<const Phi*>(instr->origin());
       for (size_t i = 0; i < hir_instr->NumOperands(); ++i) {
         hir::BasicBlock* hir_block = hir_instr->basic_blocks().at(i);

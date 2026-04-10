@@ -39,6 +39,12 @@ class LoadGlobalCacheTests(unittest.TestCase):
         return a_global
 
     @staticmethod
+    @cinder_support.failUnlessJITCompiled
+    @failUnlessHasOpcodes("LOAD_GLOBAL")
+    def get_global_2():
+        return a_global
+
+    @staticmethod
     def del_global():
         global a_global
         del a_global
@@ -84,6 +90,15 @@ class LoadGlobalCacheTests(unittest.TestCase):
         # We don't support DELETE_ATTR yet.
         delattr(builtins, "a_global")
         self.assertRaises(NameError, self.get_global)
+
+    def test_multiple_watchers_same_global_key(self):
+        self.set_global(123)
+        self.assertEqual(self.get_global(), 123)
+        self.assertEqual(self.get_global_2(), 123)
+
+        self.set_global(456)
+        self.assertEqual(self.get_global(), 456)
+        self.assertEqual(self.get_global_2(), 456)
 
     class prefix_str(str):
         def __new__(cls, prefix, value):

@@ -280,10 +280,19 @@ GETITEM(PyObject *v, Py_ssize_t i) {
 #define ADAPTIVE_COUNTER_TRIGGERS(COUNTER) \
     backoff_counter_triggers(forge_backoff_counter((COUNTER)))
 
+#ifdef CINDER_ENABLE_STATIC_PYTHON
 #define ADVANCE_ADAPTIVE_COUNTER(COUNTER) \
-    if (adaptive_enabled) { \
+    do { \
+        if (adaptive_enabled) { \
+            (COUNTER) = advance_backoff_counter((COUNTER)); \
+        } \
+    } while (0);
+#else
+#define ADVANCE_ADAPTIVE_COUNTER(COUNTER) \
+    do { \
         (COUNTER) = advance_backoff_counter((COUNTER)); \
-    }
+    } while (0);
+#endif
 
 #define PAUSE_ADAPTIVE_COUNTER(COUNTER) \
     do { \
@@ -431,6 +440,7 @@ do { \
 
 // CO_NO_MONITORING_EVENTS indicates the code object is read-only and therefore
 // cannot have code-extra data added.
+#ifdef CINDER_ENABLE_STATIC_PYTHON
 #define CI_SET_ADAPTIVE_INTERPRETER_ENABLED_STATE \
     do { \
         PyObject *executable = PyStackRef_AsPyObjectBorrow(frame->f_executable); \
@@ -459,3 +469,24 @@ do { \
             } \
         } \
     } while (0);
+
+#else
+#define CI_SET_ADAPTIVE_INTERPRETER_ENABLED_STATE ((void)0);
+#define CI_UPDATE_CALL_COUNT \
+    do { \
+        if (Ci_jit_vectorcall != NULL) { \
+            PyObject *fobj = PyStackRef_AsPyObjectBorrow(frame->f_funcobj); \
+            if (PyFunction_Check(fobj) && \
+                ((PyFunctionObject*)fobj)->vectorcall == Ci_jit_vectorcall) { \
+                PyObject *executable = PyStackRef_AsPyObjectBorrow(frame->f_executable); \
+                if (PyCode_Check(executable)) { \
+                    PyCodeObject* code = (PyCodeObject*)executable; \
+                    CodeExtra *extra = codeExtra(code); \
+                    if (extra != NULL) { \
+                        Ci_code_extra_incr_calls(extra); \
+                    } \
+                } \
+            } \
+        } \
+    } while (0);
+#endif

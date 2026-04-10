@@ -11,6 +11,7 @@
 #include "cinderx/Jit/hir/preload.h"
 
 #include <memory>
+#include <optional>
 #include <unordered_map>
 #include <unordered_set>
 #include <vector>
@@ -90,6 +91,13 @@ std::unique_ptr<Function> buildHIR(const Preloader& preloader);
 struct InlineResult {
   BasicBlock* entry{nullptr};
   BasicBlock* exit{nullptr};
+  BasicBlock* success{nullptr};
+};
+
+enum class InlineGenexprCollectorKind {
+  kSet,
+  kList,
+  kAny,
 };
 
 class HIRBuilder {
@@ -133,6 +141,7 @@ class HIRBuilder {
   void emitPushNull(TranslationContext& tc);
 
   void emitBinaryOp(
+      CFG& cfg,
       TranslationContext& tc,
       const jit::BytecodeInstruction& bc_instr);
   void emitUnaryNot(TranslationContext& tc);
@@ -140,10 +149,34 @@ class HIRBuilder {
       TranslationContext& tc,
       const jit::BytecodeInstruction& bc_instr);
   void emitAnyCall(
+      Function& irfunc,
       CFG& cfg,
       TranslationContext& tc,
       jit::BytecodeInstructionBlock::Iterator& bc_it,
       const jit::BytecodeInstructionBlock& bc_instrs);
+  bool tryInlineSetGenexprCall(
+      Function& irfunc,
+      CFG& cfg,
+      TranslationContext& tc,
+      jit::BytecodeInstructionBlock::Iterator& bc_it,
+      const jit::BytecodeInstructionBlock& bc_instrs);
+  bool tryInlineAnyGenexprCall(
+      Function& irfunc,
+      CFG& cfg,
+      TranslationContext& tc,
+      jit::BytecodeInstructionBlock::Iterator& bc_it,
+      const jit::BytecodeInstructionBlock& bc_instrs);
+  bool tryInlineTupleGenexprCall(
+      Function& irfunc,
+      CFG& cfg,
+      TranslationContext& tc,
+      jit::BytecodeInstructionBlock::Iterator& bc_it,
+      const jit::BytecodeInstructionBlock& bc_instrs);
+  bool tryEmitProfiledMethodWithValuesCall(
+      CFG& cfg,
+      TranslationContext& tc,
+      const jit::BytecodeInstruction& bc_instr,
+      CallFlags flags);
   void emitCallEx(
       TranslationContext& tc,
       const jit::BytecodeInstruction& bc_instr,
@@ -161,7 +194,9 @@ class HIRBuilder {
   void emitCompareOp(
       TranslationContext& tc,
       const jit::BytecodeInstruction& bc_instr);
-  void emitToBool(TranslationContext& tc);
+  void emitToBool(
+      TranslationContext& tc,
+      const jit::BytecodeInstruction* bc_instr = nullptr);
   void emitCopyDictWithoutKeys(TranslationContext& tc);
   void emitGetLen(TranslationContext& tc);
   void emitJumpIf(
@@ -253,11 +288,30 @@ class HIRBuilder {
   void emitBinarySlice(TranslationContext& tc);
   void emitStoreSlice(TranslationContext& tc);
   void emitStoreSubscr(
+      CFG& cfg,
       TranslationContext& tc,
       const jit::BytecodeInstruction& bc_instr);
   void emitInPlaceOp(
       TranslationContext& tc,
       const jit::BytecodeInstruction& bc_instr);
+#if PY_VERSION_HEX >= 0x030E0000 && PY_VERSION_HEX < 0x030F0000
+  bool tryEmitDeepcopyDictSubscrRewrite(
+      CFG& cfg,
+      TranslationContext& tc,
+      const jit::BytecodeInstruction& bc_instr,
+      Register* container,
+      Register* subscript,
+      Register* result);
+  bool tryRewritePickleLoadStopCall(
+      CFG& cfg,
+      TranslationContext& tc,
+      jit::BytecodeInstructionBlock::Iterator& bc_it,
+      const jit::BytecodeInstructionBlock& bc_instrs);
+  bool tryEmitSendNoneLoopRewrite(
+      CFG& cfg,
+      TranslationContext& tc,
+      const jit::BytecodeInstruction& bc_instr);
+#endif
   void emitBuildSlice(
       TranslationContext& tc,
       const jit::BytecodeInstruction& bc_instr);
@@ -430,6 +484,9 @@ class HIRBuilder {
   void emitSetAdd(
       TranslationContext& tc,
       const jit::BytecodeInstruction& bc_instr);
+  void emitInlineGenexprYield(
+      TranslationContext& tc,
+      const jit::BytecodeInstruction& bc_instr);
   void emitSetUpdate(
       TranslationContext& tc,
       const jit::BytecodeInstruction& bc_instr);
@@ -483,6 +540,22 @@ class HIRBuilder {
   void emitStoreGlobal(
       TranslationContext& tc,
       const BytecodeInstruction& bc_instr);
+  Register* findFunctionClosure(BasicBlock* block, Register* func);
+  bool inlineSetGenexpr(
+      Function& irfunc,
+      CFG& cfg,
+      TranslationContext& tc,
+      Register* genfunc,
+      Register* iterable,
+      Register* closure_tuple);
+  InlineResult inlineGenexprHIR(
+      Function* caller,
+      FrameState* caller_frame_state,
+      BorrowedRef<PyCodeObject> gen_code,
+      Register* iterable,
+      Register* closure_tuple,
+      Register* collector,
+      InlineGenexprCollectorKind collector_kind);
 
   BorrowedRef<> constArg(const jit::BytecodeInstruction& bc_instr);
 
@@ -550,6 +623,14 @@ class HIRBuilder {
   BlockMap block_map_;
   const Preloader& preloader_;
 
+  struct PendingMethodWithValuesCall {
+    Register* receiver{nullptr};
+    Register* callable{nullptr};
+    PyObject* descr{nullptr};
+    uint32_t type_version{0};
+    uint32_t keys_version{0};
+  };
+
   TempAllocator temps_{nullptr};
 
   // Tracks the function for compilations that require it.
@@ -559,6 +640,16 @@ class HIRBuilder {
   Register* kwnames_{nullptr};
 
   OperandStack static_method_stack_;
+  Register* inline_genexpr_collector_{nullptr};
+  InlineGenexprCollectorKind inline_genexpr_collector_kind_{
+      InlineGenexprCollectorKind::kSet};
+  Register* inline_genexpr_closure_{nullptr};
+  BasicBlock* inline_genexpr_exit_{nullptr};
+  BasicBlock* inline_genexpr_success_{nullptr};
+  CFG* inline_genexpr_cfg_{nullptr};
+  std::vector<std::unique_ptr<FrameState>> inline_genexpr_parent_frames_;
+  std::optional<PendingMethodWithValuesCall> pending_method_with_values_call_;
+  bool stop_block_translation_{false};
 };
 
 } // namespace jit::hir

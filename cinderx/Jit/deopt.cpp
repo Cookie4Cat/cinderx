@@ -101,8 +101,10 @@ Ref<> MemoryView::readOwned(const LiveValue& value) const {
     }
     case jit::hir::ValueKind::kUnsigned:
       return Ref<>::steal(PyLong_FromSize_t(raw));
-    case hir::ValueKind::kDouble:
-      return Ref<>::steal(PyFloat_FromDouble(raw));
+    case hir::ValueKind::kDouble: {
+      double raw_double = bit_cast<double, uint64_t>(raw);
+      return Ref<>::steal(PyFloat_FromDouble(raw_double));
+    }
     case jit::hir::ValueKind::kBool:
       return Ref<>::create(raw ? Py_True : Py_False);
     case jit::hir::ValueKind::kObject:
@@ -123,31 +125,39 @@ static void reifyLocalsplus(
 #endif
 
   BorrowedRef<PyCodeObject> code = frameCode(frame);
-  int free_offset = numLocalsplus(code) - numFreevars(code);
-  // Local variables are not initialized in the frame
-  for (std::size_t i = 0; i < free_offset && i < frame_meta.localsplus.size();
-       i++) {
-    const LiveValue* value = meta.getLocalValue(i, frame_meta);
-    if (value == nullptr) {
-      // Value is dead
-      *localsplus = Ci_STACK_NULL;
-    } else {
-      PyObject* obj = mem.readOwned(*value).release();
-      *localsplus = Ci_STACK_STEAL(obj);
-    }
-    localsplus++;
+  const std::size_t nlocalsplus = static_cast<std::size_t>(numLocalsplus(code));
+  const std::size_t free_offset =
+      static_cast<std::size_t>(numLocalsplus(code) - numFreevars(code));
+
+  // Deopt metadata can legitimately omit dead locals. Ensure the full
+  // localsplus region is initialized to NULL before selectively restoring
+  // tracked values; otherwise frame teardown/copy paths may observe stale
+  // stack data and crash while INCREF/DECREFing.
+  for (std::size_t i = 0; i < nlocalsplus; i++) {
+    localsplus[i] = Ci_STACK_NULL;
   }
 
-  // Free variables are initialized
-  for (std::size_t i = free_offset; i < frame_meta.localsplus.size(); i++) {
+  const std::size_t limit = std::min(frame_meta.localsplus.size(), nlocalsplus);
+  // Local variables are not initialized in the frame.
+  for (std::size_t i = 0; i < free_offset && i < limit; i++) {
     const LiveValue* value = meta.getLocalValue(i, frame_meta);
     if (value == nullptr) {
-      Ci_STACK_CLEAR(*localsplus);
+      // Value is dead.
     } else {
       PyObject* obj = mem.readOwned(*value).release();
-      Ci_STACK_XSETREF(*localsplus, obj);
+      localsplus[i] = Ci_STACK_STEAL(obj);
     }
-    localsplus++;
+  }
+
+  // Free variables are initialized.
+  for (std::size_t i = free_offset; i < limit; i++) {
+    const LiveValue* value = meta.getLocalValue(i, frame_meta);
+    if (value == nullptr) {
+      // Already NULL from the initialization pass.
+    } else {
+      PyObject* obj = mem.readOwned(*value).release();
+      Ci_STACK_XSETREF(localsplus[i], obj);
+    }
   }
 }
 
@@ -308,8 +318,6 @@ bool shouldResumeInterpreterInErrorHandler(DeoptReason reason) {
     case jit::DeoptReason::kUnhandledNullField:
     case jit::DeoptReason::kRaiseStatic:
       return true;
-    default:
-      JIT_ABORT("Unrecognized deopt reason {}", static_cast<int>(reason));
   }
 }
 

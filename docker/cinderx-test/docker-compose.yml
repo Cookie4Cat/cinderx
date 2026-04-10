@@ -1,0 +1,33 @@
+services:
+  cinderx-arm64:
+    image: ${BASE_IMAGE:-python:3.14-slim}
+    platform: linux/arm64
+    hostname: cinderx-arm64
+
+    # Mounts
+    volumes:
+      # Wheel files (from cinderx/dist directory)
+      - ../../dist:/dist:ro
+      # Test scripts
+      - ./scripts:/scripts:ro
+      # Benchmark configs
+      - ./configs:/scripts/configs:ro
+      # Benchmark results
+      - ${RESULTS_DIR:-./results}:/results
+      # Cache for pyperformance
+      - cinderx-bench-cache:/root/.cache
+
+    # Environment
+    environment:
+      - RESULTS_ROOT=/results
+      - PYTHONUNBUFFERED=1
+      - PYTHONJIT=${PYTHONJIT:-1}
+      - PYTHONJITAUTO=${PYTHONJITAUTO:-50}
+
+    # Keep container running
+    stdin_open: true
+    tty: true
+
+volumes:
+  cinderx-bench-cache:
+    driver: local

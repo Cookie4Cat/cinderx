@@ -11,6 +11,7 @@
 #include <memoryapi.h>
 #else
 #include <sys/mman.h>
+#include <unistd.h>
 #endif
 
 #include <cstring>
@@ -68,6 +69,20 @@ bool setHugePages([[maybe_unused]] void* ptr, [[maybe_unused]] size_t size) {
 #endif
 
   return false;
+}
+
+size_t allocGranularity() {
+#ifdef WIN32
+  SYSTEM_INFO sys_info;
+  GetSystemInfo(&sys_info);
+  return static_cast<size_t>(sys_info.dwAllocationGranularity);
+#else
+  long page_size = sysconf(_SC_PAGESIZE);
+  if (page_size <= 0) {
+    return 4096;
+  }
+  return static_cast<size_t>(page_size);
+#endif
 }
 
 } // namespace
@@ -230,14 +245,16 @@ MultipleSectionCodeAllocator::~MultipleSectionCodeAllocator() {
  * each CodeSection.
  */
 void MultipleSectionCodeAllocator::createSlabs() noexcept {
-  size_t hot_section_size =
-      asmjit::Support::alignUp(getConfig().hot_code_section_size, kAllocSize);
+  size_t section_alignment = allocGranularity();
+  size_t hot_section_size = asmjit::Support::alignUp(
+      getConfig().hot_code_section_size, section_alignment);
   JIT_CHECK(
       hot_section_size > 0,
       "Hot code section must have non-zero size when using multiple sections.");
   code_section_free_sizes_[CodeSection::kHot] = hot_section_size;
 
-  size_t cold_section_size = getConfig().cold_code_section_size;
+  size_t cold_section_size = asmjit::Support::alignUp(
+      getConfig().cold_code_section_size, section_alignment);
   JIT_CHECK(
       cold_section_size > 0,
       "Cold code section must have non-zero size when using multiple "
@@ -247,7 +264,9 @@ void MultipleSectionCodeAllocator::createSlabs() noexcept {
   total_allocation_size_ = hot_section_size + cold_section_size;
 
   uint8_t* region = allocPages(total_allocation_size_);
-  setHugePages(region, hot_section_size);
+  if (hot_section_size >= kAllocSize) {
+    setHugePages(region, hot_section_size);
+  }
 
   code_alloc_ = region;
   code_sections_[CodeSection::kHot] = region;

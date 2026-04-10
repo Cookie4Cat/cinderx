@@ -37,7 +37,8 @@ enum PassConfig : uint64_t {
   kInliner = 1 << 6,
   kPhiElim = 1 << 7,
   kSimplify = 1 << 8,
-  kInsertUpdatePrevInstr = 1 << 9,
+  kGuardedLoadElim = 1 << 9,
+  kInsertUpdatePrevInstr = 1 << 10,
 
   // Run all the passes.
   kAll = ~uint64_t{0},
