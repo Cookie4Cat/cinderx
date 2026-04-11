@@ -37,8 +37,10 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(SHARED_FLAGS "-DPy_BUILD_CORE -DPy_BUILD_CORE_MODULE -fPIC -Wall -Wextra -Wno-attributes -Wno-c99-designator -Wno-c++11-narrowing -Wno-cast-function-type -Wno-cast-function-type-mismatch -Wno-deprecated-declarations -Wno-missing-field-initializers -Wno-null-pointer-subtraction -Wno-parentheses -Wno-sign-compare -Wno-unknown-pragmas -Wno-unused-function -Wno-unused-parameter")
 
 macro(set_flag VAR)
-  if (DEFINED ${VAR} AND ${${VAR}})
-    set(SHARED_FLAGS "-D${VAR} ${SHARED_FLAGS}")
+  if (DEFINED ${VAR})
+    if (${${VAR}})
+      set(SHARED_FLAGS "-D${VAR} ${SHARED_FLAGS}")
+    endif()
   endif()
 endmacro()
 
@@ -148,6 +150,8 @@ endif()
 set(GENERATED_HEADER_DIR ${CMAKE_BINARY_DIR}/generated)
 file(MAKE_DIRECTORY ${GENERATED_HEADER_DIR})
 
+option(ENABLE_RUNTIME_TESTS "Build RuntimeTests with CMake" OFF)
+
 ##############################################################################
 # Dependencies
 
@@ -156,7 +160,11 @@ include(FetchContent)
 ########################################
 # python
 
-find_package(Python ${PY_VERSION} EXACT COMPONENTS Interpreter Development.Module REQUIRED)
+if(ENABLE_RUNTIME_TESTS)
+  find_package(Python ${PY_VERSION} EXACT COMPONENTS Interpreter Development.Module Development.Embed REQUIRED)
+else()
+  find_package(Python ${PY_VERSION} EXACT COMPONENTS Interpreter Development.Module REQUIRED)
+endif()
 
 # Some of our files are partially generated from CPython source, and they
 # expect to be able to include files relative to Include/internal.
@@ -353,14 +361,18 @@ add_library(parallel-gc ${PARALLEL_GC_SOURCES})
 ########################################
 # _cinderx.cpp
 
-set(SOURCES
-  # Manually listed out to not accidentally include stuff in .git.
-  ${PROJECT_SOURCE_DIR}/_cinderx.cpp
+set(CINDERX_LIB_SOURCES
   ${PROJECT_SOURCE_DIR}/_cinderx-lib.cpp
   ${PROJECT_SOURCE_DIR}/async_lazy_value.cpp
   ${PROJECT_SOURCE_DIR}/module_state.cpp
   ${PROJECT_SOURCE_DIR}/module_c_state.cpp
   ${PROJECT_SOURCE_DIR}/python_runtime.cpp
+)
+
+set(SOURCES
+  # Manually listed out to not accidentally include stuff in .git.
+  ${PROJECT_SOURCE_DIR}/_cinderx.cpp
+  ${CINDERX_LIB_SOURCES}
 )
 
 add_library(${PROJECT_NAME} SHARED ${SOURCES})
@@ -380,3 +392,11 @@ endif()
 set_target_properties(${PROJECT_NAME} PROPERTIES PREFIX "")
 set_target_properties(${PROJECT_NAME} PROPERTIES SUFFIX "")
 set_target_properties(${PROJECT_NAME} PROPERTIES OUTPUT_NAME "_cinderx.so")
+
+########################################
+# RuntimeTests/
+
+if(ENABLE_RUNTIME_TESTS)
+  enable_testing()
+  add_subdirectory(${PROJECT_SOURCE_DIR}/RuntimeTests)
+endif()

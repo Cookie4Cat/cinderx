@@ -2,9 +2,7 @@
 
 #include <gtest/gtest.h>
 
-#ifdef BUCK_BUILD
 #include "cinderx/_cinderx-lib.h"
-#endif
 
 #include "cinderx/Jit/compiler.h"
 #include "cinderx/Jit/hir/builtin_load_method_elimination.h"
@@ -169,13 +167,16 @@ void register_test(
 
 } // namespace
 
-#ifdef BUCK_BUILD
 PyMODINIT_FUNC PyInit__cinderx() {
   return _cinderx_lib_init();
 }
-#endif
 
 void registerCinderX() {
+  if (PyImport_AppendInittab("_cinderx", PyInit__cinderx) != 0) {
+    PyErr_Print();
+    throw std::runtime_error{"Could not add cinderx to inittab"};
+  }
+
 #ifdef BUCK_BUILD
   try {
     boost::filesystem::path python_install =
@@ -197,17 +198,18 @@ void registerCinderX() {
                  "build, re-running usually fixes the issue\n";
     throw;
   }
-
-  if (PyImport_AppendInittab("_cinderx", PyInit__cinderx) != 0) {
-    PyErr_Print();
-    throw std::runtime_error{"Could not add cinderx to inittab"};
-  }
 #endif
 }
 
 int main(int argc, char* argv[]) {
 #ifdef BAKED_IN_PYTHONPATH
-  setenv("PYTHONPATH", _BAKED_IN_PYTHONPATH, 1);
+  std::string pythonpath = _BAKED_IN_PYTHONPATH;
+  const char* current_pythonpath = getenv("PYTHONPATH");
+  if (current_pythonpath != nullptr && std::strlen(current_pythonpath) > 0) {
+    pythonpath.append(":");
+    pythonpath.append(current_pythonpath);
+  }
+  setenv("PYTHONPATH", pythonpath.c_str(), 1);
 #endif
 
   registerCinderX();
