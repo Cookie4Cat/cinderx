@@ -91,8 +91,36 @@ if(ENABLE_LTO)
     set(CMAKE_AR ${LLVM_AR})
     message(STATUS "LTO: Using llvm-ar: ${CMAKE_AR}")
 
+    # llvm-ranlib is preferred when available for LLVM LTO toolchains.
+    find_program(LLVM_RANLIB llvm-ranlib)
+    if(LLVM_RANLIB)
+      set(CMAKE_RANLIB ${LLVM_RANLIB})
+      message(STATUS "LTO: Using llvm-ranlib: ${CMAKE_RANLIB}")
+    endif()
+
     set(LTO_FLAG "-flto")
-    set(LTO_LINKER_FLAGS "-flto")
+    # Prefer lld when available. Some Linux distributions place LLVMgold.so
+    # outside the compiler prefix and GNU ld fails to auto-discover it.
+    find_program(LLD_LINKER NAMES ld.lld lld)
+    if(LLD_LINKER)
+      set(LTO_LINKER_FLAGS "-flto -fuse-ld=lld")
+      message(STATUS "LTO: Using linker: ${LLD_LINKER}")
+    else()
+      # Fallback to GNU ld plugin flow when lld is unavailable.
+      execute_process(
+        COMMAND ${CMAKE_CXX_COMPILER} --print-file-name=LLVMgold.so
+        OUTPUT_VARIABLE LLVMGOLD_PLUGIN
+        OUTPUT_STRIP_TRAILING_WHITESPACE
+      )
+      if(LLVMGOLD_PLUGIN STREQUAL "LLVMgold.so" OR NOT EXISTS "${LLVMGOLD_PLUGIN}")
+        message(FATAL_ERROR
+          "LTO with Clang requires ld.lld or LLVMgold.so plugin. "
+          "Install lld or make LLVMgold.so discoverable."
+        )
+      endif()
+      set(LTO_LINKER_FLAGS "-flto -Wl,--plugin=${LLVMGOLD_PLUGIN}")
+      message(STATUS "LTO: Using LLVMgold plugin: ${LLVMGOLD_PLUGIN}")
+    endif()
   elseif(USING_GCC)
     set(LTO_FLAG "-flto")
     set(LTO_LINKER_FLAGS "-flto -fuse-linker-plugin -ffat-lto-objects")
@@ -169,8 +197,7 @@ set(ASMJIT_STATIC TRUE)
 
 FetchContent_Declare(
   asmjit
-  GIT_REPOSITORY https://github.com/asmjit/asmjit
-  GIT_TAG cecc73f2979e9704c81a2c2ec79a7475b31c56ac # 2025-May-10
+  URL https://codeload.github.com/asmjit/asmjit/tar.gz/cecc73f2979e9704c81a2c2ec79a7475b31c56ac # 2025-May-10
 )
 FetchContent_MakeAvailable(asmjit)
 
@@ -179,8 +206,7 @@ FetchContent_MakeAvailable(asmjit)
 
 FetchContent_Declare(
   fmt
-  GIT_REPOSITORY https://github.com/fmtlib/fmt
-  GIT_TAG 11.2.0 # 2025-May-03
+  URL https://codeload.github.com/fmtlib/fmt/tar.gz/refs/tags/11.2.0 # 2025-May-03
 )
 FetchContent_MakeAvailable(fmt)
 
@@ -189,8 +215,7 @@ FetchContent_MakeAvailable(fmt)
 
 FetchContent_Declare(
   parallel-hashmap
-  GIT_REPOSITORY https://github.com/greg7mdp/parallel-hashmap
-  GIT_TAG 896f1a03e429c45d9fe9638e892fc1da73befadd # 2025-Apr-11
+  URL https://codeload.github.com/greg7mdp/parallel-hashmap/tar.gz/896f1a03e429c45d9fe9638e892fc1da73befadd # 2025-Apr-11
 )
 FetchContent_MakeAvailable(parallel-hashmap)
 
@@ -199,8 +224,7 @@ FetchContent_MakeAvailable(parallel-hashmap)
 
 FetchContent_Declare(
   usdt
-  GIT_REPOSITORY https://github.com/libbpf/usdt
-  GIT_TAG f4ea2f524efa80d062f4d586d78daafb83dc7d24 # 2025-Apr-24
+  URL https://codeload.github.com/libbpf/usdt/tar.gz/f4ea2f524efa80d062f4d586d78daafb83dc7d24 # 2025-Apr-24
 )
 FetchContent_MakeAvailable(usdt)
 

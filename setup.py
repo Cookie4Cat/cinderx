@@ -11,6 +11,7 @@ import datetime
 import glob
 import os
 import os.path
+import platform
 import re
 import shutil
 import subprocess
@@ -133,6 +134,36 @@ def compute_py_version() -> str:
     return f"{sys.version_info.major}.{sys.version_info.minor}"
 
 
+def should_enable_adaptive_static_python(
+    py_version: str,
+    meta_python: bool,
+    machine: str | None = None,
+) -> bool:
+    if meta_python and py_version == "3.12":
+        return True
+
+    if machine is None:
+        machine = platform.machine()
+    machine = machine.lower()
+
+    return py_version == "3.14" and machine in {"aarch64", "arm64"}
+
+
+def is_env_flag_enabled(var: str, default: bool = False) -> bool:
+    raw_value = os.environ.get(var)
+    if raw_value is None:
+        return default
+
+    value = raw_value.strip().lower()
+    if value in {"", "0", "false", "off", "no"}:
+        return False
+    if value in {"1", "true", "on", "yes"}:
+        return True
+
+    # Preserve historical behavior: any unknown non-empty value means enabled.
+    return True
+
+
 class BuildCommand(build):
     # Don't use the setuptools default under "build/" as this clashes with
     # "build/fbcode_builder/" (auto-added to the OSS view of CinderX).
@@ -141,7 +172,7 @@ class BuildCommand(build):
         self.build_base = "scratch"
 
     def run(self) -> None:
-        enable_pgo = os.environ.get("CINDERX_ENABLE_PGO", None) is not None
+        enable_pgo = is_env_flag_enabled("CINDERX_ENABLE_PGO")
 
         if enable_pgo:
             self._run_with_pgo()
@@ -397,8 +428,8 @@ class BuildExt(build_ext):
                 cmake_args.append(f"-DPGO_PROFILE_FILE={self.cinderx_pgo_profile_path}")
 
         # LTO configuration
-        enable_lto = os.environ.get("CINDERX_ENABLE_LTO", None)
-        if enable_lto is not None:
+        enable_lto = is_env_flag_enabled("CINDERX_ENABLE_LTO")
+        if enable_lto:
             cmake_args.append("-DENABLE_LTO=ON")
             print("Building with LTO enabled (full LTO)")
         else:
@@ -428,7 +459,10 @@ class BuildExt(build_ext):
         is_314plus = py_version == "3.14" or py_version == "3.15"
 
         set_option("META_PYTHON", meta_python)
-        set_option("ENABLE_ADAPTIVE_STATIC_PYTHON", meta_312)
+        set_option(
+            "ENABLE_ADAPTIVE_STATIC_PYTHON",
+            should_enable_adaptive_static_python(py_version, meta_python),
+        )
         set_option("ENABLE_DISASSEMBLER", False)
         set_option("ENABLE_ELF_READER", linux)
         set_option("ENABLE_EVAL_HOOK", meta_312)

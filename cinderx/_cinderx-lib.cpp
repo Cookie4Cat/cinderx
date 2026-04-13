@@ -391,6 +391,20 @@ PyObject* cinder_get_adaptive_delay(PyObject* mod, PyObject*) {
 
 #endif
 
+PyDoc_STRVAR(
+    cinder_is_adaptive_static_python_enabled_doc,
+    "is_adaptive_static_python_enabled($module, /)\n"
+    "--\n"
+    "\n"
+    "Returns whether ENABLE_ADAPTIVE_STATIC_PYTHON was enabled at build time.");
+PyObject* cinder_is_adaptive_static_python_enabled(PyObject*, PyObject*) {
+#ifdef ENABLE_ADAPTIVE_STATIC_PYTHON
+  Py_RETURN_TRUE;
+#else
+  Py_RETURN_FALSE;
+#endif
+}
+
 // In 3.12+ we don't have a shadow-stack so there's no need for our own
 // stack-walking functions.
 #if PY_VERSION_HEX < 0x030C0000
@@ -1206,6 +1220,10 @@ PyMethodDef _cinderx_methods[] = {
      METH_NOARGS,
      cinder_get_adaptive_delay_doc},
 #endif
+    {"is_adaptive_static_python_enabled",
+     cinder_is_adaptive_static_python_enabled,
+     METH_NOARGS,
+     cinder_is_adaptive_static_python_enabled_doc},
 #if PY_VERSION_HEX >= 0x030E0000 && defined(ENABLE_PARALLEL_GC)
     {"get_threshold",
      cinder_get_threshold,
