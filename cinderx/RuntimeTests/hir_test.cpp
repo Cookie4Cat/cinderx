@@ -3,6 +3,7 @@
 #include <gtest/gtest.h>
 
 #include "cinderx/Common/ref.h"
+#include "cinderx/Jit/bytecode.h"
 #include "cinderx/Interpreter/cinder_opcode.h"
 #include "cinderx/Jit/compiler.h"
 #include "cinderx/Jit/hir/builder.h"
@@ -566,6 +567,113 @@ class HIRBuildTest : public RuntimeTest {
     return buildHIR(func);
   }
 };
+
+namespace {
+
+Ref<> call1(PyObject* func, BorrowedRef<PyObject> arg) {
+  return Ref<>::steal(PyObject_CallFunctionObjArgs(func, arg, nullptr));
+}
+
+Ref<> call2(
+    PyObject* func,
+    BorrowedRef<PyObject> arg0,
+    BorrowedRef<PyObject> arg1) {
+  return Ref<>::steal(PyObject_CallFunctionObjArgs(func, arg0, arg1, nullptr));
+}
+
+BytecodeInstruction findSpecializedInstr(
+    BorrowedRef<PyCodeObject> code,
+    int specialized_opcode) {
+  for (auto& instr : BytecodeInstructionBlock{code}) {
+    if (instr.specializedOpcode() == specialized_opcode) {
+      return instr;
+    }
+  }
+  JIT_ABORT("Failed to find specialized opcode {}", specialized_opcode);
+}
+
+} // namespace
+
+class SpecializedAttrHIRBuildTest : public RuntimeTest {
+ public:
+  SpecializedAttrHIRBuildTest() : RuntimeTest(static_cast<Flags>(0)) {}
+};
+
+#if PY_VERSION_HEX >= 0x030E0000
+TEST_F(SpecializedAttrHIRBuildTest, LoadAttrInstanceValueLowersToHelperCall) {
+  const char* src = R"(
+class C:
+  pass
+
+def load_x(obj):
+  return obj.x
+)";
+  runCode(src);
+  Ref<PyObject> klass(getGlobal("C"));
+  Ref<PyFunctionObject> func(getGlobal("load_x"));
+  ASSERT_NE(klass, nullptr);
+  ASSERT_NE(func, nullptr);
+
+  Ref<> obj = Ref<>::steal(PyObject_CallFunctionObjArgs(klass, nullptr));
+  Ref<> value = Ref<>::steal(PyLong_FromLong(123));
+  ASSERT_NE(obj, nullptr);
+  ASSERT_NE(value, nullptr);
+  ASSERT_EQ(PyObject_SetAttrString(obj, "x", value), 0);
+
+  for (int i = 0; i < 32; i++) {
+    auto result = call1(reinterpret_cast<PyObject*>(func.get()), obj);
+    ASSERT_NE(result, nullptr);
+    EXPECT_TRUE(isIntEquals(result, 123));
+  }
+
+  auto specialized = findSpecializedInstr(func->func_code, LOAD_ATTR_INSTANCE_VALUE);
+  ASSERT_EQ(specialized.specializedOpcode(), LOAD_ATTR_INSTANCE_VALUE);
+
+  auto irfunc = buildHIR(func);
+  ASSERT_NE(irfunc, nullptr);
+  auto hir = HIRPrinter().ToString(*irfunc);
+  EXPECT_NE(hir.find("JITRT_LoadAttrInstanceValue"), std::string::npos);
+  EXPECT_NE(hir.find("CheckExc"), std::string::npos);
+  EXPECT_EQ(hir.find("LoadAttr<"), std::string::npos);
+}
+
+TEST_F(SpecializedAttrHIRBuildTest, StoreAttrInstanceValueLowersToHelperCall) {
+  const char* src = R"(
+class C:
+  pass
+
+def store_x(obj, value):
+  obj.x = value
+)";
+  runCode(src);
+  Ref<PyObject> klass(getGlobal("C"));
+  Ref<PyFunctionObject> func(getGlobal("store_x"));
+  ASSERT_NE(klass, nullptr);
+  ASSERT_NE(func, nullptr);
+
+  Ref<> obj = Ref<>::steal(PyObject_CallFunctionObjArgs(klass, nullptr));
+  Ref<> value = Ref<>::steal(PyLong_FromLong(7));
+  ASSERT_NE(obj, nullptr);
+  ASSERT_NE(value, nullptr);
+
+  for (int i = 0; i < 32; i++) {
+    auto result = call2(reinterpret_cast<PyObject*>(func.get()), obj, value);
+    ASSERT_NE(result, nullptr);
+    EXPECT_EQ(result.get(), Py_None);
+  }
+
+  auto specialized =
+      findSpecializedInstr(func->func_code, STORE_ATTR_INSTANCE_VALUE);
+  ASSERT_EQ(specialized.specializedOpcode(), STORE_ATTR_INSTANCE_VALUE);
+
+  auto irfunc = buildHIR(func);
+  ASSERT_NE(irfunc, nullptr);
+  auto hir = HIRPrinter().ToString(*irfunc);
+  EXPECT_NE(hir.find("JITRT_StoreAttrInstanceValue"), std::string::npos);
+  EXPECT_NE(hir.find("CheckNeg"), std::string::npos);
+  EXPECT_EQ(hir.find("StoreAttr<"), std::string::npos);
+}
+#endif
 
 TEST_F(HIRBuildTest, GetLength) {
   //  0 LOAD_FAST  0

@@ -3,6 +3,7 @@
 #include <gtest/gtest.h>
 
 #include "cinderx/Common/ref.h"
+#include "cinderx/Jit/bytecode.h"
 #include "cinderx/Jit/codegen/arch.h"
 #include "cinderx/Jit/codegen/autogen.h"
 #include "cinderx/Jit/codegen/environ.h"
@@ -233,6 +234,204 @@ class BackendTest : public RuntimeTest {
     test_error(Py_False, &PyUnicode_Type);
   }
 };
+
+namespace {
+
+#if PY_VERSION_HEX >= 0x030E0000
+uint16_t readCacheU16(PyCodeObject* code, BCIndex opcode_index, int cache_index) {
+  return codeUnit(code)[opcode_index.value() + cache_index].cache;
+}
+
+uint32_t readCacheU32(PyCodeObject* code, BCIndex opcode_index, int cache_index) {
+  uint32_t lo = readCacheU16(code, opcode_index, cache_index);
+  uint32_t hi = readCacheU16(code, opcode_index, cache_index + 1);
+  return lo | (hi << 16);
+}
+
+struct SpecializedAttrCache {
+  int64_t type_version;
+  int64_t offset;
+  Ref<> name;
+};
+
+BytecodeInstruction findSpecializedInstr(
+    BorrowedRef<PyCodeObject> code,
+    int specialized_opcode) {
+  for (auto& instr : BytecodeInstructionBlock{code}) {
+    if (instr.specializedOpcode() == specialized_opcode) {
+      return instr;
+    }
+  }
+  JIT_ABORT("Failed to find specialized opcode {}", specialized_opcode);
+}
+
+SpecializedAttrCache getSpecializedAttrCache(
+    BorrowedRef<PyFunctionObject> func,
+    int specialized_opcode) {
+  auto code = reinterpret_cast<PyCodeObject*>(func->func_code);
+  auto instr = findSpecializedInstr(code, specialized_opcode);
+  return SpecializedAttrCache{
+      static_cast<int64_t>(readCacheU32(code, instr.opcodeIndex(), 2)),
+      static_cast<int64_t>(readCacheU16(code, instr.opcodeIndex(), 4)),
+      Ref<>::create(PyTuple_GET_ITEM(code->co_names, instr.oparg()))};
+}
+
+Ref<> call1(PyObject* func, BorrowedRef<PyObject> arg) {
+  return Ref<>::steal(PyObject_CallFunctionObjArgs(func, arg, nullptr));
+}
+
+Ref<> call2(
+    PyObject* func,
+    BorrowedRef<PyObject> arg0,
+    BorrowedRef<PyObject> arg1) {
+  return Ref<>::steal(PyObject_CallFunctionObjArgs(func, arg0, arg1, nullptr));
+}
+#endif
+
+} // namespace
+
+class AttrInstanceValueHelperTest : public RuntimeTest {
+ public:
+  AttrInstanceValueHelperTest() : RuntimeTest(static_cast<Flags>(0)) {}
+};
+
+#if PY_VERSION_HEX >= 0x030E0000
+TEST_F(AttrInstanceValueHelperTest, LoadAttrInstanceValueFastPathAndFallbacks) {
+  const char* src = R"(
+class C:
+  pass
+
+def load_x(obj):
+  return obj.x
+)";
+  runCode(src);
+  Ref<PyObject> klass(getGlobal("C"));
+  Ref<PyFunctionObject> load_x(getGlobal("load_x"));
+  ASSERT_NE(klass, nullptr);
+  ASSERT_NE(load_x, nullptr);
+
+  Ref<> obj = Ref<>::steal(PyObject_CallFunctionObjArgs(klass, nullptr));
+  Ref<> value = Ref<>::steal(PyLong_FromLong(123));
+  ASSERT_NE(obj, nullptr);
+  ASSERT_NE(value, nullptr);
+  ASSERT_EQ(PyObject_SetAttrString(obj, "x", value), 0);
+
+  for (int i = 0; i < 32; i++) {
+    auto result = call1(reinterpret_cast<PyObject*>(load_x.get()), obj);
+    ASSERT_NE(result, nullptr);
+    EXPECT_TRUE(isIntEquals(result, 123));
+  }
+
+  auto cache = getSpecializedAttrCache(load_x, LOAD_ATTR_INSTANCE_VALUE);
+
+  auto fast_result = Ref<>::steal(JITRT_LoadAttrInstanceValue(
+      obj, cache.type_version, cache.offset, cache.name));
+  ASSERT_NE(fast_result, nullptr);
+  EXPECT_TRUE(isIntEquals(fast_result, 123));
+
+  auto mismatch_result = Ref<>::steal(JITRT_LoadAttrInstanceValue(
+      obj, cache.type_version + 1, cache.offset, cache.name));
+  ASSERT_NE(mismatch_result, nullptr);
+  EXPECT_TRUE(isIntEquals(mismatch_result, 123));
+
+  Ref<> spill = Ref<>::steal(PyLong_FromLong(999));
+  ASSERT_NE(spill, nullptr);
+  ASSERT_EQ(PyObject_SetAttrString(obj, "spill", spill), 0);
+  PyObject** dictptr = _PyObject_GetDictPtr(obj);
+  ASSERT_NE(dictptr, nullptr);
+  ASSERT_NE(*dictptr, nullptr);
+  ASSERT_NE(_PyObject_GetManagedDict(obj), nullptr);
+  _PyObject_InlineValues(obj)->valid = 0;
+  auto invalid_result = Ref<>::steal(JITRT_LoadAttrInstanceValue(
+      obj, cache.type_version, cache.offset, cache.name));
+  ASSERT_NE(invalid_result, nullptr);
+  EXPECT_TRUE(isIntEquals(invalid_result, 123));
+}
+
+TEST_F(AttrInstanceValueHelperTest, StoreAttrInstanceValueFastPathAndFallbacks) {
+  const char* src = R"(
+class C:
+  pass
+
+def store_x(obj, value):
+  obj.x = value
+)";
+  runCode(src);
+  Ref<PyObject> klass(getGlobal("C"));
+  Ref<PyFunctionObject> store_x(getGlobal("store_x"));
+  ASSERT_NE(klass, nullptr);
+  ASSERT_NE(store_x, nullptr);
+
+  Ref<> warm_obj = Ref<>::steal(PyObject_CallFunctionObjArgs(klass, nullptr));
+  Ref<> warm_value = Ref<>::steal(PyLong_FromLong(1));
+  ASSERT_NE(warm_obj, nullptr);
+  ASSERT_NE(warm_value, nullptr);
+  for (int i = 0; i < 32; i++) {
+    auto result =
+        call2(reinterpret_cast<PyObject*>(store_x.get()), warm_obj, warm_value);
+    ASSERT_NE(result, nullptr);
+    EXPECT_EQ(result.get(), Py_None);
+  }
+
+  auto cache = getSpecializedAttrCache(store_x, STORE_ATTR_INSTANCE_VALUE);
+
+  Ref<> fast_obj = Ref<>::steal(PyObject_CallFunctionObjArgs(klass, nullptr));
+  Ref<> fast_value = Ref<>::steal(PyLong_FromLong(456));
+  ASSERT_NE(fast_obj, nullptr);
+  ASSERT_NE(fast_value, nullptr);
+  ASSERT_EQ(
+      JITRT_StoreAttrInstanceValue(
+          fast_obj, cache.type_version, cache.offset, cache.name, fast_value),
+      0);
+  auto fast_result = Ref<>::steal(PyObject_GetAttrString(fast_obj, "x"));
+  ASSERT_NE(fast_result, nullptr);
+  EXPECT_TRUE(isIntEquals(fast_result, 456));
+
+  Ref<> mismatch_obj = Ref<>::steal(PyObject_CallFunctionObjArgs(klass, nullptr));
+  Ref<> mismatch_value = Ref<>::steal(PyLong_FromLong(789));
+  ASSERT_NE(mismatch_obj, nullptr);
+  ASSERT_NE(mismatch_value, nullptr);
+  ASSERT_EQ(
+      JITRT_StoreAttrInstanceValue(
+          mismatch_obj,
+          cache.type_version + 1,
+          cache.offset,
+          cache.name,
+          mismatch_value),
+      0);
+  auto mismatch_result =
+      Ref<>::steal(PyObject_GetAttrString(mismatch_obj, "x"));
+  ASSERT_NE(mismatch_result, nullptr);
+  EXPECT_TRUE(isIntEquals(mismatch_result, 789));
+
+  Ref<> managed_obj = Ref<>::steal(PyObject_CallFunctionObjArgs(klass, nullptr));
+  Ref<> managed_initial = Ref<>::steal(PyLong_FromLong(5));
+  Ref<> managed_value = Ref<>::steal(PyLong_FromLong(111));
+  Ref<> managed_spill = Ref<>::steal(PyLong_FromLong(1));
+  ASSERT_NE(managed_obj, nullptr);
+  ASSERT_NE(managed_initial, nullptr);
+  ASSERT_NE(managed_value, nullptr);
+  ASSERT_NE(managed_spill, nullptr);
+  ASSERT_EQ(PyObject_SetAttrString(managed_obj, "x", managed_initial), 0);
+  ASSERT_EQ(PyObject_SetAttrString(managed_obj, "spill", managed_spill), 0);
+  PyObject** dictptr = _PyObject_GetDictPtr(managed_obj);
+  ASSERT_NE(dictptr, nullptr);
+  ASSERT_NE(*dictptr, nullptr);
+  ASSERT_NE(_PyObject_GetManagedDict(managed_obj), nullptr);
+  ASSERT_EQ(
+      JITRT_StoreAttrInstanceValue(
+          managed_obj,
+          cache.type_version,
+          cache.offset,
+          cache.name,
+          managed_value),
+      0);
+  auto managed_result =
+      Ref<>::steal(PyObject_GetAttrString(managed_obj, "x"));
+  ASSERT_NE(managed_result, nullptr);
+  EXPECT_TRUE(isIntEquals(managed_result, 111));
+}
+#endif
 
 // This is a test harness for experimenting with backends
 TEST_F(BackendTest, SimpleLoadAttr) {

@@ -18,6 +18,7 @@
 #include "cinderx/Interpreter/cinder_opcode.h"
 #include "cinderx/Jit/containers.h"
 #include "cinderx/Jit/context.h"
+#include "cinderx/Jit/jit_rt.h"
 #include "cinderx/Jit/hir/annotation_index.h"
 #include "cinderx/Jit/hir/ssa.h"
 #include "cinderx/Jit/hir/type.h"
@@ -40,6 +41,18 @@
 namespace jit::hir {
 
 namespace {
+
+#if PY_VERSION_HEX >= 0x030E0000
+uint16_t readCacheU16(PyCodeObject* code, BCIndex opcode_index, int cache_index) {
+  return codeUnit(code)[opcode_index.value() + cache_index].cache;
+}
+
+uint32_t readCacheU32(PyCodeObject* code, BCIndex opcode_index, int cache_index) {
+  uint32_t lo = readCacheU16(code, opcode_index, cache_index);
+  uint32_t hi = readCacheU16(code, opcode_index, cache_index + 1);
+  return lo | (hi << 16);
+}
+#endif
 
 void rotateStackTop(OperandStack& stack, int count) {
   if (count < 2) {
@@ -2806,6 +2819,34 @@ void HIRBuilder::emitLoadAttr(
 
   if (getConfig().specialized_opcodes) {
     switch (bc_instr.specializedOpcode()) {
+#if PY_VERSION_HEX >= 0x030E0000
+      case LOAD_ATTR_INSTANCE_VALUE: {
+        Register* type_version = temps_.AllocateStack();
+        Register* offset = temps_.AllocateStack();
+        Register* name = temps_.AllocateStack();
+        Register* result = temps_.AllocateStack();
+        tc.emit<LoadConst>(
+            type_version,
+            Type::fromCInt(readCacheU32(code_, bc_instr.opcodeIndex(), 2), TCInt64));
+        tc.emit<LoadConst>(
+            offset,
+            Type::fromCInt(readCacheU16(code_, bc_instr.opcodeIndex(), 4), TCInt64));
+        tc.emit<LoadConst>(
+            name, Type::fromObject(PyTuple_GET_ITEM(code_->co_names, name_idx)));
+        tc.emit<CallStatic>(
+            4,
+            result,
+            reinterpret_cast<void*>(JITRT_LoadAttrInstanceValue),
+            TObject,
+            receiver,
+            type_version,
+            offset,
+            name);
+        tc.emit<CheckExc>(result, result, tc.frame);
+        tc.frame.stack.push(result);
+        return;
+      }
+#endif
       case LOAD_ATTR_MODULE: {
         Type type = Type::fromTypeExact(&PyModule_Type);
         tc.emit<GuardType>(receiver, type, receiver, tc.frame);
@@ -3861,6 +3902,43 @@ void HIRBuilder::emitStoreAttr(
     const jit::BytecodeInstruction& bc_instr) {
   Register* receiver = tc.frame.stack.pop();
   Register* value = tc.frame.stack.pop();
+
+  if (getConfig().specialized_opcodes) {
+    switch (bc_instr.specializedOpcode()) {
+#if PY_VERSION_HEX >= 0x030E0000
+      case STORE_ATTR_INSTANCE_VALUE: {
+        Register* type_version = temps_.AllocateStack();
+        Register* offset = temps_.AllocateStack();
+        Register* name = temps_.AllocateStack();
+        Register* result = temps_.AllocateStack();
+        tc.emit<LoadConst>(
+            type_version,
+            Type::fromCInt(readCacheU32(code_, bc_instr.opcodeIndex(), 2), TCInt64));
+        tc.emit<LoadConst>(
+            offset,
+            Type::fromCInt(readCacheU16(code_, bc_instr.opcodeIndex(), 4), TCInt64));
+        tc.emit<LoadConst>(
+            name,
+            Type::fromObject(PyTuple_GET_ITEM(code_->co_names, bc_instr.oparg())));
+        tc.emit<CallStatic>(
+            5,
+            result,
+            reinterpret_cast<void*>(JITRT_StoreAttrInstanceValue),
+            TCInt32,
+            receiver,
+            type_version,
+            offset,
+            name,
+            value);
+        tc.emit<CheckNeg>(result, result, tc.frame);
+        return;
+      }
+#endif
+      default:
+        break;
+    }
+  }
+
   tc.emit<StoreAttr>(receiver, value, bc_instr.oparg(), tc.frame);
 }
 

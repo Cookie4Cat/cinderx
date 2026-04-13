@@ -209,6 +209,19 @@ PyObject* JITRT_Vectorcall(
     size_t nargsf,
     PyObject* kwnames);
 
+PyObject* JITRT_LoadAttrInstanceValue(
+    PyObject* obj,
+    int64_t type_version,
+    int64_t offset,
+    PyObject* name);
+
+int JITRT_StoreAttrInstanceValue(
+    PyObject* obj,
+    int64_t type_version,
+    int64_t offset,
+    PyObject* name,
+    PyObject* value);
+
 /*
  * Perform a method lookup on an object.
  */

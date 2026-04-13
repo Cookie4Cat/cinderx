@@ -1133,6 +1133,86 @@ PyObject* JITRT_Vectorcall(
   return res;
 }
 
+PyObject* JITRT_LoadAttrInstanceValue(
+    PyObject* obj,
+    int64_t type_version,
+    int64_t offset,
+    PyObject* name) {
+  // Mirror CPython 3.14's LOAD_ATTR_INSTANCE_VALUE cache contract: guard the
+  // type version, require inline values with a negative dictoffset, require
+  // valid inline values, and fall back to PyObject_GetAttr() on any mismatch.
+  PyTypeObject* tp = Py_TYPE(obj);
+  if (FT_ATOMIC_LOAD_UINT_RELAXED(tp->tp_version_tag) !=
+          static_cast<uint32_t>(type_version) ||
+      !(tp->tp_flags & Py_TPFLAGS_INLINE_VALUES) || tp->tp_dictoffset >= 0) {
+    return PyObject_GetAttr(obj, name);
+  }
+
+  PyDictValues* values = _PyObject_InlineValues(obj);
+  if (!FT_ATOMIC_LOAD_UINT8(values->valid)) {
+    return PyObject_GetAttr(obj, name);
+  }
+
+  auto value_ptr = reinterpret_cast<PyObject**>(
+      reinterpret_cast<char*>(obj) + offset);
+  PyObject* attr = FT_ATOMIC_LOAD_PTR_ACQUIRE(*value_ptr);
+  if (attr == nullptr) {
+    return PyObject_GetAttr(obj, name);
+  }
+
+#ifdef Py_GIL_DISABLED
+  PyObject* strong_attr = nullptr;
+  if (_Py_TryIncrefCompare(value_ptr, attr, &strong_attr)) {
+    return strong_attr;
+  }
+  return PyObject_GetAttr(obj, name);
+#else
+  return Py_NewRef(attr);
+#endif
+}
+
+int JITRT_StoreAttrInstanceValue(
+    PyObject* obj,
+    int64_t type_version,
+    int64_t offset,
+    PyObject* name,
+    PyObject* value) {
+  // Mirror CPython 3.14's STORE_ATTR_INSTANCE_VALUE cache contract: guard the
+  // type version, require inline values with a negative dictoffset, reject
+  // objects with a managed dict, require valid inline values, and fall back to
+  // PyObject_SetAttr() on any mismatch.
+  PyTypeObject* tp = Py_TYPE(obj);
+  if (FT_ATOMIC_LOAD_UINT_RELAXED(tp->tp_version_tag) !=
+          static_cast<uint32_t>(type_version) ||
+      !(tp->tp_flags & Py_TPFLAGS_INLINE_VALUES) || tp->tp_dictoffset >= 0) {
+    return PyObject_SetAttr(obj, name, value);
+  }
+
+  if (_PyObject_GetManagedDict(obj) != nullptr) {
+    return PyObject_SetAttr(obj, name, value);
+  }
+
+  PyDictValues* values = _PyObject_InlineValues(obj);
+  if (!FT_ATOMIC_LOAD_UINT8(values->valid)) {
+    return PyObject_SetAttr(obj, name, value);
+  }
+
+  auto value_ptr = reinterpret_cast<PyObject**>(
+      reinterpret_cast<char*>(obj) + offset);
+  PyObject* old_value = *value_ptr;
+#ifdef Py_GIL_DISABLED
+  FT_ATOMIC_STORE_PTR_RELEASE(*value_ptr, Py_NewRef(value));
+#else
+  *value_ptr = Py_NewRef(value);
+#endif
+  if (old_value == nullptr) {
+    Py_ssize_t index = value_ptr - values->values;
+    _PyDictValues_AddToInsertionOrder(values, index);
+  }
+  Py_XDECREF(old_value);
+  return 0;
+}
+
 PyObject* JITRT_UnaryNot(PyObject* value) {
   int res = PyObject_IsTrue(value);
   if (res == 0) {

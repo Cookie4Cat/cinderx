@@ -662,6 +662,70 @@ class GetSetNonDataDescrAttrTests(unittest.TestCase):
         self.assertEqual(self.descr.invoked_count, 2)
 
 
+class InstanceValueAttrTests(unittest.TestCase):
+    @cinder_support.failUnlessJITCompiled
+    @failUnlessHasOpcodes("LOAD_ATTR")
+    def get_x(self, obj):
+        return obj.x
+
+    @cinder_support.failUnlessJITCompiled
+    @failUnlessHasOpcodes("STORE_ATTR")
+    def set_x(self, obj, value):
+        obj.x = value
+
+    @skip_if_ft("T250369692: Inline caches disabled with free-threading")
+    def test_load_hit_returns_value(self) -> None:
+        class C:
+            pass
+
+        obj = C()
+        obj.x = 41
+
+        self.assertEqual(self.get_x(obj), 41)
+        self.assertEqual(self.get_x(obj), 41)
+
+    @skip_if_ft("T250369692: Inline caches disabled with free-threading")
+    def test_store_initial_write_and_overwrite(self) -> None:
+        class C:
+            pass
+
+        obj = C()
+
+        self.set_x(obj, 10)
+        self.assertEqual(self.get_x(obj), 10)
+
+        self.set_x(obj, 20)
+        self.assertEqual(self.get_x(obj), 20)
+
+    @skip_if_ft("T250369692: Inline caches disabled with free-threading")
+    def test_missing_attribute_still_raises(self) -> None:
+        class C:
+            pass
+
+        obj = C()
+
+        with self.assertRaises(AttributeError):
+            self.get_x(obj)
+
+        with self.assertRaises(AttributeError):
+            self.get_x(obj)
+
+    @skip_if_ft("T250369692: Inline caches disabled with free-threading")
+    def test_class_version_change_keeps_python_semantics(self) -> None:
+        class C:
+            pass
+
+        obj = C()
+        obj.x = 5
+
+        self.assertEqual(self.get_x(obj), 5)
+        C.version_bump = object()
+        self.assertEqual(self.get_x(obj), 5)
+
+        self.set_x(obj, 6)
+        self.assertEqual(self.get_x(obj), 6)
+
+
 class ClosureTests(unittest.TestCase):
     @cinder_support.failUnlessJITCompiled
     def test_cellvar(self) -> None:
