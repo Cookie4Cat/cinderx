@@ -56,6 +56,21 @@ class GetFrameLineNumberTests(unittest.TestCase):
 
         self.assert_code_and_lineno(g(), g, 2)
 
+    def test_line_numbers_for_rematerialized_frames(self) -> None:
+        """Verify rematerialized frames refresh their current line number."""
+
+        @cinder_support.failUnlessJITCompiled
+        def g():
+            frame1 = sys._getframe()
+            x = 1
+            frame2 = sys._getframe()
+            return frame1, frame2, x
+
+        frame1, frame2, x = g()
+        self.assertEqual(x, 1)
+        self.assertIs(frame1, frame2)
+        self.assert_code_and_lineno(frame1, g, 5)
+
     def test_line_numbers_for_running_generators(self) -> None:
         """Verify that line numbers are correct for running generator functions"""
 
