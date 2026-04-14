@@ -391,6 +391,7 @@ void jitFramePopulateFrame([[maybe_unused]] _PyInterpreterFrame* frame) {
   }
 
   BorrowedRef<PyCodeObject> code = frameCode(frame);
+  PyFrameObject* escaped_frame = frame->frame_obj;
   frame->f_builtins = func->func_builtins;
   frame->f_globals = func->func_globals;
   frame->f_locals = nullptr;
@@ -402,7 +403,7 @@ void jitFramePopulateFrame([[maybe_unused]] _PyInterpreterFrame* frame) {
 #else
   frame->stacktop = code->co_nlocalsplus;
 #endif
-  frame->frame_obj = nullptr;
+  frame->frame_obj = escaped_frame;
   frame->return_offset = 0;
   if (!(code->co_flags & kCoFlagsAnyGenerator)) {
     frame->owner = FRAME_OWNED_BY_THREAD;
@@ -628,6 +629,13 @@ void jitFrameClearExceptCode(_PyInterpreterFrame* frame) {
   JIT_DCHECK(currentFrame(PyThreadState_Get()) != frame, "wrong current frame");
 
   if (getConfig().frame_mode != FrameMode::kLightweight) {
+    _PyFrame_ClearExceptCode(frame);
+    return;
+  }
+
+  if (frame->frame_obj != nullptr) {
+    jitFramePopulateFrame(frame);
+    jitFrameRemoveReifier(frame);
     _PyFrame_ClearExceptCode(frame);
     return;
   }

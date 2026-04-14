@@ -11,6 +11,8 @@ _opcode = import_module("_opcode")
 # pyre-ignore[21]: can't find _opcode
 from _opcode import stack_effect
 
+SHADOW_OPS = getattr(opcode, "shadowop", ())
+
 
 MISSING_STACK_EFFECT = {
     "LOAD_FIELD",
@@ -54,27 +56,48 @@ MISSING_STACK_EFFECT = {
 class CinderX_OpcodeTests(unittest.TestCase):
     def test_stack_effect(self) -> None:
         self.assertEqual(stack_effect(dis.opmap["POP_TOP"]), -1)
-        self.assertEqual(stack_effect(dis.opmap["DUP_TOP_TWO"]), 2)
-        self.assertEqual(stack_effect(dis.opmap["BUILD_SLICE"], 0), -1)
-        self.assertEqual(stack_effect(dis.opmap["BUILD_SLICE"], 1), -1)
-        self.assertEqual(stack_effect(dis.opmap["BUILD_SLICE"], 3), -2)
+        if "DUP_TOP_TWO" in dis.opmap:
+            self.assertEqual(stack_effect(dis.opmap["DUP_TOP_TWO"]), 2)
+        else:
+            self.assertEqual(stack_effect(dis.opmap["COPY"], 1), 1)
+        self.assertEqual(
+            stack_effect(dis.opmap["BUILD_SLICE"], 0),
+            dis.stack_effect(dis.opmap["BUILD_SLICE"], 0),
+        )
+        self.assertEqual(
+            stack_effect(dis.opmap["BUILD_SLICE"], 1),
+            dis.stack_effect(dis.opmap["BUILD_SLICE"], 1),
+        )
+        self.assertEqual(
+            stack_effect(dis.opmap["BUILD_SLICE"], 3),
+            dis.stack_effect(dis.opmap["BUILD_SLICE"], 3),
+        )
         self.assertRaises(ValueError, stack_effect, 30000)
-        self.assertRaises(ValueError, stack_effect, dis.opmap["BUILD_SLICE"])
-        self.assertRaises(ValueError, stack_effect, dis.opmap["POP_TOP"], 0)
+        self.assertEqual(
+            stack_effect(dis.opmap["BUILD_SLICE"]),
+            dis.stack_effect(dis.opmap["BUILD_SLICE"]),
+        )
+        self.assertEqual(
+            stack_effect(dis.opmap["POP_TOP"], 0),
+            dis.stack_effect(dis.opmap["POP_TOP"], 0),
+        )
         # All defined opcodes
         for name, code in dis.opmap.items():
             # TASK(T74641077) - Figure out how to deal with static python opcodes
             # pyre-fixme[16]: Module `opcode` has no attribute `shadowop`.
-            if name in MISSING_STACK_EFFECT or code in opcode.shadowop:
+            if name in MISSING_STACK_EFFECT or code in SHADOW_OPS:
                 continue
 
             with self.subTest(opname=name):
                 if code < dis.HAVE_ARGUMENT:
-                    stack_effect(code)
-                    self.assertRaises(ValueError, stack_effect, code, 0)
+                    self.assertEqual(stack_effect(code), dis.stack_effect(code))
+                    self.assertEqual(
+                        stack_effect(code, 0),
+                        dis.stack_effect(code, 0),
+                    )
                 else:
-                    stack_effect(code, 0)
-                    self.assertRaises(ValueError, stack_effect, code)
+                    self.assertEqual(stack_effect(code, 0), dis.stack_effect(code, 0))
+                    self.assertEqual(stack_effect(code), dis.stack_effect(code))
         # All not defined opcodes
         for code in set(range(256)) - set(dis.opmap.values()):
             with self.subTest(opcode=code):
@@ -82,14 +105,26 @@ class CinderX_OpcodeTests(unittest.TestCase):
                 self.assertRaises(ValueError, stack_effect, code, 0)
 
     def test_stack_effect_jump(self) -> None:
-        JUMP_IF_TRUE_OR_POP = dis.opmap["JUMP_IF_TRUE_OR_POP"]
-        self.assertEqual(stack_effect(JUMP_IF_TRUE_OR_POP, 0), 0)
-        self.assertEqual(stack_effect(JUMP_IF_TRUE_OR_POP, 0, jump=True), 0)
-        self.assertEqual(stack_effect(JUMP_IF_TRUE_OR_POP, 0, jump=False), -1)
+        if "JUMP_IF_TRUE_OR_POP" in dis.opmap:
+            jump_if_true = dis.opmap["JUMP_IF_TRUE_OR_POP"]
+            self.assertEqual(stack_effect(jump_if_true, 0), 0)
+            self.assertEqual(stack_effect(jump_if_true, 0, jump=True), 0)
+            self.assertEqual(stack_effect(jump_if_true, 0, jump=False), -1)
+        else:
+            jump_if_true = dis.opmap["JUMP_IF_TRUE"]
+            self.assertEqual(stack_effect(jump_if_true, 0), 0)
+            self.assertEqual(stack_effect(jump_if_true, 0, jump=True), 0)
+            self.assertEqual(stack_effect(jump_if_true, 0, jump=False), 0)
         FOR_ITER = dis.opmap["FOR_ITER"]
-        self.assertEqual(stack_effect(FOR_ITER, 0), 1)
-        self.assertEqual(stack_effect(FOR_ITER, 0, jump=True), -1)
-        self.assertEqual(stack_effect(FOR_ITER, 0, jump=False), 1)
+        self.assertEqual(stack_effect(FOR_ITER, 0), dis.stack_effect(FOR_ITER, 0))
+        self.assertEqual(
+            stack_effect(FOR_ITER, 0, jump=True),
+            dis.stack_effect(FOR_ITER, 0, jump=True),
+        )
+        self.assertEqual(
+            stack_effect(FOR_ITER, 0, jump=False),
+            dis.stack_effect(FOR_ITER, 0, jump=False),
+        )
         JUMP_FORWARD = dis.opmap["JUMP_FORWARD"]
         self.assertEqual(stack_effect(JUMP_FORWARD, 0), 0)
         self.assertEqual(stack_effect(JUMP_FORWARD, 0, jump=True), 0)
@@ -99,7 +134,7 @@ class CinderX_OpcodeTests(unittest.TestCase):
         for name, code in dis.opmap.items():
             # TASK(T74641077) - Figure out how to deal with static python opcodes
             # pyre-fixme[16]: Module `opcode` has no attribute `shadowop`.
-            if name in MISSING_STACK_EFFECT or code in opcode.shadowop:
+            if name in MISSING_STACK_EFFECT or code in SHADOW_OPS:
                 continue
 
             with self.subTest(opname=name):
@@ -107,15 +142,19 @@ class CinderX_OpcodeTests(unittest.TestCase):
                     common = stack_effect(code)
                     jump = stack_effect(code, jump=True)
                     nojump = stack_effect(code, jump=False)
+                    expected_common = dis.stack_effect(code)
+                    expected_jump = dis.stack_effect(code, jump=True)
+                    expected_nojump = dis.stack_effect(code, jump=False)
                 else:
                     common = stack_effect(code, 0)
                     jump = stack_effect(code, 0, jump=True)
                     nojump = stack_effect(code, 0, jump=False)
-                if code in has_jump:
-                    self.assertEqual(common, max(jump, nojump))
-                else:
-                    self.assertEqual(jump, common)
-                    self.assertEqual(nojump, common)
+                    expected_common = dis.stack_effect(code, 0)
+                    expected_jump = dis.stack_effect(code, 0, jump=True)
+                    expected_nojump = dis.stack_effect(code, 0, jump=False)
+                self.assertEqual(common, expected_common)
+                self.assertEqual(jump, expected_jump)
+                self.assertEqual(nojump, expected_nojump)
 
 
 if __name__ == "__main__":

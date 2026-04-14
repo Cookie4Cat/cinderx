@@ -165,7 +165,9 @@ void InsertUpdatePrevInstr::Run([[maybe_unused]] Function& func) {
 
           inited_once = true;
         }
-      } else if (hasArbitraryExecution(instr)) {
+      }
+
+      if (hasArbitraryExecution(instr)) {
         update_one();
       }
     }
