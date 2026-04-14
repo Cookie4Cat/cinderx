@@ -9,18 +9,18 @@ description: "定位和分析cinderx功能测试失败用例，逐文件运行�
 
 ## 配置与脚本
 
-- 配置文件：`config.ini`（同 `cinderx-build-test`）
-- `scripts/build_test.ps1` — 主脚本（`test-single` 操作用于单用例执行）
-- `scripts/remote.ps1` — 底层远程连接脚本
-- `scripts/run_tests_per_file.sh` — 逐文件运行测试的 Shell 脚本，隔离崩溃影响
+- 配置文件：`.trae/config.ini`（同 `cinderx-build-test`）
+- `.trae/scripts/build_test.ps1` — 主脚本（`test-single` 操作用于单用例执行）
+- `.trae/scripts/remote.ps1` — 底层远程连接脚本
+- `.trae/scripts/run_tests_per_file.sh` — 逐文件运行测试的 Shell 脚本，隔离崩溃影响
 
 ## 诊断流程
 
 ### 第 1 步：检查远程环境
 
 ```powershell
-powershell -ExecutionPolicy Bypass -File scripts/remote.ps1 `
-  -Action exec -ConfigFile config.ini `
+powershell -ExecutionPolicy Bypass -File .trae/scripts/remote.ps1 `
+  -Action exec -ConfigFile .trae/config.ini `
   -Command "cd /home/cinderx && /home/pybin/bin/python3.14 -c 'import cinderx; print(cinderx.get_import_error()); print(cinderx.is_initialized())'"
 ```
 
@@ -37,13 +37,13 @@ powershell -ExecutionPolicy Bypass -File scripts/remote.ps1 `
 
 ```powershell
 # 上传脚本
-powershell -ExecutionPolicy Bypass -File scripts/remote.ps1 `
-  -Action upload -ConfigFile config.ini `
-  -LocalPath "scripts\run_tests_per_file.sh" -RemotePath "/home/run_tests_per_file.sh"
+powershell -ExecutionPolicy Bypass -File .trae/scripts/remote.ps1 `
+  -Action upload -ConfigFile .trae/config.ini `
+  -LocalPath ".trae\scripts\run_tests_per_file.sh" -RemotePath "/home/run_tests_per_file.sh"
 
 # 执行（后台运行）
-powershell -ExecutionPolicy Bypass -File scripts/remote.ps1 `
-  -Action exec -ConfigFile config.ini `
+powershell -ExecutionPolicy Bypass -File .trae/scripts/remote.ps1 `
+  -Action exec -ConfigFile .trae/config.ini `
   -Command "chmod +x /home/run_tests_per_file.sh && cd /home/cinderx && nohup bash /home/run_tests_per_file.sh /home/pybin/bin/python3.14 cinderx/PythonLib/test_cinderx /home/test_results_full.txt 'test_jit_global_cache.py test_arm_runtime.py' 120 > /home/test_runner.log 2>&1 & echo PID=$!"
 ```
 
@@ -52,16 +52,16 @@ powershell -ExecutionPolicy Bypass -File scripts/remote.ps1 `
 等待完成：
 
 ```powershell
-powershell -ExecutionPolicy Bypass -File scripts/remote.ps1 `
-  -Action exec -ConfigFile config.ini `
+powershell -ExecutionPolicy Bypass -File .trae/scripts/remote.ps1 `
+  -Action exec -ConfigFile .trae/config.ini `
   -Command "ps -p <PID> -o pid,stat,etime,comm 2>/dev/null && echo '--- Still running ---' || echo '--- Process completed ---'; tail -10 /home/test_results_full.txt 2>/dev/null"
 ```
 
 下载测试结果：
 
 ```powershell
-powershell -ExecutionPolicy Bypass -File scripts/remote.ps1 `
-  -Action download -ConfigFile config.ini `
+powershell -ExecutionPolicy Bypass -File .trae/scripts/remote.ps1 `
+  -Action download -ConfigFile .trae/config.ini `
   -RemotePath /home/test_results_full.txt -LocalPath "<work_dir>\test_results_full.txt"
 ```
 
@@ -80,8 +80,8 @@ powershell -ExecutionPolicy Bypass -File scripts/remote.ps1 `
 3. **JIT 对比**（如怀疑 JIT 问题）：
 
 ```powershell
-powershell -ExecutionPolicy Bypass -File scripts/remote.ps1 `
-  -Action exec -ConfigFile config.ini `
+powershell -ExecutionPolicy Bypass -File .trae/scripts/remote.ps1 `
+  -Action exec -ConfigFile .trae/config.ini `
   -Command "cd /home/cinderx && CINDERX_JIT_DISABLE=1 /home/pybin/bin/python3.14 -m pytest cinderx/PythonLib/test_cinderx/<file>::<Class>::<method> -v --tb=long 2>&1"
 ```
 
@@ -96,8 +96,8 @@ powershell -ExecutionPolicy Bypass -File scripts/remote.ps1 `
 3. **获取 C 堆栈**：
 
 ```powershell
-powershell -ExecutionPolicy Bypass -File scripts/remote.ps1 `
-  -Action exec -ConfigFile config.ini `
+powershell -ExecutionPolicy Bypass -File .trae/scripts/remote.ps1 `
+  -Action exec -ConfigFile .trae/config.ini `
   -Command "cd /home/cinderx && /home/pybin/bin/python3.14 -m pytest cinderx/PythonLib/test_cinderx/<file>::<Class>::<method> -v --tb=long 2>&1 | tail -80"
 ```
 

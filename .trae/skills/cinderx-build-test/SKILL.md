@@ -9,12 +9,12 @@ description: "执行cinderx的编译构建和功能测试。当用户需要编�
 
 ## 配置
 
-远程连接参数和路径配置在 `config.ini` 中，脚本启动时自动读取。关键字段：`server_ip`、`key_file`、`user`、`work_dir`、`upload_dir`、`remote_python`。
+远程连接参数和路径配置在 `.trae/config.ini` 中，脚本启动时自动读取。关键字段：`server_ip`、`key_file`、`user`、`work_dir`、`upload_dir`、`remote_python`。
 
 ## 辅助脚本
 
-- `scripts/build_test.ps1` — 主脚本，提供构建、测试等操作入口
-- `scripts/remote.ps1` — 底层脚本，负责 SSH 连接、远程命令执行、文件上传/下载
+- `.trae/scripts/build_test.ps1` — 主脚本，提供构建、测试等操作入口
+- `.trae/scripts/remote.ps1` — 底层脚本，负责 SSH 连接、远程命令执行、文件上传/下载
 
 ## 操作与命令
 
