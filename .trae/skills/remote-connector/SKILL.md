@@ -9,7 +9,7 @@ description: "通过SSH连接远程服务器，支持执行命令、上传文件
 
 ## 配置
 
-连接参数从 `config.ini` 中读取：
+连接参数从 `.trae/config.ini` 中读取：
 
 | 字段 | 说明 |
 |------|------|
@@ -20,34 +20,34 @@ description: "通过SSH连接远程服务器，支持执行命令、上传文件
 
 ## 使用方法
 
-辅助脚本：`scripts/remote.ps1`
+辅助脚本：`.trae/scripts/remote.ps1`
 
 ### 执行远程命令
 
 ```powershell
-powershell -ExecutionPolicy Bypass -File scripts/remote.ps1 `
-  -Action exec -ConfigFile config.ini -Command "<命令>"
+powershell -ExecutionPolicy Bypass -File .trae/scripts/remote.ps1 `
+  -Action exec -ConfigFile .trae/config.ini -Command "<命令>"
 ```
 
 ### 上传文件
 
 ```powershell
-powershell -ExecutionPolicy Bypass -File scripts/remote.ps1 `
-  -Action upload -ConfigFile config.ini `
+powershell -ExecutionPolicy Bypass -File .trae/scripts/remote.ps1 `
+  -Action upload -ConfigFile .trae/config.ini `
   -LocalPath "<本地路径>" -RemotePath "<远程路径>"
 ```
 
 ### 下载文件
 
 ```powershell
-powershell -ExecutionPolicy Bypass -File scripts/remote.ps1 `
-  -Action download -ConfigFile config.ini `
+powershell -ExecutionPolicy Bypass -File .trae/scripts/remote.ps1 `
+  -Action download -ConfigFile .trae/config.ini `
   -RemotePath "<远程路径>" -LocalPath "<本地路径>"
 ```
 
 ## 注意事项
 
-- 确保 `config.ini` 中指定的 SSH 密钥文件存在
+- 确保 `.trae/config.ini` 中指定的 SSH 密钥文件存在
 - 已设置 `StrictHostKeyChecking=no` 避免首次连接交互提示
 - 连接超时 10 秒
 - `-Command` 包含特殊字符时用双引号包裹

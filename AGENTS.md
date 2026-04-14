@@ -24,11 +24,13 @@
 
 ### 代码结构
 .github/ # 存放项目的GitHub相关文件，如 workflows、actions 等
+.trae/ # 存放项目的Trae相关文件，如 skills、agents 等
+|--skills/ # 存放项目的技能文件，如功能测试、性能测试等
+|--agents/ # 存放项目的智能体文件，如功能开发、性能优化等
+|--config.ini # 存放项目配置文件
 plans/ # 存放临时验证方案，不允许读取
-scripts/ # 存放项目的脚本文件，如远程执行脚本、本地执行脚本等
 cinderx/ # 存放项目代码
 |--Docs/ # 存放代码架构设计文档、功能设计文档、接口设计文档
-config.ini # 存放项目配置文件
 
 ### 设计原则
 
