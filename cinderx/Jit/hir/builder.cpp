@@ -4575,7 +4575,6 @@ void HIRBuilder::emitLoadAttr(
 #else
       false;
 #endif
-
   if (getConfig().specialized_opcodes) {
     auto instance_value_min_locals = [&]() -> int {
 #if PY_VERSION_HEX >= 0x030E0000
@@ -4693,6 +4692,13 @@ void HIRBuilder::emitLoadAttr(
       case LOAD_ATTR_MODULE: {
         Type type = Type::fromTypeExact(&PyModule_Type);
         tc.emit<GuardType>(receiver, type, receiver, tc.frame);
+        if (is_method) {
+          Register* result = temps_.AllocateStack();
+          tc.emit<LoadAttr>(result, receiver, name_idx, tc.frame);
+          tc.frame.stack.push(result);
+          emitPushNull(tc);
+          return;
+        }
         break;
       }
       case LOAD_ATTR_SLOT: {
@@ -4710,6 +4716,9 @@ void HIRBuilder::emitLoadAttr(
         CheckField* cf = tc.emit<CheckField>(result, result, name, tc.frame);
         cf->setGuiltyReg(receiver);
         tc.frame.stack.push(result);
+        if (is_method) {
+          emitPushNull(tc);
+        }
         return;
       }
 #if PY_VERSION_HEX >= 0x030E0000
@@ -4733,6 +4742,9 @@ void HIRBuilder::emitLoadAttr(
         CheckField* cf = tc.emit<CheckField>(result, result, name, tc.frame);
         cf->setGuiltyReg(receiver);
         tc.frame.stack.push(result);
+        if (is_method) {
+          emitPushNull(tc);
+        }
         return;
       }
       case LOAD_ATTR_METHOD_WITH_VALUES: {
