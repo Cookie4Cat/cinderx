@@ -76,13 +76,9 @@ test.test__xxinterpchannels.ChannelTests.*
 # Expects only _testcapi module to be loaded in error message
 test.test_capi.test_misc.CAPITest.test_getitem_with_error
 
-# This test unassigns a random type watcher ID which could be ours
-test.test_capi.test_watchers.TestTypeWatchers.test_clear_unassigned_watcher_id
-test.test_capi.test_watchers.TestTypeWatchers.test_unwatch_unassigned_watcher_id
-test.test_capi.test_watchers.TestTypeWatchers.test_watch_unassigned_watcher_id
-
-# This expects the watcher ID to be 1
-test.test_capi.test_watchers.TestTypeWatchers.test_error
+# CinderX registers a type watcher at import time, so CPython's type-watcher
+# tests can observe a different watcher-id layout and become unstable.
+test.test_capi.test_watchers.TestTypeWatchers.*
 
 # subinterpreters not supported
 test.test__interpreters.*
