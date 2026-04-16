@@ -2,6 +2,8 @@
 
 #include <gtest/gtest.h>
 
+#include <cstring>
+
 #include "cinderx/Common/ref.h"
 #include "cinderx/Jit/bytecode.h"
 #include "cinderx/Interpreter/cinder_opcode.h"
@@ -672,6 +674,49 @@ def store_x(obj, value):
   EXPECT_NE(hir.find("JITRT_StoreAttrInstanceValue"), std::string::npos);
   EXPECT_NE(hir.find("CheckNeg"), std::string::npos);
   EXPECT_EQ(hir.find("StoreAttr<"), std::string::npos);
+}
+
+TEST_F(SpecializedAttrHIRBuildTest, LoadAttrMethodWithValuesLowersToHelperCall) {
+  const char* src = R"(
+class C:
+  def __init__(self):
+    self.base = 41
+
+  def f(self, value):
+    return self.base + value
+
+def call_f(obj, value):
+  return obj.f(value)
+)";
+  runCode(src);
+  Ref<PyObject> klass(getGlobal("C"));
+  Ref<PyFunctionObject> func(getGlobal("call_f"));
+  ASSERT_NE(klass, nullptr);
+  ASSERT_NE(func, nullptr);
+
+  Ref<> obj = Ref<>::steal(PyObject_CallFunctionObjArgs(klass, nullptr));
+  Ref<> value = Ref<>::steal(PyLong_FromLong(1));
+  ASSERT_NE(obj, nullptr);
+  ASSERT_NE(value, nullptr);
+
+  for (int i = 0; i < 256; i++) {
+    auto result = call2(reinterpret_cast<PyObject*>(func.get()), obj, value);
+    ASSERT_NE(result, nullptr);
+    EXPECT_TRUE(isIntEquals(result, 42));
+  }
+
+  auto specialized =
+      findSpecializedInstr(func->func_code, LOAD_ATTR_METHOD_WITH_VALUES);
+  ASSERT_EQ(specialized.specializedOpcode(), LOAD_ATTR_METHOD_WITH_VALUES);
+
+  auto irfunc = buildHIR(func);
+  ASSERT_NE(irfunc, nullptr);
+  auto hir = HIRPrinter().ToString(*irfunc);
+  EXPECT_NE(hir.find("JITRT_LoadAttrMethodWithValues"), std::string::npos);
+  EXPECT_NE(hir.find("GetSecondOutput"), std::string::npos);
+  EXPECT_NE(hir.find("CheckExc"), std::string::npos);
+  EXPECT_EQ(hir.find("LoadMethod<"), std::string::npos);
+  EXPECT_EQ(hir.find("LoadMethodCached<"), std::string::npos);
 }
 #endif
 

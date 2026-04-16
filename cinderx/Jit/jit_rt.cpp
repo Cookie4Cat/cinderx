@@ -1171,6 +1171,49 @@ PyObject* JITRT_LoadAttrInstanceValue(
 #endif
 }
 
+LoadMethodResult JITRT_LoadAttrMethodWithValues(
+    PyObject* obj,
+    int64_t type_version,
+    int64_t keys_version,
+    PyObject* descr,
+    PyObject* name) {
+  // Mirror CPython 3.14's LOAD_ATTR_METHOD_WITH_VALUES cache contract: guard
+  // the owner type version, require inline values with a valid values array,
+  // require the heap type's shared keys version to match, require the cached
+  // descriptor to still be a method descriptor, and fall back to
+  // JITRT_GetMethod() on any mismatch.
+  PyTypeObject* tp = Py_TYPE(obj);
+  if (FT_ATOMIC_LOAD_UINT_RELAXED(tp->tp_version_tag) !=
+      static_cast<uint32_t>(type_version)) {
+    return JITRT_GetMethod(obj, name);
+  }
+
+  if (!(tp->tp_flags & Py_TPFLAGS_INLINE_VALUES)) {
+    return JITRT_GetMethod(obj, name);
+  }
+
+  PyDictValues* values = _PyObject_InlineValues(obj);
+  if (!FT_ATOMIC_LOAD_UINT8(values->valid)) {
+    return JITRT_GetMethod(obj, name);
+  }
+
+  auto* heap_type = reinterpret_cast<PyHeapTypeObject*>(tp);
+  if (heap_type->ht_cached_keys == nullptr ||
+      FT_ATOMIC_LOAD_UINT32_RELAXED(heap_type->ht_cached_keys->dk_version) !=
+          static_cast<uint32_t>(keys_version)) {
+    return JITRT_GetMethod(obj, name);
+  }
+
+  if (descr == nullptr ||
+      !PyType_HasFeature(Py_TYPE(descr), Py_TPFLAGS_METHOD_DESCRIPTOR)) {
+    return JITRT_GetMethod(obj, name);
+  }
+
+  Py_INCREF(descr);
+  Py_INCREF(obj);
+  return {descr, obj};
+}
+
 int JITRT_StoreAttrInstanceValue(
     PyObject* obj,
     int64_t type_version,

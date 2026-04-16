@@ -726,6 +726,63 @@ class InstanceValueAttrTests(unittest.TestCase):
         self.assertEqual(self.get_x(obj), 6)
 
 
+class MethodWithValuesAttrTests(unittest.TestCase):
+    @cinder_support.failUnlessJITCompiled
+    @failUnlessHasOpcodes("LOAD_ATTR", "CALL")
+    def call_f(self, obj, value):
+        return obj.f(value)
+
+    @skip_if_ft("T250369692: Inline caches disabled with free-threading")
+    def test_method_call_hit_returns_value(self) -> None:
+        class C:
+            def __init__(self) -> None:
+                self.base = 41
+
+            def f(self, value):
+                return self.base + value
+
+        obj = C()
+
+        self.assertEqual(self.call_f(obj, 1), 42)
+        self.assertEqual(self.call_f(obj, 1), 42)
+
+    @skip_if_ft("T250369692: Inline caches disabled with free-threading")
+    def test_instance_shadowing_keeps_python_semantics(self) -> None:
+        class C:
+            def __init__(self) -> None:
+                self.base = 41
+
+            def f(self, value):
+                return self.base + value
+
+        obj = C()
+
+        self.assertEqual(self.call_f(obj, 1), 42)
+        obj.f = lambda value: value + 100
+        self.assertEqual(self.call_f(obj, 1), 101)
+
+    @skip_if_ft("T250369692: Inline caches disabled with free-threading")
+    def test_class_version_change_keeps_python_semantics(self) -> None:
+        class C:
+            def __init__(self) -> None:
+                self.base = 41
+
+            def f(self, value):
+                return self.base + value
+
+        obj = C()
+
+        self.assertEqual(self.call_f(obj, 1), 42)
+        C.extra = object()
+        self.assertEqual(self.call_f(obj, 1), 42)
+
+        def new_f(self, value):
+            return self.base + value + 100
+
+        C.f = new_f
+        self.assertEqual(self.call_f(obj, 1), 142)
+
+
 class ClosureTests(unittest.TestCase):
     @cinder_support.failUnlessJITCompiled
     def test_cellvar(self) -> None:

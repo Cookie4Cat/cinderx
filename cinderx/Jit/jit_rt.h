@@ -215,6 +215,13 @@ PyObject* JITRT_LoadAttrInstanceValue(
     int64_t offset,
     PyObject* name);
 
+LoadMethodResult JITRT_LoadAttrMethodWithValues(
+    PyObject* obj,
+    int64_t type_version,
+    int64_t keys_version,
+    PyObject* descr,
+    PyObject* name);
+
 int JITRT_StoreAttrInstanceValue(
     PyObject* obj,
     int64_t type_version,

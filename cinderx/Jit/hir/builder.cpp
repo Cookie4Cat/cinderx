@@ -30,6 +30,7 @@
 #include "cinderx/module_state.h"
 
 #include <algorithm>
+#include <cstring>
 #include <deque>
 #include <memory>
 #include <optional>
@@ -51,6 +52,15 @@ uint32_t readCacheU32(PyCodeObject* code, BCIndex opcode_index, int cache_index)
   uint32_t lo = readCacheU16(code, opcode_index, cache_index);
   uint32_t hi = readCacheU16(code, opcode_index, cache_index + 1);
   return lo | (hi << 16);
+}
+
+PyObject* readCacheObj(PyCodeObject* code, BCIndex opcode_index, int cache_index) {
+  PyObject* obj = nullptr;
+  std::memcpy(
+      &obj,
+      &codeUnit(code)[opcode_index.value() + cache_index].cache,
+      sizeof(obj));
+  return obj;
 }
 #endif
 
@@ -2810,6 +2820,52 @@ void HIRBuilder::emitLoadAttr(
   // which one it should be.
   if constexpr (PY_VERSION_HEX >= 0x030C0000) {
     if (oparg & 1) {
+      if (getConfig().specialized_opcodes) {
+        switch (bc_instr.specializedOpcode()) {
+#if PY_VERSION_HEX >= 0x030E0000
+          case LOAD_ATTR_METHOD_WITH_VALUES: {
+            Register* receiver = tc.frame.stack.pop();
+            Register* type_version = temps_.AllocateStack();
+            Register* keys_version = temps_.AllocateStack();
+            Register* descr = temps_.AllocateStack();
+            Register* name = temps_.AllocateStack();
+            Register* raw_result = temps_.AllocateStack();
+            Register* result = temps_.AllocateStack();
+            Register* method_instance = temps_.AllocateStack();
+            tc.emit<LoadConst>(
+                type_version,
+                Type::fromCInt(
+                    readCacheU32(code_, bc_instr.opcodeIndex(), 2), TCInt64));
+            tc.emit<LoadConst>(
+                keys_version,
+                Type::fromCInt(
+                    readCacheU32(code_, bc_instr.opcodeIndex(), 4), TCInt64));
+            tc.emit<LoadConst>(
+                descr,
+                Type::fromObject(readCacheObj(code_, bc_instr.opcodeIndex(), 6)));
+            tc.emit<LoadConst>(
+                name, Type::fromObject(PyTuple_GET_ITEM(code_->co_names, name_idx)));
+            tc.emit<CallStatic>(
+                5,
+                raw_result,
+                reinterpret_cast<void*>(JITRT_LoadAttrMethodWithValues),
+                TObject,
+                receiver,
+                type_version,
+                keys_version,
+                descr,
+                name);
+            tc.emit<CheckExc>(result, raw_result, tc.frame);
+            tc.emit<GetSecondOutput>(method_instance, TOptObject, raw_result);
+            tc.frame.stack.push(result);
+            tc.frame.stack.push(method_instance);
+            return;
+          }
+#endif
+          default:
+            break;
+        }
+      }
       emitLoadMethod(tc, name_idx);
       return;
     }

@@ -2,6 +2,8 @@
 
 #include <gtest/gtest.h>
 
+#include <cstring>
+
 #include "cinderx/Common/ref.h"
 #include "cinderx/Jit/bytecode.h"
 #include "cinderx/Jit/codegen/arch.h"
@@ -248,9 +250,25 @@ uint32_t readCacheU32(PyCodeObject* code, BCIndex opcode_index, int cache_index)
   return lo | (hi << 16);
 }
 
+PyObject* readCacheObj(PyCodeObject* code, BCIndex opcode_index, int cache_index) {
+  PyObject* obj = nullptr;
+  std::memcpy(
+      &obj,
+      &codeUnit(code)[opcode_index.value() + cache_index].cache,
+      sizeof(obj));
+  return obj;
+}
+
 struct SpecializedAttrCache {
   int64_t type_version;
   int64_t offset;
+  Ref<> name;
+};
+
+struct SpecializedMethodCache {
+  int64_t type_version;
+  int64_t keys_version;
+  Ref<> descr;
   Ref<> name;
 };
 
@@ -274,6 +292,18 @@ SpecializedAttrCache getSpecializedAttrCache(
       static_cast<int64_t>(readCacheU32(code, instr.opcodeIndex(), 2)),
       static_cast<int64_t>(readCacheU16(code, instr.opcodeIndex(), 4)),
       Ref<>::create(PyTuple_GET_ITEM(code->co_names, instr.oparg()))};
+}
+
+SpecializedMethodCache getSpecializedMethodCache(
+    BorrowedRef<PyFunctionObject> func,
+    int specialized_opcode) {
+  auto code = reinterpret_cast<PyCodeObject*>(func->func_code);
+  auto instr = findSpecializedInstr(code, specialized_opcode);
+  return SpecializedMethodCache{
+      static_cast<int64_t>(readCacheU32(code, instr.opcodeIndex(), 2)),
+      static_cast<int64_t>(readCacheU32(code, instr.opcodeIndex(), 4)),
+      Ref<>::create(readCacheObj(code, instr.opcodeIndex(), 6)),
+      Ref<>::create(PyTuple_GET_ITEM(code->co_names, loadAttrIndex(instr.oparg())))};
 }
 
 Ref<> call1(PyObject* func, BorrowedRef<PyObject> arg) {
@@ -430,6 +460,136 @@ def store_x(obj, value):
       Ref<>::steal(PyObject_GetAttrString(managed_obj, "x"));
   ASSERT_NE(managed_result, nullptr);
   EXPECT_TRUE(isIntEquals(managed_result, 111));
+}
+
+TEST_F(AttrInstanceValueHelperTest, LoadAttrMethodWithValuesFastPathAndFallbacks) {
+  const char* src = R"(
+class C:
+  def __init__(self):
+    self.base = 41
+
+  def f(self, value):
+    return self.base + value
+
+def call_f(obj, value):
+  return obj.f(value)
+)";
+  runCode(src);
+  Ref<PyObject> klass(getGlobal("C"));
+  Ref<PyFunctionObject> call_f(getGlobal("call_f"));
+  ASSERT_NE(klass, nullptr);
+  ASSERT_NE(call_f, nullptr);
+
+  Ref<> obj = Ref<>::steal(PyObject_CallFunctionObjArgs(klass, nullptr));
+  Ref<> value = Ref<>::steal(PyLong_FromLong(1));
+  ASSERT_NE(obj, nullptr);
+  ASSERT_NE(value, nullptr);
+
+  for (int i = 0; i < 64; i++) {
+    auto result = call2(reinterpret_cast<PyObject*>(call_f.get()), obj, value);
+    ASSERT_NE(result, nullptr);
+    EXPECT_TRUE(isIntEquals(result, 42));
+  }
+
+  auto cache = getSpecializedMethodCache(call_f, LOAD_ATTR_METHOD_WITH_VALUES);
+
+  auto fast = JITRT_LoadAttrMethodWithValues(
+      obj, cache.type_version, cache.keys_version, cache.descr, cache.name);
+  auto fast_callable = Ref<>::steal(fast.callable);
+  auto fast_self = Ref<>::steal(fast.self_or_null);
+  ASSERT_NE(fast_callable, nullptr);
+  ASSERT_NE(fast_self, nullptr);
+  EXPECT_EQ(fast_self.get(), obj.get());
+  auto fast_result = Ref<>::steal(
+      PyObject_CallFunctionObjArgs(
+          fast_callable.get(), fast_self.get(), value.get(), nullptr));
+  ASSERT_NE(fast_result, nullptr);
+  EXPECT_TRUE(isIntEquals(fast_result, 42));
+
+  auto mismatch = JITRT_LoadAttrMethodWithValues(
+      obj,
+      cache.type_version + 1,
+      cache.keys_version,
+      cache.descr,
+      cache.name);
+  auto mismatch_callable = Ref<>::steal(mismatch.callable);
+  auto mismatch_self = Ref<>::steal(mismatch.self_or_null);
+  ASSERT_NE(mismatch_callable, nullptr);
+  ASSERT_NE(mismatch_self, nullptr);
+  auto mismatch_result = Ref<>::steal(PyObject_CallFunctionObjArgs(
+      mismatch_callable.get(), mismatch_self.get(), value.get(), nullptr));
+  ASSERT_NE(mismatch_result, nullptr);
+  EXPECT_TRUE(isIntEquals(mismatch_result, 42));
+
+  auto keys_mismatch = JITRT_LoadAttrMethodWithValues(
+      obj,
+      cache.type_version,
+      cache.keys_version + 1,
+      cache.descr,
+      cache.name);
+  auto keys_callable = Ref<>::steal(keys_mismatch.callable);
+  auto keys_self = Ref<>::steal(keys_mismatch.self_or_null);
+  ASSERT_NE(keys_callable, nullptr);
+  ASSERT_NE(keys_self, nullptr);
+  auto keys_result = Ref<>::steal(PyObject_CallFunctionObjArgs(
+      keys_callable.get(), keys_self.get(), value.get(), nullptr));
+  ASSERT_NE(keys_result, nullptr);
+  EXPECT_TRUE(isIntEquals(keys_result, 42));
+
+  Ref<> spill = Ref<>::steal(PyLong_FromLong(7));
+  ASSERT_NE(spill, nullptr);
+  ASSERT_EQ(PyObject_SetAttrString(obj, "spill", spill), 0);
+  _PyObject_InlineValues(obj)->valid = 0;
+  auto invalid = JITRT_LoadAttrMethodWithValues(
+      obj, cache.type_version, cache.keys_version, cache.descr, cache.name);
+  auto invalid_callable = Ref<>::steal(invalid.callable);
+  auto invalid_self = Ref<>::steal(invalid.self_or_null);
+  ASSERT_NE(invalid_callable, nullptr);
+  ASSERT_NE(invalid_self, nullptr);
+}
+
+TEST_F(AttrInstanceValueHelperTest, LoadAttrMethodWithValuesFallsBackForNonMethodDescr) {
+  const char* src = R"(
+class C:
+  def __init__(self):
+    self.base = 41
+
+  def f(self, value):
+    return self.base + value
+
+def call_f(obj, value):
+  return obj.f(value)
+)";
+  runCode(src);
+  Ref<PyObject> klass(getGlobal("C"));
+  Ref<PyFunctionObject> call_f(getGlobal("call_f"));
+  ASSERT_NE(klass, nullptr);
+  ASSERT_NE(call_f, nullptr);
+
+  Ref<> obj = Ref<>::steal(PyObject_CallFunctionObjArgs(klass, nullptr));
+  Ref<> value = Ref<>::steal(PyLong_FromLong(1));
+  Ref<> fake_descr = Ref<>::steal(PyLong_FromLong(123));
+  ASSERT_NE(obj, nullptr);
+  ASSERT_NE(value, nullptr);
+  ASSERT_NE(fake_descr, nullptr);
+
+  for (int i = 0; i < 64; i++) {
+    auto result = call2(reinterpret_cast<PyObject*>(call_f.get()), obj, value);
+    ASSERT_NE(result, nullptr);
+    EXPECT_TRUE(isIntEquals(result, 42));
+  }
+
+  auto cache = getSpecializedMethodCache(call_f, LOAD_ATTR_METHOD_WITH_VALUES);
+  auto fallback = JITRT_LoadAttrMethodWithValues(
+      obj, cache.type_version, cache.keys_version, fake_descr, cache.name);
+  auto fallback_callable = Ref<>::steal(fallback.callable);
+  auto fallback_self = Ref<>::steal(fallback.self_or_null);
+  ASSERT_NE(fallback_callable, nullptr);
+  ASSERT_NE(fallback_self, nullptr);
+  auto fallback_result = Ref<>::steal(PyObject_CallFunctionObjArgs(
+      fallback_callable.get(), fallback_self.get(), value.get(), nullptr));
+  ASSERT_NE(fallback_result, nullptr);
+  EXPECT_TRUE(isIntEquals(fallback_result, 42));
 }
 #endif
 
