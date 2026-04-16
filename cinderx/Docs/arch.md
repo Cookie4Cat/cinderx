@@ -6,8 +6,7 @@ CinderX 是一个 Python 扩展模块，旨在提升 Python 运行时的性能�
 
 | 角色 | 角色描述 |
 |:--|:-------|
-| Python 应用开发者 | 通过 JIT 编译和 Static Python 获得性能提升，无需修改现有代码 |
-| 运维工程师 | 通过并行 GC 和轻量级帧优化降低服务延迟和资源消耗 |
+| Python 应用开发者 | 通过 JIT 编译、Static Python 和轻量级帧优化获得性能提升并降低服务延迟和资源消耗，无需修改现有代码 |
 | 性能工程师 | 利用 JIT 编译、类型特化等特性进行深度性能优化 |
 
 ## 1.2、依赖组件
@@ -32,7 +31,7 @@ MIT License
 CinderX 的核心架构目标是**作为 CPython 的扩展模块而非分支**运行，这决定了其与 CPython 之间的边界设计原则：
 
 1. **最小侵入性**：通过标准的 Python C API 和有限的内部 API 与 CPython 交互
-2. **版本兼容性**：支持多个 CPython 版本（3.10-3.15），通过抽象层屏蔽版本差异
+2. **版本兼容性**：支持 CPython 3.14.3+，通过抽象层屏蔽版本差异
 3. **可插拔性**：可以动态加载和卸载，不修改 CPython 核心代码
 4. **性能优先**：在边界设计上允许必要的底层访问以实现高性能优化
 
@@ -42,17 +41,16 @@ CinderX 的核心架构目标是**作为 CPython 的扩展模块而非分支**�
 |:--|:-------|:------|:-----|
 | JIT 编译 | 将 Python 字节码编译为本地机器码 | 功能 | 高 |
 | Static Python | 提供更严格的 Python 子集以实现类型安全和优化 | 功能 | 高 |
-| 多版本兼容 | 支持 CPython 3.10 至 3.15 多个版本 | 兼容性 | 高 |
+| 多版本兼容 | 支持 CPython 3.14.3+ | 兼容性 | 高 |
 | 帧评估器替换 | 通过 PEP 523 钩子替换解释器帧评估函数 | 功能 | 高 |
 | 去优化支持 | 支持从 JIT 代码回退到解释器执行 | 可靠性 | 高 |
-| 并行 GC | 多线程垃圾回收优化 | 性能 | 中 |
 | 轻量级帧 | 减少帧对象内存开销 | 性能 | 中 |
 
 ## 2.3 假设和约束
 
-- **运行环境**：Linux x86_64（主要支持），macOS（部分功能），Windows（暂不支持）
+- **运行环境**：Linux ARM64、X86_64（主要支持），不支持 macOS、Windows
 - **编译器要求**：GCC 13+ 或 Clang 18+
-- **Python 版本**：Python 3.14.3+（完整支持），3.10-3.12 需要 Meta 的 CPython 分支
+- **Python 版本**：Python 3.14.3+（完整支持），暂不兼容 Meta 的 CPython 分支
 - **GIL 依赖**：当前主要针对 GIL 模式设计，free-threading 支持正在开发中
 
 ## 2.4 架构原则
@@ -100,7 +98,7 @@ graph TB
 
     Interpreter -- "PEP 523<br/>帧评估器替换" --> CXI
     Objects -- "Type/Dict/Func<br/>Watcher 监听" --> CXL
-    GC -- "并行 GC 集成" --> CinderX
+    GC -- "GC 集成" --> CinderX
     Modules -- "Import 钩子" --> CXL
 
     CXL --> JIT
@@ -118,7 +116,7 @@ CinderX 与 CPython 之间的边界通过三层抽象实现，从上到下依次
 graph TB
     subgraph CinderX内部["CinderX 内部实现"]
         direction TB
-        BizLayer["业务功能层<br/>JIT Compiler | Static Python | Parallel GC | Interpreter"]
+        BizLayer["业务功能层<br/>JIT Compiler | Static Python | Interpreter"]
         AbsLayer["公共抽象层<br/>py-portability.h | ref.h | code.h | type.h | watchers.h | opcode_stubs.h"]
         BorrowLayer["代码借用层<br/>borrowed.h（符号重定义，避免冲突）"]
 
@@ -146,9 +144,8 @@ graph TB
 | EXT-001 | Python API | `cinderx.jit.auto()` - 自动 JIT 编译 | 启动后自动编译热点函数 |
 | EXT-002 | Python API | `cinderx.jit.force_compile(func)` - 强制编译指定函数 | 同步编译，返回编译结果 |
 | EXT-003 | Python API | `cinderx.jit.lazy_compile(func)` - 延迟编译 | 下次调用时编译 |
-| EXT-004 | Python API | `cinderx.enable_parallel_gc()` - 启用并行 GC | 可配置线程数和代数 |
-| EXT-005 | C API | `PyInit__cinderx()` - 模块初始化入口 | Python 扩展标准入口 |
-| EXT-006 | C API | `Ci_EvalFrame()` - 帧评估函数 | 替换 CPython 默认帧评估器 |
+| EXT-004 | C API | `PyInit__cinderx()` - 模块初始化入口 | Python 扩展标准入口 |
+| EXT-005 | C API | `Ci_EvalFrame()` - 帧评估函数 | 替换 CPython 默认帧评估器 |
 
 ## 3.2、USE-CASE 模型
 
@@ -161,16 +158,14 @@ graph LR
     UC1["自动 JIT 编译<br/>import cinderx.jit; jit.auto()"]
     UC2["手动 JIT 编译<br/>jit.force_compile(func)"]
     UC3["Static Python 编译<br/>类型注解 + 严格模块"]
-    UC4["并行垃圾回收<br/>enable_parallel_gc()"]
-    UC5["缓存属性<br/>@cached_property"]
-    UC6["对象永生化<br/>immortalize_heap()"]
+    UC4["缓存属性<br/>@cached_property"]
+    UC5["对象永生化<br/>immortalize_heap()"]
 
     Actor --> UC1
     Actor --> UC2
     Actor --> UC3
     Actor --> UC4
     Actor --> UC5
-    Actor --> UC6
 ```
 
 ## 3.3、逻辑视图
@@ -208,8 +203,6 @@ graph TB
         interp_h["interpreter.h<br/>解释器接口"]
         cinder_op["cinder_opcode<br/>扩展操作码"]
         interp_base["interpreter_base<br/>基础实现"]
-        v310["3.10/"]
-        v312["3.12/"]
         v314["3.14/"]
         v315["3.15/"]
     end
@@ -401,11 +394,54 @@ void reifyFrame(
 | Interpreter/ | 解释器层 | 自定义字节码解释器 | 替换 CPython 帧评估器 |
 | Jit/ | JIT 编译器 | 字节码到机器码编译 | 通过公共抽象层间接调用 |
 | StaticPython/ | 静态 Python | 类型特化优化 | 扩展 Python 类型系统 |
-| ParallelGC/ | 并行 GC | 多线程垃圾回收 | 集成 CPython GC 机制 |
 
 ### 3.4.2、构建系统
 
-CMake 构建系统，主要编译目标：
+CinderX 的最终发布产物为 **wheel 包**（`.whl`），构建流水线由 setuptools 编排，CMake 作为其中的编译环节：
+
+```mermaid
+graph LR
+    subgraph Pipeline["构建流水线"]
+        direction LR
+        A["pyproject.toml<br/>定义构建后端与项目元数据"] --> B["setup.py<br/>编排构建流程"]
+        B --> C["BuildPy<br/>打包 Python 模块<br/>（opcode、.pth 等）"]
+        B --> D["BuildExt<br/>调用 CMake 编译 C++ 扩展"]
+        D --> E["CMake<br/>编译 _cinderx.so"]
+        E --> F["wheel 包<br/>cinderx-版本-cp314-linux_x86_64.whl"]
+    end
+```
+
+#### 1. 项目元数据（pyproject.toml）
+
+定义构建后端、Python 版本要求和 cibuildwheel 配置：
+
+```toml
+[build-system]
+requires = ["setuptools >= 77.0.3"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "cinderx"
+requires-python = ">= 3.14.0, < 3.16"
+
+[tool.cibuildwheel]
+build = ["cp314-manylinux_x86_64", "cp314-musllinux_x86_64"]
+environment = { CINDERX_ENABLE_PGO = "1", CINDERX_ENABLE_LTO = "1" }
+```
+
+#### 2. 构建编排（setup.py）
+
+通过自定义 setuptools 命令编排构建流程：
+
+| 命令 | 职责 |
+|:--|:------|
+| `BuildCommand` | 顶层构建入口，支持 PGO（Profile-Guided Optimization）三阶段构建 |
+| `BuildPy` | 打包 Python 模块，生成版本特定的 opcode.py、.pth 文件等 |
+| `BuildExt` | 调用 CMake 编译 C++ 扩展模块 `_cinderx` |
+
+#### 3. CMake 编译环节
+
+CMake 由 `BuildExt` 调用，负责将 C++ 源码编译为 `_cinderx.so` 共享库：
 
 ```cmake
 # 主要库目标
@@ -419,8 +455,18 @@ add_library(static-python ${STATIC_PYTHON_SOURCES})  # Static Python
 add_library(_cinderx SHARED ${SOURCES})
 target_link_libraries(_cinderx PRIVATE
   Python::Module borrowed cached-properties common immortalize
-  interpreter jit parallel-gc static-python asmjit::asmjit fmt::fmt)
+  interpreter jit static-python asmjit::asmjit fmt::fmt)
 ```
+
+#### 4. wheel 包内容
+
+| 内容 | 来源 | 说明 |
+|:--|:------|:-----|
+| `_cinderx.so` | CMake 编译产物 | C++ 扩展模块 |
+| `cinderx/` | PythonLib/cinderx/ | Python 包（jit.py、strictmodule.py 等） |
+| `cinderx/opcode.py` | 构建时生成 | 版本特定的操作码定义 |
+| `cinderx.pth` | PythonLib/cinderx.pth | 启动时自动加载 cinderx |
+| `cinderx/.dev_build` | 构建时生成 | 标记开发构建 |
 
 ## 3.5、运行视图
 
@@ -595,33 +641,7 @@ sequenceDiagram
     Py->>SP: StaticTypeError（编译时类型检查失败）
 ```
 
-### 3.5.6、并行 GC 场景
-
-开发者启用并行 GC 以减少垃圾回收停顿时间：
-
-```mermaid
-sequenceDiagram
-    participant Dev as 开发者代码
-    participant Py as CPython GC
-    participant PGC as CinderX ParallelGC
-    participant T1 as 工作线程1
-    participant T2 as 工作线程2
-
-    Dev->>PGC: cinderx.enable_parallel_gc(min_generation=2, num_threads=4)
-
-    Note over Dev,T2: 应用运行中产生大量对象
-
-    Py->>PGC: GC 触发（generation >= 2）
-    PGC->>PGC: 将堆分区
-    PGC->>T1: 分配分区1
-    PGC->>T2: 分配分区2
-    T1->>PGC: 标记分区1存活对象
-    T2->>PGC: 标记分区2存活对象
-    PGC->>Py: 合并结果，完成回收
-    Py-->>Dev: 应用继续运行（停顿时间显著缩短）
-```
-
-### 3.5.7、运行时状态切换
+### 3.5.6、运行时状态切换
 
 CinderX 的 JIT 编译器在运行时有明确的生命周期状态：
 
@@ -694,14 +714,13 @@ stateDiagram-v2
 
 | no | 特性描述 | 代码估计规模 | 实现版本 |
 |:--|:-------|:------|:----|
-| 1 | JIT 编译器核心 | ~50K LOC | 3.10+ |
-| 2 | Static Python | ~20K LOC | 3.10+ |
-| 3 | 多版本移植层 | ~5K LOC | 3.10-3.15 |
-| 4 | 帧评估器替换 | ~3K LOC | 3.10+ |
-| 5 | 去优化机制 | ~5K LOC | 3.10+ |
-| 6 | 并行 GC | ~3K LOC | 3.14+ |
-| 7 | 轻量级帧 | ~2K LOC | 3.14+ |
-| 8 | 缓存属性 | ~1K LOC | 3.10+ |
+| 1 | JIT 编译器核心 | ~50K LOC | 3.14+ |
+| 2 | Static Python | ~20K LOC | 3.14+ |
+| 3 | 多版本移植层 | ~5K LOC | 3.14+ |
+| 4 | 帧评估器替换 | ~3K LOC | 3.14+ |
+| 5 | 去优化机制 | ~5K LOC | 3.14+ |
+| 6 | 轻量级帧 | ~2K LOC | 3.14+ |
+| 7 | 缓存属性 | ~1K LOC | 3.14+ |
 
 ## 3.8、接口清单
 
@@ -712,7 +731,6 @@ stateDiagram-v2
 | cinderx.jit.auto() | 启用自动 JIT 编译 | 无 | None | RuntimeError |
 | cinderx.jit.force_compile(func) | 强制编译函数 | 函数对象 | bool | TypeError |
 | cinderx.jit.lazy_compile(func) | 延迟编译函数 | 函数对象 | None | TypeError |
-| cinderx.enable_parallel_gc(min_gen, num_threads) | 启用并行 GC | 代数, 线程数 | None | ValueError |
 | cinderx.install_frame_evaluator() | 安装帧评估器 | 无 | None | RuntimeError |
 | cinderx.clear_caches() | 清除 JIT 缓存 | 无 | None | - |
 
@@ -734,6 +752,7 @@ stateDiagram-v2
 |:--|:-------|
 | 1.0 | 初始架构文档，基于代码库实际实现更新，重点体现 CinderX 与 CPython 边界设计 |
 | 1.1 | 图表改用 Mermaid 表达；运行视图改为开发者使用 CinderX 发布件的视角 |
+| 1.2 | 移除并行 GC 相关内容（受益人、需求、接口、场景、特性清单等）；CPython 版本范围统一为 3.14.3+，暂不兼容 Meta 分支；运行环境更新为 Linux ARM64/X86_64，不支持 macOS/Windows；构建系统改为以 wheel 包为产物的流水线描述 |
 
 # 5、参考目录
 
