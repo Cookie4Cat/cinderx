@@ -2088,15 +2088,30 @@ void HIRBuilder::emitBinaryOp(
 
   int opcode = bc_instr.opcode();
   int oparg = bc_instr.oparg();
-
   if (getConfig().specialized_opcodes) {
     switch (bc_instr.specializedOpcode()) {
       case BINARY_OP_ADD_INT:
       case BINARY_OP_MULTIPLY_INT:
-      case BINARY_OP_SUBTRACT_INT:
         tc.emit<GuardType>(left, TLongExact, left, tc.frame);
         tc.emit<GuardType>(right, TLongExact, right, tc.frame);
         break;
+      case BINARY_OP_SUBTRACT_INT: {
+        if (!(left->isA(TLongExact) && right->isA(TLongExact))) {
+          tc.emit<CallStatic>(
+              2,
+              result,
+              reinterpret_cast<void*>(JITRT_BinaryOpSpecializedSubtract),
+              TObject,
+              left,
+              right);
+          tc.emit<CheckExc>(result, result, tc.frame);
+          stack.push(result);
+          return;
+        }
+        tc.emit<GuardType>(left, TLongExact, left, tc.frame);
+        tc.emit<GuardType>(right, TLongExact, right, tc.frame);
+        break;
+      }
       case BINARY_OP_ADD_FLOAT:
       case BINARY_OP_MULTIPLY_FLOAT:
       case BINARY_OP_SUBTRACT_FLOAT:

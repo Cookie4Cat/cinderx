@@ -215,6 +215,8 @@ PyObject* JITRT_LoadAttrInstanceValue(
     int64_t offset,
     PyObject* name);
 
+PyObject* JITRT_BinaryOpSpecializedSubtract(PyObject* left, PyObject* right);
+
 int JITRT_StoreAttrInstanceValue(
     PyObject* obj,
     int64_t type_version,

@@ -1171,6 +1171,45 @@ PyObject* JITRT_LoadAttrInstanceValue(
 #endif
 }
 
+namespace {
+
+using binaryfunc = PyObject* (*)(PyObject*, PyObject*);
+
+static PyObject* binaryOpSpecializedFloatLongSubtract(
+    PyObject* left,
+    PyObject* right) {
+  if (PyFloat_CheckExact(left) && PyFloat_CheckExact(right)) {
+    return PyFloat_FromDouble(PyFloat_AS_DOUBLE(left) - PyFloat_AS_DOUBLE(right));
+  }
+
+  if (PyLong_CheckExact(left) && PyLong_CheckExact(right)) {
+    return PyLong_Type.tp_as_number->nb_subtract(left, right);
+  }
+
+  if ((PyFloat_CheckExact(left) || PyLong_CheckExact(left)) &&
+      (PyFloat_CheckExact(right) || PyLong_CheckExact(right))) {
+    double lhs =
+        PyFloat_CheckExact(left) ? PyFloat_AS_DOUBLE(left) : PyLong_AsDouble(left);
+    if (lhs == -1.0 && PyErr_Occurred()) {
+      return nullptr;
+    }
+    double rhs = PyFloat_CheckExact(right) ? PyFloat_AS_DOUBLE(right)
+                                           : PyLong_AsDouble(right);
+    if (rhs == -1.0 && PyErr_Occurred()) {
+      return nullptr;
+    }
+    return PyFloat_FromDouble(lhs - rhs);
+  }
+
+  return PyNumber_Subtract(left, right);
+}
+
+} // namespace
+
+PyObject* JITRT_BinaryOpSpecializedSubtract(PyObject* left, PyObject* right) {
+  return binaryOpSpecializedFloatLongSubtract(left, right);
+}
+
 int JITRT_StoreAttrInstanceValue(
     PyObject* obj,
     int64_t type_version,
