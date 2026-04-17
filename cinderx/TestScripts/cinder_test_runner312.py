@@ -43,6 +43,7 @@ import test.libregrtest.runtests as libregrtest_runtests
 import test.libregrtest.save_env as libregrtest_save_env
 import test.libregrtest.setup as libregrtest_setup
 import test.libregrtest.single as libregrtest_single
+import test.libregrtest.testresult as libregrtest_testresult
 import test.libregrtest.utils as libregrtest_utils
 import cinderx.jit
 from cinderx.test_support import get_cinderjit_xargs, is_sanitizer_build
@@ -840,6 +841,59 @@ def patch_libregrtest_save_env_jit_suppress():
     cls.__exit__ = patched_exit
 
 
+def _jit_suppress_attrs(cls, *names):
+    for name in names:
+        if hasattr(cls, name):
+            setattr(cls, name, cinderx.jit.jit_suppress(getattr(cls, name)))
+
+
+def patch_unittest_jit_suppress():
+    # Low-threshold autojit can compile unittest/libregrtest bookkeeping code
+    # and crash in framework internals rather than user test bodies.
+    _jit_suppress_attrs(
+        unittest.case._Outcome,
+        "testPartExecutor",
+    )
+    _jit_suppress_attrs(
+        unittest.case.TestCase,
+        "__call__",
+        "run",
+        "assertEqual",
+        "_getAssertEqualityFunc",
+        "_baseAssertEqual",
+        "assertIsInstance",
+        "shortDescription",
+    )
+    _jit_suppress_attrs(
+        unittest.suite.TestSuite,
+        "_tearDownPreviousClass",
+        "_handleModuleFixture",
+        "_handleClassSetUp",
+    )
+    _jit_suppress_attrs(
+        unittest.result.TestResult,
+        "startTest",
+        "_setupStdout",
+        "_restoreStdout",
+    )
+    _jit_suppress_attrs(
+        unittest.runner.TextTestResult,
+        "startTest",
+        "_write_status",
+        "getDescription",
+    )
+    _jit_suppress_attrs(
+        unittest.runner._WritelnDecorator,
+        "writeln",
+        "__getattr__",
+    )
+    _jit_suppress_attrs(
+        libregrtest_testresult.RegressionTestResult,
+        "_add_result",
+        "startTest",
+    )
+
+
 def should_patch_save_env_jit_suppress():
     return os.environ.get("CINDERX_DISABLE_SAVE_ENV_JIT_SUPPRESS") != "1"
 
@@ -853,6 +907,7 @@ def user_selected_main(args):
     patch_libregrtest_os_environ_snapshot()
     if should_patch_save_env_jit_suppress():
         patch_libregrtest_save_env_jit_suppress()
+        patch_unittest_jit_suppress()
 
     fix_env_always_changed_issue()
 
@@ -888,6 +943,7 @@ def worker_main(args):
     patch_libregrtest_os_environ_snapshot()
     if should_patch_save_env_jit_suppress():
         patch_libregrtest_save_env_jit_suppress()
+        patch_unittest_jit_suppress()
     libregrtest_setup.setup_process()
     with open(args.runtest_config_json_file, "r") as f:
         worker_runtests_dict = json.load(f)
