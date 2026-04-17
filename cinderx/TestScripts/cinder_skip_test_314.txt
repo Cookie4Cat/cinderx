@@ -1,5 +1,24 @@
-# This variant starts w/ the perf trampoline enabled and CinderX can't install over it
-test.test_perf_profiler.TestPerfTrampoline.test_trampoline_works
+# CinderX installs its own frame-eval / JIT machinery, which conflicts with
+# CPython's perf-profiler trampoline tests.
+test.test_perf_profiler.*
+
+# _cinderx declares Py_MOD_MULTIPLE_INTERPRETERS_NOT_SUPPORTED, so
+# subinterpreter/embed tests that assume distinct subinterpreter state are not
+# compatible with a CinderX-enabled runtime.
+test.test_embed.test_audit_subinterpreter
+test.test_subinterps_different_ids
+test.test_subinterps_distinct_state
+test.test_subinterps_main
+
+# test_getpath executes getpath.py in a synthetic namespace via exec(). In the
+# CinderX runner, builtins exposure can leak the cinderx module into that
+# namespace; the reused namespace in test_registry_win32 then fails its second
+# deepcopy-based assertion.
+test.test_getpath.MockGetPathTests.test_registry_win32
+
+# This validates CPython's own JIT state reporting. Once CinderX is imported,
+# the runtime no longer reflects a pure CPython JIT-only environment.
+test.test_sys.TestSysJIT.test_jit_is_active
 
 # This test hits a deprecation warning about forking in a multi-threaded process
 test.test_threading.ThreadTests.test_native_id_after_fork
@@ -9,3 +28,7 @@ test_cinderx.test_parallel_gc.*
 
 # T249123927
 test.test_generators.GeneratorTest.test_close_clears_frame
+
+# These validate CPython's own tier2/uops executors. Once CinderX is imported,
+# CPython no longer produces the expected executors in this environment.
+test.test_capi.test_opt.*

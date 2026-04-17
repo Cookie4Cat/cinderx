@@ -2949,13 +2949,23 @@ bool HIRBuilder::tryEmitProfiledMethodWithValuesCall(
     call_tc.emit<LoadConst>(funcreg, Type::fromObject(pending.descr));
 
     Register* call_out = temps_.AllocateStack();
-    auto vector_call = call_tc.emit<VectorCall>(num_operands, call_out, flags);
-    vector_call->SetOperand(0, funcreg);
-    vector_call->SetOperand(1, self);
-    for (std::size_t i = 2; i < num_operands; i++) {
-      vector_call->SetOperand(i, arg_regs[i - 1]);
+    if (PyFunction_Check(pending.descr)) {
+      auto call = call_tc.emit<CallMethod>(num_operands, call_out, flags);
+      call->SetOperand(0, funcreg);
+      call->SetOperand(1, self);
+      for (std::size_t i = 2; i < num_operands; i++) {
+        call->SetOperand(i, arg_regs[i - 1]);
+      }
+      call->setFrameState(call_tc.frame);
+    } else {
+      auto vector_call = call_tc.emit<VectorCall>(num_operands, call_out, flags);
+      vector_call->SetOperand(0, funcreg);
+      vector_call->SetOperand(1, self);
+      for (std::size_t i = 2; i < num_operands; i++) {
+        vector_call->SetOperand(i, arg_regs[i - 1]);
+      }
+      vector_call->setFrameState(call_tc.frame);
     }
-    vector_call->setFrameState(call_tc.frame);
     call_tc.frame.stack.push(call_out);
     return call_out;
   };
@@ -3319,6 +3329,18 @@ bool HIRBuilder::tryInlineTupleGenexprCall(
     return false;
   }
 
+  BasicBlock* resume_block = nullptr;
+  if (!pattern->returns_directly) {
+    if (!pattern->resume_off.has_value()) {
+      return false;
+    }
+    auto it = block_map_.blocks.find(*pattern->resume_off);
+    if (it == block_map_.blocks.end()) {
+      return false;
+    }
+    resume_block = it->second;
+  }
+
   Register* closure_tuple = findFunctionClosure(tc.block, genfunc);
   if (numFreevars(gen_code) != 0 && closure_tuple == nullptr) {
     return false;
@@ -3356,7 +3378,7 @@ bool HIRBuilder::tryInlineTupleGenexprCall(
         pattern->resume_off.has_value(),
         "tuple genexpr pattern should provide resume offset when not returning");
     stack.push(result);
-    tc.emit<Branch>(getBlockAtOff(*pattern->resume_off));
+    tc.emit<Branch>(resume_block);
   }
   stop_block_translation_ = true;
   return true;
@@ -4575,7 +4597,6 @@ void HIRBuilder::emitLoadAttr(
 #else
       false;
 #endif
-
   if (getConfig().specialized_opcodes) {
     auto instance_value_min_locals = [&]() -> int {
 #if PY_VERSION_HEX >= 0x030E0000
@@ -4693,6 +4714,13 @@ void HIRBuilder::emitLoadAttr(
       case LOAD_ATTR_MODULE: {
         Type type = Type::fromTypeExact(&PyModule_Type);
         tc.emit<GuardType>(receiver, type, receiver, tc.frame);
+        if (is_method) {
+          Register* result = temps_.AllocateStack();
+          tc.emit<LoadAttr>(result, receiver, name_idx, tc.frame);
+          tc.frame.stack.push(result);
+          emitPushNull(tc);
+          return;
+        }
         break;
       }
       case LOAD_ATTR_SLOT: {
@@ -4710,6 +4738,9 @@ void HIRBuilder::emitLoadAttr(
         CheckField* cf = tc.emit<CheckField>(result, result, name, tc.frame);
         cf->setGuiltyReg(receiver);
         tc.frame.stack.push(result);
+        if (is_method) {
+          emitPushNull(tc);
+        }
         return;
       }
 #if PY_VERSION_HEX >= 0x030E0000
@@ -4733,6 +4764,9 @@ void HIRBuilder::emitLoadAttr(
         CheckField* cf = tc.emit<CheckField>(result, result, name, tc.frame);
         cf->setGuiltyReg(receiver);
         tc.frame.stack.push(result);
+        if (is_method) {
+          emitPushNull(tc);
+        }
         return;
       }
       case LOAD_ATTR_METHOD_WITH_VALUES: {

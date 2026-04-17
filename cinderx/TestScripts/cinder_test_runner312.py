@@ -10,6 +10,7 @@
 # internal logging systems, etc.
 
 import argparse
+import builtins
 import dataclasses
 import difflib
 import gc
@@ -43,6 +44,7 @@ import test.libregrtest.runtests as libregrtest_runtests
 import test.libregrtest.save_env as libregrtest_save_env
 import test.libregrtest.setup as libregrtest_setup
 import test.libregrtest.single as libregrtest_single
+import test.libregrtest.testresult as libregrtest_testresult
 import test.libregrtest.utils as libregrtest_utils
 import cinderx.jit
 from cinderx.test_support import get_cinderjit_xargs, is_sanitizer_build
@@ -51,7 +53,6 @@ from common import (
     ASANLogManipulator,
     CINDER_RUNNER_LOG_DIR,
     get_cinderx_dir,
-    get_cinderx_static_tests,
     log_err,
     MAX_WORKERS,
     MessagePipe,
@@ -94,8 +95,6 @@ WORKER_PATH = os.path.abspath(__file__)
 # treating the whole directory as a single test module.
 CINDERX_SPLIT_TEST_DIRS = {
     "test_cinderx.test_cpython_overrides",
-    "test_cinderx.test_compiler",
-    "test_cinderx.test_compiler.test_static",
 }
 
 
@@ -337,14 +336,6 @@ def _select_tests(exclude: Set[str]) -> List[str]:
     )
     tests.extend(cinderx_tests)
 
-    # findtests won't discover the static tests that don't start with test_, so manually
-    # add those (it would find just test_static if we didn't split on that, but we want
-    # to parallelize all of the static tests)
-    testdir = libregrtest_findtests.findtestdir(
-        get_test_cinderx_dir() / Path("test_compiler/test_static")
-    )
-    tests.extend(get_cinderx_static_tests(testdir))
-
     return tests
 
 
@@ -432,7 +423,7 @@ class MultiWorkerCinderRegrtest:
             use_junit=False,
             memory_limit=None,
             gc_threshold=None,
-            use_resources=(),
+            use_resources={},
             python_cmd=None,
             randomize=False,
             random_seed=1,
@@ -750,14 +741,26 @@ def patch_libregrtest_to_use_loadTestsFromName():
     # Mostly a copy of test.libregrtest.single.run_unittest
     def patched_run_unittest(test_name):
         loader = libregrtest_single.unittest.TestLoader()
-        # Primary change for CinderX is this line
-        tests = loader.loadTestsFromName(test_name, None)
-        for error in loader.errors:
-            print(error, file=sys.stderr)
-        if loader.errors:
-            raise Exception("errors while loading tests")
-        libregrtest_single._filter_suite(tests, libregrtest_single.match_test)
-        return libregrtest_single._run_suite(tests)
+        saved_builtin = getattr(builtins, "cinderx", None)
+        removed_builtin = False
+        if test_name.startswith("test.") and hasattr(builtins, "cinderx"):
+            # Some stdlib tests exec code into ad-hoc namespaces and then
+            # deepcopy them; exposing the cinderx module through builtins makes
+            # those namespaces unpicklable.
+            del builtins.cinderx
+            removed_builtin = True
+        try:
+            # Primary change for CinderX is this line
+            tests = loader.loadTestsFromName(test_name, None)
+            for error in loader.errors:
+                print(error, file=sys.stderr)
+            if loader.errors:
+                raise Exception("errors while loading tests")
+            libregrtest_single._filter_suite(tests, libregrtest_single.match_test)
+            return libregrtest_single._run_suite(tests)
+        finally:
+            if removed_builtin:
+                builtins.cinderx = saved_builtin
 
     def patched__load_run_test(
         result: libregrtest_single.TestResult, runtests: libregrtest_single.RunTests
@@ -840,6 +843,59 @@ def patch_libregrtest_save_env_jit_suppress():
     cls.__exit__ = patched_exit
 
 
+def _jit_suppress_attrs(cls, *names):
+    for name in names:
+        if hasattr(cls, name):
+            setattr(cls, name, cinderx.jit.jit_suppress(getattr(cls, name)))
+
+
+def patch_unittest_jit_suppress():
+    # Low-threshold autojit can compile unittest/libregrtest bookkeeping code
+    # and crash in framework internals rather than user test bodies.
+    _jit_suppress_attrs(
+        unittest.case._Outcome,
+        "testPartExecutor",
+    )
+    _jit_suppress_attrs(
+        unittest.case.TestCase,
+        "__call__",
+        "run",
+        "assertEqual",
+        "_getAssertEqualityFunc",
+        "_baseAssertEqual",
+        "assertIsInstance",
+        "shortDescription",
+    )
+    _jit_suppress_attrs(
+        unittest.suite.TestSuite,
+        "_tearDownPreviousClass",
+        "_handleModuleFixture",
+        "_handleClassSetUp",
+    )
+    _jit_suppress_attrs(
+        unittest.result.TestResult,
+        "startTest",
+        "_setupStdout",
+        "_restoreStdout",
+    )
+    _jit_suppress_attrs(
+        unittest.runner.TextTestResult,
+        "startTest",
+        "_write_status",
+        "getDescription",
+    )
+    _jit_suppress_attrs(
+        unittest.runner._WritelnDecorator,
+        "writeln",
+        "__getattr__",
+    )
+    _jit_suppress_attrs(
+        libregrtest_testresult.RegressionTestResult,
+        "_add_result",
+        "startTest",
+    )
+
+
 def should_patch_save_env_jit_suppress():
     return os.environ.get("CINDERX_DISABLE_SAVE_ENV_JIT_SUPPRESS") != "1"
 
@@ -853,6 +909,7 @@ def user_selected_main(args):
     patch_libregrtest_os_environ_snapshot()
     if should_patch_save_env_jit_suppress():
         patch_libregrtest_save_env_jit_suppress()
+        patch_unittest_jit_suppress()
 
     fix_env_always_changed_issue()
 
@@ -888,6 +945,7 @@ def worker_main(args):
     patch_libregrtest_os_environ_snapshot()
     if should_patch_save_env_jit_suppress():
         patch_libregrtest_save_env_jit_suppress()
+        patch_unittest_jit_suppress()
     libregrtest_setup.setup_process()
     with open(args.runtest_config_json_file, "r") as f:
         worker_runtests_dict = json.load(f)
