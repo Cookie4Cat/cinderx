@@ -3319,6 +3319,18 @@ bool HIRBuilder::tryInlineTupleGenexprCall(
     return false;
   }
 
+  BasicBlock* resume_block = nullptr;
+  if (!pattern->returns_directly) {
+    if (!pattern->resume_off.has_value()) {
+      return false;
+    }
+    auto it = block_map_.blocks.find(*pattern->resume_off);
+    if (it == block_map_.blocks.end()) {
+      return false;
+    }
+    resume_block = it->second;
+  }
+
   Register* closure_tuple = findFunctionClosure(tc.block, genfunc);
   if (numFreevars(gen_code) != 0 && closure_tuple == nullptr) {
     return false;
@@ -3356,7 +3368,7 @@ bool HIRBuilder::tryInlineTupleGenexprCall(
         pattern->resume_off.has_value(),
         "tuple genexpr pattern should provide resume offset when not returning");
     stack.push(result);
-    tc.emit<Branch>(getBlockAtOff(*pattern->resume_off));
+    tc.emit<Branch>(resume_block);
   }
   stop_block_translation_ = true;
   return true;
