@@ -159,6 +159,28 @@ class SpecializationTests(unittest.TestCase):
             self.assertIn("BINARY_SUBSCR_LIST_INT", opnames(f))
         self.assertEqual(f(["c", "d"], 0), "c")
 
+    def test_binary_subscr_list_slice(self) -> None:
+        def f(a: list[str]) -> list[str]:
+            return a[:]
+
+        specialize(f, lambda: f(["a", "b"]))
+
+        self.assertNotIn("BINARY_OP", opnames(f))
+        self.assertIn("BINARY_OP_SUBSCR_LIST_SLICE", opnames(f))
+        items = ["c", "d"]
+        result = f(items)
+        self.assertEqual(result, ["c", "d"])
+        self.assertIsNot(result, items)
+
+    def test_min_single_arg(self) -> None:
+        def f(items):
+            return min(items)
+
+        specialize(f, lambda: f(frozenset((3, 1, 2))))
+
+        self.assertEqual(f(frozenset((3, 1, 2))), 1)
+        self.assertEqual(f([5, 4, 6]), 4)
+
     def test_binary_subscr_tuple_int(self) -> None:
         def f(a: tuple[str, str], b: int) -> str:
             return a[b]
@@ -228,6 +250,20 @@ class SpecializationTests(unittest.TestCase):
         d = {"a": "b"}
         f(d, "a", "c")
         self.assertEqual(d, {"a": "c"})
+
+    def test_store_subscr_list_int(self) -> None:
+        def f(a: list[str], b: int, c: str) -> None:
+            a[b] = c
+
+        specialize(f, lambda: f(["a", "b"], 0, "c"))
+
+        if sys.version_info >= (3, 14):
+            self.assertNotIn("STORE_SUBSCR", opnames(f))
+            self.assertIn("STORE_SUBSCR_LIST_INT", opnames(f))
+
+        d = ["a", "b"]
+        f(d, 0, "c")
+        self.assertEqual(d, ["c", "b"])
 
     def test_unpack_sequence_list(self) -> None:
         def f(li: list[str]) -> str:

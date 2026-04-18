@@ -2121,9 +2121,27 @@ void HIRBuilder::emitBinaryOp(
         tc.emit<GuardType>(left, TDictExact, left, tc.frame);
         break;
       case BINARY_SUBSCR_LIST_INT:
-        tc.emit<GuardType>(left, TListExact, left, tc.frame);
-        tc.emit<GuardType>(right, TLongExact, right, tc.frame);
-        break;
+        tc.emit<CallStatic>(
+            2,
+            result,
+            reinterpret_cast<void*>(JITRT_BinarySubscrListInt),
+            TObject,
+            left,
+            right);
+        tc.emit<CheckExc>(result, result, tc.frame);
+        stack.push(result);
+        return;
+      case BINARY_OP_SUBSCR_LIST_SLICE:
+        tc.emit<CallStatic>(
+            2,
+            result,
+            reinterpret_cast<void*>(JITRT_BinarySubscrListSlice),
+            TObject,
+            left,
+            right);
+        tc.emit<CheckExc>(result, result, tc.frame);
+        stack.push(result);
+        return;
       case BINARY_SUBSCR_TUPLE_INT:
         tc.emit<GuardType>(left, TTupleExact, left, tc.frame);
         tc.emit<GuardType>(right, TLongExact, right, tc.frame);
@@ -4102,6 +4120,21 @@ void HIRBuilder::emitStoreSubscr(
   if (getConfig().specialized_opcodes &&
       bc_instr.specializedOpcode() == STORE_SUBSCR_DICT) {
     tc.emit<GuardType>(container, TDictExact, container, tc.frame);
+  }
+
+  if (getConfig().specialized_opcodes &&
+      bc_instr.specializedOpcode() == STORE_SUBSCR_LIST_INT) {
+    Register* result = temps_.AllocateStack();
+    tc.emit<CallStatic>(
+        3,
+        result,
+        reinterpret_cast<void*>(JITRT_StoreSubscrListInt),
+        TCInt32,
+        container,
+        sub,
+        value);
+    tc.emit<CheckNeg>(result, result, tc.frame);
+    return;
   }
 
   tc.emit<StoreSubscr>(container, sub, value, tc.frame);

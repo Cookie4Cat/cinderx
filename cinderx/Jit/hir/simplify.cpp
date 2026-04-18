@@ -13,6 +13,7 @@
 #include "cinderx/Jit/hir/analysis.h"
 #include "cinderx/Jit/hir/clean_cfg.h"
 #include "cinderx/Jit/hir/copy_propagation.h"
+#include "cinderx/Jit/jit_rt.h"
 #include "cinderx/Jit/hir/printer.h"
 #include "cinderx/Jit/hir/type.h"
 #include "cinderx/Jit/threaded_compile.h"
@@ -1814,6 +1815,15 @@ Register* simplifyVectorCall(Env& env, const VectorCall* instr) {
   if (isBuiltin(target, "len") && instr->numArgs() == 1) {
     env.emit<UseType>(target, target->type());
     return env.emit<GetLength>(instr->arg(0), *instr->frameState());
+  }
+  if (isBuiltin(target, "min") && instr->numArgs() == 1) {
+    env.emit<UseType>(target, target->type());
+    Register* result = env.emitVariadic<CallStatic>(
+        1,
+        reinterpret_cast<void*>(JITRT_MinSingleArg),
+        TObject,
+        instr->arg(0));
+    return env.emit<CheckExc>(result, *instr->frameState());
   }
   if (isBuiltin(target, "isinstance") && instr->numArgs() == 2 &&
       instr->GetOperand(2)->type() <= TType &&

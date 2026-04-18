@@ -215,6 +215,12 @@ PyObject* JITRT_LoadAttrInstanceValue(
     int64_t offset,
     PyObject* name);
 
+PyObject* JITRT_BinarySubscrListInt(PyObject* list, PyObject* sub);
+
+PyObject* JITRT_BinarySubscrListSlice(PyObject* list, PyObject* sub);
+
+PyObject* JITRT_MinSingleArg(PyObject* iterable);
+
 LoadMethodResult JITRT_LoadAttrMethodWithValues(
     PyObject* obj,
     int64_t type_version,
@@ -228,6 +234,8 @@ int JITRT_StoreAttrInstanceValue(
     int64_t offset,
     PyObject* name,
     PyObject* value);
+
+int JITRT_StoreSubscrListInt(PyObject* list, PyObject* sub, PyObject* value);
 
 /*
  * Perform a method lookup on an object.

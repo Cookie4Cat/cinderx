@@ -718,6 +718,127 @@ def call_f(obj, value):
   EXPECT_EQ(hir.find("LoadMethod<"), std::string::npos);
   EXPECT_EQ(hir.find("LoadMethodCached<"), std::string::npos);
 }
+
+TEST_F(SpecializedAttrHIRBuildTest, BinarySubscrListIntLowersToHelperCall) {
+  const char* src = R"(
+def load_idx(items, idx):
+  return items[idx]
+)";
+  runCode(src);
+  Ref<PyFunctionObject> func(getGlobal("load_idx"));
+  ASSERT_NE(func, nullptr);
+
+  Ref<> items = Ref<>::steal(Py_BuildValue("[ss]", "a", "b"));
+  Ref<> idx = Ref<>::steal(PyLong_FromLong(0));
+  ASSERT_NE(items, nullptr);
+  ASSERT_NE(idx, nullptr);
+
+  for (int i = 0; i < 64; i++) {
+    auto result = call2(reinterpret_cast<PyObject*>(func.get()), items, idx);
+    ASSERT_NE(result, nullptr);
+    EXPECT_EQ(PyUnicode_CompareWithASCIIString(result, "a"), 0);
+  }
+
+  auto specialized = findSpecializedInstr(func->func_code, BINARY_SUBSCR_LIST_INT);
+  ASSERT_EQ(specialized.specializedOpcode(), BINARY_SUBSCR_LIST_INT);
+
+  auto irfunc = buildHIR(func);
+  ASSERT_NE(irfunc, nullptr);
+  auto hir = HIRPrinter().ToString(*irfunc);
+  EXPECT_NE(hir.find("JITRT_BinarySubscrListInt"), std::string::npos);
+  EXPECT_NE(hir.find("CheckExc"), std::string::npos);
+}
+
+TEST_F(SpecializedAttrHIRBuildTest, BinarySubscrListSliceLowersToHelperCall) {
+  const char* src = R"(
+def copy_items(items):
+  return items[:]
+)";
+  runCode(src);
+  Ref<PyFunctionObject> func(getGlobal("copy_items"));
+  ASSERT_NE(func, nullptr);
+
+  Ref<> items = Ref<>::steal(Py_BuildValue("[ss]", "a", "b"));
+  ASSERT_NE(items, nullptr);
+  for (int i = 0; i < 64; i++) {
+    auto result = call1(reinterpret_cast<PyObject*>(func.get()), items);
+    ASSERT_NE(result, nullptr);
+    EXPECT_TRUE(PyList_Check(result));
+    EXPECT_NE(result.get(), items.get());
+  }
+
+  auto specialized =
+      findSpecializedInstr(func->func_code, BINARY_OP_SUBSCR_LIST_SLICE);
+  ASSERT_EQ(specialized.specializedOpcode(), BINARY_OP_SUBSCR_LIST_SLICE);
+
+  auto irfunc = buildHIR(func);
+  ASSERT_NE(irfunc, nullptr);
+  auto hir = HIRPrinter().ToString(*irfunc);
+  EXPECT_NE(hir.find("JITRT_BinarySubscrListSlice"), std::string::npos);
+  EXPECT_NE(hir.find("CheckExc"), std::string::npos);
+}
+
+TEST_F(SpecializedAttrHIRBuildTest, MinSingleArgLowersToHelperCall) {
+  const char* src = R"(
+def get_min(items):
+  return min(items)
+)";
+  runCode(src);
+  Ref<PyFunctionObject> func(getGlobal("get_min"));
+  ASSERT_NE(func, nullptr);
+
+  Ref<> items = Ref<>::steal(PyFrozenSet_New(Py_BuildValue("[iii]", 3, 1, 2)));
+  ASSERT_NE(items, nullptr);
+  for (int i = 0; i < 64; i++) {
+    auto result = call1(reinterpret_cast<PyObject*>(func.get()), items);
+    ASSERT_NE(result, nullptr);
+    EXPECT_TRUE(isIntEquals(result, 1));
+  }
+
+  auto irfunc = buildHIR(func);
+  ASSERT_NE(irfunc, nullptr);
+  auto hir = HIRPrinter().ToString(*irfunc);
+  EXPECT_NE(hir.find("JITRT_MinSingleArg"), std::string::npos);
+  EXPECT_EQ(hir.find("VectorCall<1>"), std::string::npos);
+}
+
+TEST_F(SpecializedAttrHIRBuildTest, StoreSubscrListIntLowersToHelperCall) {
+  const char* src = R"(
+def store_idx(items, idx, value):
+  items[idx] = value
+)";
+  runCode(src);
+  Ref<PyFunctionObject> func(getGlobal("store_idx"));
+  ASSERT_NE(func, nullptr);
+
+  Ref<> items = Ref<>::steal(Py_BuildValue("[ss]", "a", "b"));
+  Ref<> idx = Ref<>::steal(PyLong_FromLong(0));
+  Ref<> value = Ref<>::steal(PyUnicode_FromString("c"));
+  ASSERT_NE(items, nullptr);
+  ASSERT_NE(idx, nullptr);
+  ASSERT_NE(value, nullptr);
+
+  for (int i = 0; i < 64; i++) {
+    auto result = Ref<>::steal(PyObject_CallFunctionObjArgs(
+        reinterpret_cast<PyObject*>(func.get()),
+        items.get(),
+        idx.get(),
+        value.get(),
+        nullptr));
+    ASSERT_NE(result, nullptr);
+    EXPECT_EQ(result.get(), Py_None);
+  }
+
+  auto specialized =
+      findSpecializedInstr(func->func_code, STORE_SUBSCR_LIST_INT);
+  ASSERT_EQ(specialized.specializedOpcode(), STORE_SUBSCR_LIST_INT);
+
+  auto irfunc = buildHIR(func);
+  ASSERT_NE(irfunc, nullptr);
+  auto hir = HIRPrinter().ToString(*irfunc);
+  EXPECT_NE(hir.find("JITRT_StoreSubscrListInt"), std::string::npos);
+  EXPECT_NE(hir.find("CheckNeg"), std::string::npos);
+}
 #endif
 
 TEST_F(HIRBuildTest, GetLength) {

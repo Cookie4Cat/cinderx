@@ -591,6 +591,99 @@ def call_f(obj, value):
   ASSERT_NE(fallback_result, nullptr);
   EXPECT_TRUE(isIntEquals(fallback_result, 42));
 }
+
+TEST_F(AttrInstanceValueHelperTest, BinarySubscrListIntFastPathAndFallbacks) {
+  Ref<> list = Ref<>::steal(Py_BuildValue("[ss]", "a", "b"));
+  Ref<> zero = Ref<>::steal(PyLong_FromLong(0));
+  Ref<> neg_one = Ref<>::steal(PyLong_FromLong(-1));
+  Ref<> oob = Ref<>::steal(PyLong_FromLong(99));
+  ASSERT_NE(list, nullptr);
+  ASSERT_NE(zero, nullptr);
+  ASSERT_NE(neg_one, nullptr);
+  ASSERT_NE(oob, nullptr);
+
+  auto fast = Ref<>::steal(JITRT_BinarySubscrListInt(list, zero));
+  ASSERT_NE(fast, nullptr);
+  EXPECT_EQ(PyUnicode_CompareWithASCIIString(fast, "a"), 0);
+
+  auto fallback = Ref<>::steal(JITRT_BinarySubscrListInt(list, neg_one));
+  ASSERT_NE(fallback, nullptr);
+  EXPECT_EQ(PyUnicode_CompareWithASCIIString(fallback, "b"), 0);
+
+  auto oob_result = Ref<>::steal(JITRT_BinarySubscrListInt(list, oob));
+  EXPECT_EQ(oob_result, nullptr);
+  ASSERT_TRUE(PyErr_ExceptionMatches(PyExc_IndexError));
+  PyErr_Clear();
+}
+
+TEST_F(AttrInstanceValueHelperTest, BinarySubscrListSliceFastPathAndFallbacks) {
+  Ref<> list = Ref<>::steal(Py_BuildValue("[sss]", "a", "b", "c"));
+  Ref<> full_slice = Ref<>::steal(PySlice_New(Py_None, Py_None, Py_None));
+  Ref<> partial_slice =
+      Ref<>::steal(PySlice_New(PyLong_FromLong(1), Py_None, Py_None));
+  ASSERT_NE(list, nullptr);
+  ASSERT_NE(full_slice, nullptr);
+  ASSERT_NE(partial_slice, nullptr);
+
+  auto fast = Ref<>::steal(JITRT_BinarySubscrListSlice(list, full_slice));
+  ASSERT_NE(fast, nullptr);
+  ASSERT_TRUE(PyList_Check(fast));
+  EXPECT_NE(fast.get(), list.get());
+  ASSERT_EQ(PyList_GET_SIZE(fast.get()), 3);
+  EXPECT_EQ(
+      PyUnicode_CompareWithASCIIString(PyList_GET_ITEM(fast.get(), 0), "a"), 0);
+
+  auto fallback =
+      Ref<>::steal(JITRT_BinarySubscrListSlice(list, partial_slice));
+  ASSERT_NE(fallback, nullptr);
+  ASSERT_TRUE(PyList_Check(fallback));
+  ASSERT_EQ(PyList_GET_SIZE(fallback.get()), 2);
+  EXPECT_EQ(
+      PyUnicode_CompareWithASCIIString(PyList_GET_ITEM(fallback.get(), 0), "b"), 0);
+}
+
+TEST_F(AttrInstanceValueHelperTest, MinSingleArgFastPathAndFallbacks) {
+  Ref<> set_items = Ref<>::steal(Py_BuildValue("[iii]", 3, 1, 2));
+  Ref<> exact = Ref<>::steal(PyFrozenSet_New(set_items));
+  ASSERT_NE(exact, nullptr);
+
+  auto fast = Ref<>::steal(JITRT_MinSingleArg(exact));
+  ASSERT_NE(fast, nullptr);
+  EXPECT_TRUE(isIntEquals(fast, 1));
+
+  Ref<> list = Ref<>::steal(Py_BuildValue("[iii]", 5, 4, 6));
+  ASSERT_NE(list, nullptr);
+  auto fallback = Ref<>::steal(JITRT_MinSingleArg(list));
+  ASSERT_NE(fallback, nullptr);
+  EXPECT_TRUE(isIntEquals(fallback, 4));
+}
+
+TEST_F(AttrInstanceValueHelperTest, StoreSubscrListIntFastPathAndFallbacks) {
+  Ref<> list = Ref<>::steal(Py_BuildValue("[ss]", "a", "b"));
+  Ref<> zero = Ref<>::steal(PyLong_FromLong(0));
+  Ref<> neg_one = Ref<>::steal(PyLong_FromLong(-1));
+  Ref<> oob = Ref<>::steal(PyLong_FromLong(99));
+  Ref<> c = Ref<>::steal(PyUnicode_FromString("c"));
+  Ref<> d = Ref<>::steal(PyUnicode_FromString("d"));
+  ASSERT_NE(list, nullptr);
+  ASSERT_NE(zero, nullptr);
+  ASSERT_NE(neg_one, nullptr);
+  ASSERT_NE(oob, nullptr);
+  ASSERT_NE(c, nullptr);
+  ASSERT_NE(d, nullptr);
+
+  ASSERT_EQ(JITRT_StoreSubscrListInt(list, zero, c), 0);
+  EXPECT_EQ(
+      PyUnicode_CompareWithASCIIString(PyList_GET_ITEM(list.get(), 0), "c"), 0);
+
+  ASSERT_EQ(JITRT_StoreSubscrListInt(list, neg_one, d), 0);
+  EXPECT_EQ(
+      PyUnicode_CompareWithASCIIString(PyList_GET_ITEM(list.get(), 1), "d"), 0);
+
+  EXPECT_EQ(JITRT_StoreSubscrListInt(list, oob, c), -1);
+  ASSERT_TRUE(PyErr_ExceptionMatches(PyExc_IndexError));
+  PyErr_Clear();
+}
 #endif
 
 // This is a test harness for experimenting with backends

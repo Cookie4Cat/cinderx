@@ -7,6 +7,7 @@
 #include "internal/pycore_object.h"
 #include "internal/pycore_pyerrors.h"
 #include "internal/pycore_pystate.h"
+#include "internal/pycore_setobject.h"
 
 #include "cinderx/Common/log.h"
 #include "cinderx/Common/py-portability.h"
@@ -1253,6 +1254,141 @@ int JITRT_StoreAttrInstanceValue(
     _PyDictValues_AddToInsertionOrder(values, index);
   }
   Py_XDECREF(old_value);
+  return 0;
+}
+
+PyObject* JITRT_BinarySubscrListInt(PyObject* list, PyObject* sub) {
+  // Mirror CPython 3.14's BINARY_OP_SUBSCR_LIST_INT fast path: require an
+  // exact list, require an exact compact non-negative int index, and use the
+  // list fast path when possible. Any mismatch falls back to PyObject_GetItem()
+  // so Python indexing semantics stay unchanged.
+  if (!PyList_CheckExact(list) || !PyLong_CheckExact(sub)) {
+    return PyObject_GetItem(list, sub);
+  }
+
+  Py_ssize_t index = PyLong_AsSsize_t(sub);
+  if (index < 0) {
+    if (PyErr_Occurred()) {
+      return nullptr;
+    }
+    return PyObject_GetItem(list, sub);
+  }
+
+  PyObject* result = PyList_GetItemRef(list, index);
+  if (result != nullptr) {
+    return result;
+  }
+  return PyObject_GetItem(list, sub);
+}
+
+PyObject* JITRT_BinarySubscrListSlice(PyObject* list, PyObject* sub) {
+  // Mirror the guarded portion of CPython 3.14's BINARY_OP_SUBSCR_LIST_SLICE
+  // contract: require an exact list and a slice operand. We narrow the fast
+  // path further to the hottest pattern in our workloads, list[:] full-copy
+  // slices, and fall back to PyObject_GetItem() for every other slice shape so
+  // Python slicing semantics remain unchanged.
+  if (!PyList_CheckExact(list) || !PySlice_Check(sub)) {
+    return PyObject_GetItem(list, sub);
+  }
+
+  auto* slice = reinterpret_cast<PySliceObject*>(sub);
+  if (slice->start == Py_None && slice->stop == Py_None &&
+      slice->step == Py_None) {
+    return PyList_GetSlice(list, 0, PyList_GET_SIZE(list));
+  }
+
+  return PyObject_GetItem(list, sub);
+}
+
+PyObject* JITRT_MinSingleArg(PyObject* iterable) {
+  if (PyAnySet_CheckExact(iterable)) {
+    PyObject* best = nullptr;
+    Py_ssize_t pos = 0;
+    PyObject* key = nullptr;
+    Py_hash_t hash = 0;
+    while (_PySet_NextEntry(iterable, &pos, &key, &hash)) {
+      if (!PyLong_CheckExact(key)) {
+        best = nullptr;
+        break;
+      }
+      if (best == nullptr) {
+        best = key;
+        continue;
+      }
+      int smaller = PyObject_RichCompareBool(key, best, Py_LT);
+      if (smaller < 0) {
+        return nullptr;
+      }
+      if (smaller != 0) {
+        best = key;
+      }
+    }
+    if (best != nullptr) {
+      return Py_NewRef(best);
+    }
+  }
+
+  Ref<> iter = Ref<>::steal(PyObject_GetIter(iterable));
+  if (iter == nullptr) {
+    return nullptr;
+  }
+
+  Ref<> best = Ref<>::steal(PyIter_Next(iter));
+  if (best == nullptr) {
+    if (!PyErr_Occurred()) {
+      PyErr_SetString(PyExc_ValueError, "min() iterable argument is empty");
+    }
+    return nullptr;
+  }
+
+  while (true) {
+    Ref<> item = Ref<>::steal(PyIter_Next(iter));
+    if (item == nullptr) {
+      if (PyErr_Occurred()) {
+        return nullptr;
+      }
+      break;
+    }
+    int smaller = PyObject_RichCompareBool(item, best, Py_LT);
+    if (smaller < 0) {
+      return nullptr;
+    }
+    if (smaller != 0) {
+      best = std::move(item);
+    }
+  }
+
+  return best.release();
+}
+
+int JITRT_StoreSubscrListInt(PyObject* list, PyObject* sub, PyObject* value) {
+  // Mirror CPython 3.14's STORE_SUBSCR_LIST_INT fast path: require an exact
+  // list and an exact compact non-negative int index, and fall back to
+  // PyObject_SetItem() for every mismatch so assignment semantics stay
+  // unchanged.
+  if (!PyList_CheckExact(list) || !PyLong_CheckExact(sub)) {
+    return PyObject_SetItem(list, sub, value);
+  }
+
+  Py_ssize_t index = PyLong_AsSsize_t(sub);
+  if (index < 0) {
+    if (PyErr_Occurred()) {
+      return -1;
+    }
+    return PyObject_SetItem(list, sub, value);
+  }
+  if (index >= PyList_GET_SIZE(list)) {
+    return PyObject_SetItem(list, sub, value);
+  }
+
+  PyObject* old_value = PyList_GET_ITEM(list, index);
+  Py_INCREF(value);
+#ifdef Py_GIL_DISABLED
+  FT_ATOMIC_STORE_PTR_RELEASE(_PyList_ITEMS(list)[index], value);
+#else
+  PyList_SET_ITEM(list, index, value);
+#endif
+  Py_DECREF(old_value);
   return 0;
 }
 

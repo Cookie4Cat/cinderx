@@ -84,6 +84,7 @@ int BytecodeInstruction::specializedOpcode() const {
     case BINARY_OP_SUBTRACT_INT:
     case BINARY_SUBSCR_DICT:
     case BINARY_SUBSCR_LIST_INT:
+    case BINARY_OP_SUBSCR_LIST_SLICE:
     case BINARY_SUBSCR_TUPLE_INT:
     case COMPARE_OP_FLOAT:
     case COMPARE_OP_INT:
@@ -92,6 +93,7 @@ int BytecodeInstruction::specializedOpcode() const {
     case LOAD_ATTR_METHOD_WITH_VALUES:
     case LOAD_ATTR_MODULE:
     case STORE_ATTR_INSTANCE_VALUE:
+    case STORE_SUBSCR_LIST_INT:
     case STORE_SUBSCR_DICT:
     case UNPACK_SEQUENCE_LIST:
     case UNPACK_SEQUENCE_TUPLE:
