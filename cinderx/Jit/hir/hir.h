@@ -4228,6 +4228,7 @@ bool usesRuntimeFunc(BorrowedRef<PyCodeObject> code);
   V(HasKwOnlyArgs, "it has keyword-only args")                             \
   V(HasVarargs, "it has varargs")                                          \
   V(HasVarkwargs, "it has varkwargs")                                      \
+  V(HasExceptionHandlers, "it has exception handlers")                     \
   V(CalledWithMismatchedArgs, "it is called with mismatched arguments")    \
   V(IsGenerator, "it is a generator")                                      \
   V(HasCellvars, "it has cellvars")                                        \

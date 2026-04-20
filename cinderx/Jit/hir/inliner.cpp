@@ -126,6 +126,10 @@ bool canInline(Function& caller, AbstractCall* call_instr) {
   BorrowedRef<PyCodeObject> code{func->func_code};
   JIT_CHECK(PyCode_Check(code), "Expected PyCodeObject");
 
+  if (PyBytes_GET_SIZE(code->co_exceptiontable) > 0) {
+    return fail(InlineFailureType::kHasExceptionHandlers);
+  }
+
   if (code->co_kwonlyargcount > 0) {
     return fail(InlineFailureType::kHasKwOnlyArgs);
   }
