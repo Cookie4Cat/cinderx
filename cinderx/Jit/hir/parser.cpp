@@ -201,6 +201,8 @@ HIRParser::parseInstr(std::string_view opcode, Register* dst, int bb_index) {
           flags |= CallFlags::KwArgs;
         } else if (tok == "static") {
           flags |= CallFlags::Static;
+        } else if (tok == "pyfunc") {
+          flags |= CallFlags::PyFunc;
         } else {
           JIT_ABORT("Unexpected VectorCall immediate '{}'", tok);
         }

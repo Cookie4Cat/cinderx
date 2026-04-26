@@ -1926,6 +1926,8 @@ void HIRBuilder::emitAnyCall(
     case CALL:
     case CALL_KW:
     case CALL_METHOD: {
+      bool is_call_py_exact_args =
+          opcode == CALL && bc_instr.specializedOpcode() == CALL_PY_EXACT_ARGS;
       auto num_operands = static_cast<std::size_t>(bc_instr.oparg()) + 2;
       auto num_stack_inputs = num_operands;
       bool is_call_kw = opcode == CALL_KW;
@@ -1937,14 +1939,25 @@ void HIRBuilder::emitAnyCall(
         flags |= CallFlags::KwArgs;
       }
 
+      std::vector<Register*> operands(num_stack_inputs);
+      for (auto i = num_stack_inputs; i > 0; i--) {
+        operands[i - 1] = tc.frame.stack.pop();
+      }
+
+      if (is_call_py_exact_args && !(flags & CallFlags::KwArgs)) {
+        Register* guarded_func = temps_.AllocateStack();
+        tc.emit<GuardType>(guarded_func, TFunc, operands[0], tc.frame);
+        operands[0] = guarded_func;
+        flags |= CallFlags::PyFunc;
+      }
+
       // Manually set up the instruction instead of using emitVariadic.
       // kwnames_ isn't on the stack, but it has to be part of the operand
       // count.
       Register* out = temps_.AllocateStack();
       auto call = tc.emit<CallMethod>(num_operands, out, flags);
-      for (auto i = num_stack_inputs; i > 0; i--) {
-        Register* arg = tc.frame.stack.pop();
-        call->SetOperand(i - 1, arg);
+      for (std::size_t i = 0; i < num_stack_inputs; i++) {
+        call->SetOperand(i, operands[i]);
       }
       if (kwnames_ != nullptr) {
         JIT_CHECK(

@@ -49,6 +49,12 @@ bool guardNeeded(const RegUses& uses, Register* new_reg, Type relaxed_type) {
               worklist.emplace(passthrough_output, passthrough_type);
             }
           }
+          if (instr->IsVectorCall() && i == 0) {
+            auto call = static_cast<const VectorCall*>(instr);
+            if (call->flags() & CallFlags::PyFunc) {
+              return true;
+            }
+          }
           OperandType expected_type = instr->GetOperandType(i);
           // TASK(T106726658): We should be able to remove GuardTypes if we ever
           // add a matching constraint for non-Primitive types, and our

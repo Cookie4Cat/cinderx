@@ -88,6 +88,7 @@ int BytecodeInstruction::specializedOpcode() const {
     case COMPARE_OP_FLOAT:
     case COMPARE_OP_INT:
     case COMPARE_OP_STR:
+    case CALL_PY_EXACT_ARGS:
     case LOAD_ATTR_MODULE:
     case STORE_SUBSCR_DICT:
     case UNPACK_SEQUENCE_LIST:

@@ -1,6 +1,7 @@
 # Copyright (c) Meta Platforms, Inc. and affiliates.
 
 import asyncio
+import dis
 import faulthandler
 import gc
 import subprocess
@@ -325,9 +326,73 @@ def _simpleFunc(a, b):
     return a, b
 
 
+def _callPyExactArgsTarget(a, b):
+    return a + b
+
+
+def _callPyExactArgs(func, a, b):
+    return func(a, b)
+
+
+def _callPyExactArgsFallback(func, a, b):
+    return func(a, b)
+
+
 class _CallableObj:
     def __call__(self, a, b):
         return self, a, b
+
+
+class CallPyExactArgsTests(unittest.TestCase):
+    def setUp(self) -> None:
+        if sys.version_info < (3, 14):
+            self.skipTest("CALL_PY_EXACT_ARGS is a CPython 3.14 specialization")
+
+    def warmup(self, func: Callable[[Callable[[int, int], object], int, int], object]) -> None:
+        for _ in range(2000):
+            func(_callPyExactArgsTarget, 1, 2)
+
+    def assertHasCallPyExactArgs(
+        self,
+        func: Callable[[Callable[[int, int], object], int, int], object],
+    ) -> None:
+        opnames = {
+            instr.opname
+            for instr in dis.get_instructions(
+                func,
+                adaptive=True,
+                show_caches=True,
+            )
+        }
+        self.assertIn("CALL_PY_EXACT_ARGS", opnames)
+
+    @skip_unless_jit("Tests CinderX JIT handling of CALL_PY_EXACT_ARGS")
+    def test_exact_python_function_positional_call(self) -> None:
+        force_uncompile(_callPyExactArgs)
+        self.warmup(_callPyExactArgs)
+        self.assertHasCallPyExactArgs(_callPyExactArgs)
+
+        self.assertTrue(force_compile(_callPyExactArgs))
+        self.assertTrue(is_jit_compiled(_callPyExactArgs))
+        self.assertEqual(_callPyExactArgs(_callPyExactArgsTarget, 2, 3), 5)
+
+    @skip_unless_jit("Tests CinderX JIT handling of CALL_PY_EXACT_ARGS")
+    def test_exact_python_function_falls_back_for_callable_object(self) -> None:
+        force_uncompile(_callPyExactArgsFallback)
+        self.warmup(_callPyExactArgsFallback)
+        self.assertHasCallPyExactArgs(_callPyExactArgsFallback)
+
+        self.assertTrue(force_compile(_callPyExactArgsFallback))
+        self.assertEqual(
+            _callPyExactArgsFallback(_callPyExactArgsTarget, 2, 3),
+            5,
+        )
+
+        callable_obj = _CallableObj()
+        self.assertEqual(
+            _callPyExactArgsFallback(callable_obj, 2, 3),
+            (callable_obj, 2, 3),
+        )
 
 
 class CallKWArgsTests(unittest.TestCase):

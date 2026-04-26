@@ -353,11 +353,12 @@ static std::string format_immediates(const Function* func, const Instr& instr) {
     case Opcode::kVectorCall: {
       const auto& call = static_cast<const VectorCall&>(instr);
       return fmt::format(
-          "{}{}{}{}",
+          "{}{}{}{}{}",
           call.numArgs(),
           (call.flags() & CallFlags::Awaited) ? ", awaited" : "",
           (call.flags() & CallFlags::KwArgs) ? ", kwnames" : "",
-          (call.flags() & CallFlags::Static) ? ", static" : "");
+          (call.flags() & CallFlags::Static) ? ", static" : "",
+          (call.flags() & CallFlags::PyFunc) ? ", pyfunc" : "");
     }
     case Opcode::kCallCFunc: {
       const auto& call = static_cast<const CallCFunc&>(instr);

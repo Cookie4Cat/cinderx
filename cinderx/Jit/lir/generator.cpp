@@ -1977,7 +1977,8 @@ LIRGenerator::TranslatedBlock LIRGenerator::TranslateOneBasicBlock(
             ? Ci_Py_AWAITED_CALL_MARKER
             : 0;
 #else
-        if (!(hir_instr.func()->type() <= TFunc)) {
+        if (!(hir_instr.func()->type() <= TFunc) &&
+            !(hir_instr.flags() & CallFlags::PyFunc)) {
           // Calls to things which aren't simple Python functions will
           // need to check the eval breaker. We do this in a helper instead
           // of injecting it after every call.
