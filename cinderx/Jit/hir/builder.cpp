@@ -57,6 +57,46 @@ void rotateStackTop(OperandStack& stack, int count) {
   std::rotate(stack.end() - count, stack.end() - 1, stack.end());
 }
 
+bool globalIsReboundByModuleFunction(
+    BorrowedRef<PyDictObject> globals,
+    BorrowedRef<> name) {
+  Py_ssize_t pos = 0;
+  PyObject* key = nullptr;
+  PyObject* value = nullptr;
+  while (PyDict_Next(globals, &pos, &key, &value)) {
+    if (!PyFunction_Check(value)) {
+      continue;
+    }
+    auto func = reinterpret_cast<PyFunctionObject*>(value);
+    if (PyFunction_GET_GLOBALS(func) !=
+        reinterpret_cast<PyObject*>(globals.get())) {
+      continue;
+    }
+    auto func_code = reinterpret_cast<PyCodeObject*>(PyFunction_GET_CODE(func));
+    for (auto& bc_instr : BytecodeInstructionBlock{func_code}) {
+      if (bc_instr.opcode() == STORE_GLOBAL &&
+          PyTuple_GET_ITEM(func_code->co_names, bc_instr.oparg()) == name) {
+        return true;
+      }
+    }
+  }
+  return false;
+}
+
+bool shouldUseExactTypeGuardForGlobal(
+    BorrowedRef<PyDictObject> globals,
+    BorrowedRef<> name,
+    BorrowedRef<> value) {
+  if (value == nullptr || _Py_IsImmortal(value)) {
+    return false;
+  }
+  PyTypeObject* type = Py_TYPE(value);
+  if (!PyType_HasFeature(type, Py_TPFLAGS_HEAPTYPE)) {
+    return false;
+  }
+  return globalIsReboundByModuleFunction(globals, name);
+}
+
 // Check that an opcode is one we know how to translate into HIR.
 bool isSupportedOpcode(int opcode) {
   switch (opcode) {
@@ -3583,11 +3623,18 @@ void HIRBuilder::emitLoadGlobal(
     if (value == nullptr) {
       return false;
     }
+    BorrowedRef<> name = PyTuple_GET_ITEM(code_->co_names, name_idx);
     tc.emit<LoadGlobalCached>(
         result, code_, preloader_.builtins(), preloader_.globals(), name_idx);
-    auto guard_is = tc.emit<GuardIs>(result, value, result);
-    BorrowedRef<> name = PyTuple_GET_ITEM(code_->co_names, name_idx);
-    guard_is->setDescr(fmt::format("LOAD_GLOBAL: {}", PyUnicode_AsUTF8(name)));
+    if (shouldUseExactTypeGuardForGlobal(preloader_.globals(), name, value)) {
+      auto exact_type = Type::fromTypeExact(Py_TYPE(value));
+      auto guard_type = tc.emit<GuardType>(result, exact_type, result, tc.frame);
+      guard_type->setDescr(
+          fmt::format("LOAD_GLOBAL_TYPE: {}", PyUnicode_AsUTF8(name)));
+    } else {
+      auto guard_is = tc.emit<GuardIs>(result, value, result);
+      guard_is->setDescr(fmt::format("LOAD_GLOBAL: {}", PyUnicode_AsUTF8(name)));
+    }
     return true;
   };
 

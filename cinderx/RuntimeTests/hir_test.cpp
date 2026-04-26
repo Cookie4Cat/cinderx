@@ -569,6 +569,93 @@ class HIRBuildTest : public RuntimeTest {
   }
 };
 
+namespace {
+
+Ref<> call1(PyObject* func, BorrowedRef<PyObject> arg) {
+  return Ref<>::steal(PyObject_CallFunctionObjArgs(func, arg, nullptr));
+}
+
+} // namespace
+
+class ReboundGlobalHIRBuildTest : public RuntimeTest {
+ public:
+  ReboundGlobalHIRBuildTest() : RuntimeTest(static_cast<Flags>(0)) {}
+};
+
+#if PY_VERSION_HEX >= 0x030E0000
+TEST_F(ReboundGlobalHIRBuildTest, ReboundGlobalUsesExactTypeGuard) {
+  const char* src = R"(
+class Planner:
+  pass
+
+planner = Planner()
+planner.value = 1
+
+def get_value():
+  return planner.value
+
+def replace_planner(value):
+  global planner
+  planner = Planner()
+  planner.value = value
+)";
+  runCode(src);
+  Ref<PyFunctionObject> func(getGlobal("get_value"));
+  Ref<PyFunctionObject> replace(getGlobal("replace_planner"));
+  ASSERT_NE(func, nullptr);
+  ASSERT_NE(replace, nullptr);
+
+  Ref<> value = Ref<>::steal(PyLong_FromLong(2));
+  ASSERT_NE(value, nullptr);
+  auto replaced = call1(reinterpret_cast<PyObject*>(replace.get()), value);
+  ASSERT_NE(replaced, nullptr);
+
+  auto irfunc = buildHIR(func);
+  ASSERT_NE(irfunc, nullptr);
+  auto hir = HIRPrinter().ToString(*irfunc);
+  EXPECT_NE(hir.find("LOAD_GLOBAL_TYPE: planner"), std::string::npos);
+  EXPECT_NE(hir.find("GuardType"), std::string::npos);
+}
+
+TEST_F(ReboundGlobalHIRBuildTest, StableGlobalKeepsIdentityGuard) {
+  const char* src = R"(
+class WorkArea:
+  pass
+
+taskWorkArea = WorkArea()
+taskWorkArea.value = 1
+
+def get_value():
+  return taskWorkArea.value
+)";
+  runCode(src);
+  Ref<PyFunctionObject> func(getGlobal("get_value"));
+  ASSERT_NE(func, nullptr);
+
+  auto irfunc = buildHIR(func);
+  ASSERT_NE(irfunc, nullptr);
+  auto hir = HIRPrinter().ToString(*irfunc);
+  EXPECT_NE(hir.find("LOAD_GLOBAL: taskWorkArea"), std::string::npos);
+  EXPECT_EQ(hir.find("LOAD_GLOBAL_TYPE: taskWorkArea"), std::string::npos);
+}
+
+TEST_F(ReboundGlobalHIRBuildTest, BuiltinGlobalKeepsIdentityGuard) {
+  const char* src = R"(
+def get_len(value):
+  return len(value)
+)";
+  runCode(src);
+  Ref<PyFunctionObject> func(getGlobal("get_len"));
+  ASSERT_NE(func, nullptr);
+
+  auto irfunc = buildHIR(func);
+  ASSERT_NE(irfunc, nullptr);
+  auto hir = HIRPrinter().ToString(*irfunc);
+  EXPECT_NE(hir.find("LOAD_GLOBAL: len"), std::string::npos);
+  EXPECT_EQ(hir.find("LOAD_GLOBAL_TYPE: len"), std::string::npos);
+}
+#endif
+
 TEST_F(HIRBuildTest, GetLength) {
   //  0 LOAD_FAST  0
   //  2 GET_LENGTH
