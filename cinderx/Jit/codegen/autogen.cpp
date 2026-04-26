@@ -693,8 +693,7 @@ void translateLoadThreadState(Environ* env, const Instruction* instr) {
             arch::reg_scratch_0));
   } else {
     // Fallback: call _PyThreadState_GetCurrent().
-    as->mov(arch::reg_scratch_br, _PyThreadState_GetCurrent);
-    as->blr(arch::reg_scratch_br);
+    as->bl(_PyThreadState_GetCurrent);
     if (dst.id() != a64::x0.id()) {
       as->mov(dst, a64::x0);
     }
@@ -1493,7 +1492,11 @@ void translateCall(Environ* env, const Instruction* instr) {
   auto output = instr->output();
   auto input = instr->getInput(0);
 
-  if (input->isReg()) {
+  if (input->isImm()) {
+    // Use bl(imm) which leverages asmjit's relaxation to pick the optimal
+    // encoding: direct bl if within ±128MB, or ldr+blr via address table.
+    as->bl(static_cast<uint64_t>(input->getConstant()));
+  } else if (input->isReg()) {
     as->blr(AT::getGp(input));
   } else if (input->isStack()) {
     auto loc = input->getStackSlot().loc;
@@ -1610,6 +1613,13 @@ void translateMove(Environ* env, const Instruction* instr) {
             as->mov(
                 AT::getGpWiden(output),
                 AT::getGpWiden(output->dataType(), a64::xzr.id()));
+          } else if (input->dataType() == OperandBase::kObject) {
+            // Pointer constant: use load_addr which relaxes to adr, adrp+add,
+            // or ldr from address table depending on displacement.
+            // load_addr emits adr which requires a 64-bit x register.
+            as->load_addr(
+                a64::x(output->getPhyRegister().loc),
+                static_cast<uint64_t>(constant));
           } else {
             as->mov(AT::getGpWiden(output), constant);
           }
@@ -1636,7 +1646,7 @@ void translateMove(Environ* env, const Instruction* instr) {
       break;
     }
     case lir::OperandType::kMem:
-      as->mov(scratch0, reinterpret_cast<uint64_t>(output->getMemoryAddress()));
+      as->load_addr(scratch0, output->getMemoryAddress());
 
       if (input->isReg()) {
         // Storing the value of a register to an absolute address.
