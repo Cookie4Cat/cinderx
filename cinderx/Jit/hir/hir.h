@@ -813,6 +813,7 @@ enum class CallFlags : uint32_t {
   KwArgs = 1 << 0,
   Awaited = 1 << 1,
   Static = 1 << 2,
+  PyFunc = 1 << 3,
 };
 
 constexpr uint32_t raw(CallFlags flags) {

@@ -1,6 +1,7 @@
 # Copyright (c) Meta Platforms, Inc. and affiliates.
 
 import asyncio
+import dis
 import faulthandler
 import gc
 import subprocess
@@ -325,9 +326,168 @@ def _simpleFunc(a, b):
     return a, b
 
 
+def _callPyExactArgsTarget(a, b):
+    return a + b
+
+
+def _callPyExactArgs(func, a, b):
+    return func(a, b)
+
+
+def _callPyExactArgsFallback(func, a, b):
+    return func(a, b)
+
+
 class _CallableObj:
     def __call__(self, a, b):
         return self, a, b
+
+
+def _forIterList(values):
+    total = 0
+    for value in values:
+        total += value
+    return total
+
+
+def _forIterTuple(values):
+    total = 0
+    for value in values:
+        total += value
+    return total
+
+
+def _forIterRange(n):
+    total = 0
+    for value in range(n):
+        total += value
+    return total
+
+
+def _forIterParam(values):
+    total = 0
+    for value in values:
+        total += value
+    return total
+
+
+class CallPyExactArgsTests(unittest.TestCase):
+    def setUp(self) -> None:
+        if sys.version_info < (3, 14):
+            self.skipTest("CALL_PY_EXACT_ARGS is a CPython 3.14 specialization")
+
+    def warmup(self, func: Callable[[Callable[[int, int], object], int, int], object]) -> None:
+        for _ in range(2000):
+            func(_callPyExactArgsTarget, 1, 2)
+
+    def assertHasCallPyExactArgs(
+        self,
+        func: Callable[[Callable[[int, int], object], int, int], object],
+    ) -> None:
+        opnames = {
+            instr.opname
+            for instr in dis.get_instructions(
+                func,
+                adaptive=True,
+                show_caches=True,
+            )
+        }
+        self.assertIn("CALL_PY_EXACT_ARGS", opnames)
+
+    @skip_unless_jit("Tests CinderX JIT handling of CALL_PY_EXACT_ARGS")
+    def test_exact_python_function_positional_call(self) -> None:
+        force_uncompile(_callPyExactArgs)
+        self.warmup(_callPyExactArgs)
+        self.assertHasCallPyExactArgs(_callPyExactArgs)
+
+        self.assertTrue(force_compile(_callPyExactArgs))
+        self.assertTrue(is_jit_compiled(_callPyExactArgs))
+        self.assertEqual(_callPyExactArgs(_callPyExactArgsTarget, 2, 3), 5)
+
+    @skip_unless_jit("Tests CinderX JIT handling of CALL_PY_EXACT_ARGS")
+    def test_exact_python_function_falls_back_for_callable_object(self) -> None:
+        force_uncompile(_callPyExactArgsFallback)
+        self.warmup(_callPyExactArgsFallback)
+        self.assertHasCallPyExactArgs(_callPyExactArgsFallback)
+
+        self.assertTrue(force_compile(_callPyExactArgsFallback))
+        self.assertEqual(
+            _callPyExactArgsFallback(_callPyExactArgsTarget, 2, 3),
+            5,
+        )
+
+        callable_obj = _CallableObj()
+        self.assertEqual(
+            _callPyExactArgsFallback(callable_obj, 2, 3),
+            (callable_obj, 2, 3),
+        )
+
+
+class ForIterSpecializedTests(unittest.TestCase):
+    def setUp(self) -> None:
+        if sys.version_info < (3, 14):
+            self.skipTest("FOR_ITER_* specializations require CPython 3.14")
+
+    def assertHasOpcode(self, func: Callable[..., object], opname: str) -> None:
+        opnames = {
+            instr.opname
+            for instr in dis.get_instructions(
+                func,
+                adaptive=True,
+                show_caches=True,
+            )
+        }
+        self.assertIn(opname, opnames)
+
+    @skip_unless_jit("Tests CinderX JIT handling of FOR_ITER_LIST")
+    def test_for_iter_list(self) -> None:
+        force_uncompile(_forIterList)
+        values = [1, 2, 3, 4]
+        for _ in range(2000):
+            _forIterList(values)
+        self.assertHasOpcode(_forIterList, "FOR_ITER_LIST")
+
+        self.assertTrue(force_compile(_forIterList))
+        self.assertTrue(is_jit_compiled(_forIterList))
+        self.assertEqual(_forIterList([10, 20, 30]), 60)
+        self.assertEqual(_forIterList([]), 0)
+
+    @skip_unless_jit("Tests CinderX JIT handling of FOR_ITER_TUPLE")
+    def test_for_iter_tuple(self) -> None:
+        force_uncompile(_forIterTuple)
+        values = (1, 2, 3, 4)
+        for _ in range(2000):
+            _forIterTuple(values)
+        self.assertHasOpcode(_forIterTuple, "FOR_ITER_TUPLE")
+
+        self.assertTrue(force_compile(_forIterTuple))
+        self.assertTrue(is_jit_compiled(_forIterTuple))
+        self.assertEqual(_forIterTuple((10, 20, 30)), 60)
+        self.assertEqual(_forIterTuple(()), 0)
+
+    @skip_unless_jit("Tests CinderX JIT handling of FOR_ITER_RANGE intake")
+    def test_for_iter_range_still_compiles(self) -> None:
+        force_uncompile(_forIterRange)
+        for _ in range(2000):
+            _forIterRange(8)
+        self.assertHasOpcode(_forIterRange, "FOR_ITER_RANGE")
+
+        self.assertTrue(force_compile(_forIterRange))
+        self.assertTrue(is_jit_compiled(_forIterRange))
+        self.assertEqual(_forIterRange(10), 45)
+
+    @skip_unless_jit("Tests FOR_ITER_LIST falls back for non-list iterators")
+    def test_for_iter_list_specialized_opcode_fallback(self) -> None:
+        force_uncompile(_forIterParam)
+        values = [1, 2, 3, 4]
+        for _ in range(2000):
+            _forIterParam(values)
+        self.assertHasOpcode(_forIterParam, "FOR_ITER_LIST")
+
+        self.assertTrue(force_compile(_forIterParam))
+        self.assertTrue(is_jit_compiled(_forIterParam))
+        self.assertEqual(_forIterParam((10, 20, 30)), 60)
+        self.assertEqual(_forIterParam(range(4)), 6)
 
 
 class CallKWArgsTests(unittest.TestCase):

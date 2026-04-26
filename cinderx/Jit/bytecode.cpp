@@ -88,6 +88,11 @@ int BytecodeInstruction::specializedOpcode() const {
     case COMPARE_OP_FLOAT:
     case COMPARE_OP_INT:
     case COMPARE_OP_STR:
+    case CALL_PY_EXACT_ARGS:
+#if PY_VERSION_HEX >= 0x030E0000
+    case FOR_ITER_LIST:
+    case FOR_ITER_TUPLE:
+#endif
     case LOAD_ATTR_MODULE:
     case STORE_SUBSCR_DICT:
     case UNPACK_SEQUENCE_LIST:
