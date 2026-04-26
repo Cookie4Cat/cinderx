@@ -662,6 +662,43 @@ class GetSetNonDataDescrAttrTests(unittest.TestCase):
         self.assertEqual(self.descr.invoked_count, 2)
 
 
+class ReboundGlobalGuardTests(unittest.TestCase):
+    @skip_if_ft("T250369692: Inline caches disabled with free-threading")
+    def test_rebound_heap_global_keeps_python_semantics(self) -> None:
+        ns = {"cinder_support": cinder_support, "__builtins__": __builtins__}
+        exec(
+            """
+class Planner:
+    pass
+
+planner = Planner()
+planner.value = 1
+
+@cinder_support.failUnlessJITCompiled
+def get_value():
+    return planner.value
+
+def replace_planner(value):
+    global planner
+    planner = Planner()
+    planner.value = value
+""",
+            ns,
+            ns,
+        )
+        get_value = ns["get_value"]
+        replace_planner = ns["replace_planner"]
+
+        self.assertEqual(get_value(), 1)
+        self.assertEqual(get_value(), 1)
+
+        replace_planner(2)
+        self.assertEqual(get_value(), 2)
+
+        replace_planner(3)
+        self.assertEqual(get_value(), 3)
+
+
 class ClosureTests(unittest.TestCase):
     @cinder_support.failUnlessJITCompiled
     def test_cellvar(self) -> None:
