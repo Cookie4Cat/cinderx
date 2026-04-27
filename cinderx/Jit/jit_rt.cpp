@@ -8,6 +8,7 @@
 #include "internal/pycore_pyerrors.h"
 #include "internal/pycore_pystate.h"
 
+#include "cinderx/Common/dict.h"
 #include "cinderx/Common/log.h"
 #include "cinderx/Common/py-portability.h"
 #include "cinderx/Common/ref.h"
@@ -1115,6 +1116,42 @@ PyObject* JITRT_GetAttrFromSuper(
     bool no_args_in_super_call) {
   return super_lookup_method_or_attr(
       global_super, type, self, name, no_args_in_super_call, nullptr);
+}
+
+int JITRT_StoreAttrInstanceValue(
+    PyObject* obj,
+    PyObject* value,
+    uint32_t type_version,
+    uint16_t value_offset,
+    PyObject* name) {
+#if PY_VERSION_HEX >= 0x030E0000 && !defined(Py_GIL_DISABLED)
+  PyTypeObject* tp = Py_TYPE(obj);
+  if (type_version == 0 || tp->tp_version_tag != type_version ||
+      !PyType_HasFeature(tp, Py_TPFLAGS_INLINE_VALUES) ||
+      _PyObject_GetManagedDict(obj) != nullptr) {
+    return PyObject_SetAttr(obj, name, value);
+  }
+
+  PyDictValues* values = _PyObject_InlineValues(obj);
+  if (!values->valid) {
+    return PyObject_SetAttr(obj, name, value);
+  }
+
+  PyObject** value_ptr = reinterpret_cast<PyObject**>(
+      reinterpret_cast<char*>(obj) + value_offset);
+  PyObject* old_value = *value_ptr;
+  *value_ptr = Py_NewRef(value);
+
+  if (old_value == nullptr) {
+    Py_ssize_t index = value_ptr - values->values;
+    _PyDictValues_AddToInsertionOrder(values, index);
+  } else {
+    Py_DECREF(old_value);
+  }
+  return 0;
+#else
+  return PyObject_SetAttr(obj, name, value);
+#endif
 }
 
 PyObject* JITRT_InvokeMethod(

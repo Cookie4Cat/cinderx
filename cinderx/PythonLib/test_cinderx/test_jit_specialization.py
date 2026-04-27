@@ -228,6 +228,24 @@ class SpecializationTests(unittest.TestCase):
         f(d, "a", "c")
         self.assertEqual(d, {"a": "c"})
 
+    def test_store_attr_instance_value(self) -> None:
+        class C:
+            def __init__(self) -> None:
+                self.x = 0
+
+        def f(obj: C, value: int) -> None:
+            obj.x = value
+
+        obj = C()
+        specialize(f, lambda: f(obj, 1))
+
+        if sys.version_info >= (3, 14):
+            self.assertNotIn("STORE_ATTR", opnames(f))
+            self.assertIn("STORE_ATTR_INSTANCE_VALUE", opnames(f))
+
+        f(obj, 42)
+        self.assertEqual(obj.x, 42)
+
     def test_unpack_sequence_list(self) -> None:
         def f(li: list[str]) -> str:
             (a, _b) = li

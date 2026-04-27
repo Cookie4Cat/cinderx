@@ -206,6 +206,13 @@ PyObject* JITRT_GetAttrFromSuper(
     PyObject* name,
     bool no_args_in_super_call);
 
+int JITRT_StoreAttrInstanceValue(
+    PyObject* obj,
+    PyObject* value,
+    uint32_t type_version,
+    uint16_t value_offset,
+    PyObject* name);
+
 /*
  * Mimics the behavior of the UNARY_NOT opcode.
  *

@@ -23,6 +23,7 @@ extern "C" {
 #include "cinderx/Jit/hir/annotation_index.h"
 #include "cinderx/Jit/hir/ssa.h"
 #include "cinderx/Jit/hir/type.h"
+#include "cinderx/Jit/jit_rt.h"
 #include "cinderx/StaticPython/checked_dict.h"
 #include "cinderx/StaticPython/checked_list.h"
 #include "cinderx/StaticPython/classloader.h"
@@ -3718,6 +3719,44 @@ void HIRBuilder::emitStoreAttr(
     const jit::BytecodeInstruction& bc_instr) {
   Register* receiver = tc.frame.stack.pop();
   Register* value = tc.frame.stack.pop();
+
+#if PY_VERSION_HEX >= 0x030E0000
+  if (getConfig().specialized_opcodes &&
+      bc_instr.specializedOpcode() == STORE_ATTR_INSTANCE_VALUE) {
+    // CPython 3.14 STORE_ATTR cache layout:
+    // counter:1, type_version:2, inline-value byte offset:1.
+    uint32_t type_version = bc_instr.inlineCacheEntry32(1);
+    uint16_t value_offset = bc_instr.inlineCacheEntry(3);
+    if (type_version != 0) {
+      Register* type_version_reg = temps_.AllocateStack();
+      tc.emit<LoadConst>(
+          type_version_reg, Type::fromCUInt(type_version, TCUInt32));
+
+      Register* value_offset_reg = temps_.AllocateStack();
+      tc.emit<LoadConst>(
+          value_offset_reg, Type::fromCUInt(value_offset, TCUInt16));
+
+      Register* name_reg = temps_.AllocateStack();
+      PyObject* name = PyTuple_GET_ITEM(code_->co_names, bc_instr.oparg());
+      tc.emit<LoadConst>(name_reg, Type::fromObject(name));
+
+      Register* result = temps_.AllocateStack();
+      auto call = tc.emit<CallStatic>(
+          5,
+          result,
+          reinterpret_cast<void*>(JITRT_StoreAttrInstanceValue),
+          TCInt32);
+      call->SetOperand(0, receiver);
+      call->SetOperand(1, value);
+      call->SetOperand(2, type_version_reg);
+      call->SetOperand(3, value_offset_reg);
+      call->SetOperand(4, name_reg);
+      tc.emit<CheckNeg>(result, result, tc.frame);
+      return;
+    }
+  }
+#endif
+
   tc.emit<StoreAttr>(receiver, value, bc_instr.oparg(), tc.frame);
 }
 
