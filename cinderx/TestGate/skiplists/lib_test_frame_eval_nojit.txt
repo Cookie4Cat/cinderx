@@ -1,0 +1,9 @@
+# CPython's perf trampoline conflicts with CinderX's frame evaluator.
+test_perf_profiler
+
+# The frame-eval gate requires CinderX in the main interpreter only.
+test.test_struct.StructTest.test_endian_table_init_subinterpreters
+
+# The rest of test_code runs in single-process mode.
+test.test_code.CodeTest.test_stateless
+test.test_code.CoExtra.*

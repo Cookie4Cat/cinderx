@@ -447,6 +447,7 @@ class BuildExt(build_ext):
         set_option("ENABLE_PERF_TRAMPOLINE", meta_312)
         set_option("ENABLE_SYMBOLIZER", linux)
         set_option("ENABLE_USDT", linux)
+        set_option("ENABLE_XXCLASSLOADER", False)
         set_option("ENABLE_ZLIB", linux or mac)
 
         for name, value in options.items():
@@ -488,7 +489,10 @@ def main() -> None:
         },
         packages=find_packages(where=PYTHON_LIB_DIR, exclude=["test_cinderx*"]),
         package_dir={"": PYTHON_LIB_DIR},
-        package_data={"cinderx": [".dev_build"]},
+        package_data={
+            "cinderx": [".dev_build"],
+            "cinderx.compiler.strict": ["stubs/**/*.pys"],
+        },
     )
 
 
