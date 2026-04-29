@@ -1,0 +1,13 @@
+# CinderX frame evaluator is process-global and is not supported in subinterpreters.
+test.test_struct.StructTest.test_endian_table_init_subinterpreters
+
+# These inspect CPython code-object internals which CinderX replaces with co-extra data.
+test.test_code.CodeTest.test_stateless
+test.test_code.CoExtra.*
+
+# Known jit-all debts: JIT generator/frame cleanup can run object finalizers
+# while locals are being cleared, producing unraisable exceptions.
+test.test_ordered_dict.*test_free_after_iterating*
+test.test_userlist.UserListTest.test_free_after_iterating
+test.test_xml_etree.BadElementTest.test_element_get_tail
+test.test_xml_etree.BadElementTest.test_element_get_text

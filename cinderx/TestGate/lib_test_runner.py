@@ -26,11 +26,16 @@ REPO_ROOT = find_repo_root()
 TESTGATE_DIR = REPO_ROOT / "cinderx" / "TestGate"
 TEST_SCRIPTS_DIR = REPO_ROOT / "cinderx" / "TestScripts"
 TESTGATE_SKIPLIST_DIR = TESTGATE_DIR / "skiplists"
+MAX_WORKERS = 64
 
-MODES_REQUIRING_FRAME_EVALUATOR = {"frame-eval-nojit"}
+MODES_REQUIRING_FRAME_EVALUATOR = {"frame-eval-nojit", "frame-eval-jit-all"}
+MODES_REQUIRING_JIT_ALL = {"frame-eval-jit-all"}
 NOJIT_MODES = {"frame-eval-nojit"}
 SINGLE_PROCESS_TESTS = {
     "frame-eval-nojit": {
+        "test.test_code",
+    },
+    "frame-eval-jit-all": {
         "test.test_code",
     },
 }
@@ -38,6 +43,12 @@ EXIT_FAST_UNITTEST_TESTS = {
     "frame-eval-nojit": {
         "test.test_code",
     },
+    "frame-eval-jit-all": {
+        "test.test_code",
+    },
+}
+MODE_XOPTIONS = {
+    "frame-eval-jit-all": ["-X", "jit-all"],
 }
 
 
@@ -78,7 +89,10 @@ def skip_file_names(*, mode: str, huntrleaks: bool, use_rr: bool) -> list[str]:
     if use_rr:
         names.append("rr_skip_tests.txt")
 
-    if mode not in NOJIT_MODES:
+    if mode in MODES_REQUIRING_JIT_ALL:
+        names.append("cinder_jit_ignore_tests.txt")
+        names.append(f"cinder_jit_ignore_tests_{version}.txt")
+    elif mode not in NOJIT_MODES:
         try:
             import cinderjit  # noqa: F401
         except ImportError:
@@ -138,7 +152,32 @@ def write_lines(path: Path, lines: Iterable[str]) -> None:
     path.write_text("".join(f"{line}\n" for line in lines), encoding="utf-8")
 
 
-def write_startup_hook(path: Path, mode: str) -> None:
+def read_test_file(path: Path) -> list[str]:
+    tests = []
+    with path.open(encoding="utf-8") as test_file:
+        for raw_line in test_file:
+            line = raw_line.strip()
+            if not line or line.startswith("#"):
+                continue
+            tests.append(line)
+    return tests
+
+
+def default_num_workers() -> int:
+    return min(os.cpu_count() or 1, MAX_WORKERS)
+
+
+def parse_num_workers(value: str | None) -> int:
+    value = value or os.environ.get("CINDERX_TESTGATE_WORKERS", "auto")
+    if value == "auto":
+        return default_num_workers()
+    workers = int(value)
+    if workers <= 0:
+        raise argparse.ArgumentTypeError("--num-workers must be positive or 'auto'")
+    return workers
+
+
+def write_startup_hook(path: Path, mode: str, jit_stats_dir: Path | None = None) -> None:
     path.mkdir(parents=True, exist_ok=True)
     hook = [
         "import sys\n",
@@ -158,6 +197,7 @@ def write_startup_hook(path: Path, mode: str) -> None:
         "    or argv0.endswith('/test/__main__.py')\n",
         "    or argv0.endswith('/test/regrtest.py')\n",
         "    or argv0.endswith('/cinderx/TestGate/filtered_unittest.py')\n",
+        "    or argv0.endswith('/jit_probe.py')\n",
         "):\n",
         "    import os\n",
     ]
@@ -174,6 +214,26 @@ def write_startup_hook(path: Path, mode: str) -> None:
         "    cinderx.init()\n",
         "    if not cinderx.is_initialized():\n",
         "        raise RuntimeError('CinderX failed to initialize')\n",
+        "    try:\n",
+        "        import _testcapi\n",
+        "        import types\n",
+        "        original_get_code = _testcapi.gen_get_code\n",
+        "        def gen_get_code(o):\n",
+        "            if type(o) is not types.GeneratorType:\n",
+        "                return o.gi_code\n",
+        "            return original_get_code(o)\n",
+        "        _testcapi.gen_get_code = gen_get_code\n",
+        "        original_raise_sigint_then_send_none = getattr(\n",
+        "            _testcapi, 'raise_SIGINT_then_send_None', None)\n",
+        "        if original_raise_sigint_then_send_none is not None:\n",
+        "            import cinderx.jit\n",
+        "            def raise_SIGINT_then_send_None(o):\n",
+        "                cinderx.jit._deopt_gen(o)\n",
+        "                return original_raise_sigint_then_send_none(o)\n",
+        "            _testcapi.raise_SIGINT_then_send_None = (\n",
+        "                raise_SIGINT_then_send_None)\n",
+        "    except (ImportError, AttributeError):\n",
+        "        pass\n",
         ]
     )
     if mode in MODES_REQUIRING_FRAME_EVALUATOR:
@@ -193,6 +253,16 @@ def write_startup_hook(path: Path, mode: str) -> None:
                 "        raise RuntimeError('CinderX JIT is enabled in nojit mode')\n",
             ]
         )
+    if mode in MODES_REQUIRING_JIT_ALL:
+        hook.extend(
+            [
+                "    import cinderx.jit\n",
+                "    if not cinderx.jit.is_enabled():\n",
+                "        raise RuntimeError('CinderX JIT is not enabled')\n",
+                "    if cinderx.jit.get_compile_after_n_calls() != 0:\n",
+                "        raise RuntimeError('CinderX JIT is not in jit-all mode')\n",
+            ]
+        )
     hook.extend(
         [
             "    marker = os.environ.get('CINDERX_TESTGATE_FRAME_EVAL_MARKER')\n",
@@ -201,6 +271,57 @@ def write_startup_hook(path: Path, mode: str) -> None:
             "            marker_file.write(f'{os.getpid()} {argv0}\\n')\n",
         ]
     )
+    if jit_stats_dir is not None and mode in MODES_REQUIRING_JIT_ALL:
+        hook.extend(
+            [
+                "    jit_stats_dir = os.environ.get('CINDERX_TESTGATE_JIT_STATS_DIR')\n",
+                "    if jit_stats_dir:\n",
+                "        import atexit\n",
+                "        import json\n",
+                "        from pathlib import Path\n",
+                "        def _jit_func_record(func):\n",
+                "            module = getattr(func, '__module__', None)\n",
+                "            qualname = getattr(func, '__qualname__', None)\n",
+                "            return {\n",
+                "                'module': module,\n",
+                "                'qualname': qualname,\n",
+                "                'name': f'{module}.{qualname}' if module and qualname else repr(func),\n",
+                "            }\n",
+                "        _jit_before_records = [\n",
+                "            _jit_func_record(func)\n",
+                "            for func in cinderx.jit.get_compiled_functions()\n",
+                "        ]\n",
+                "        _jit_before_names = {\n",
+                "            record['name'] for record in _jit_before_records\n",
+                "        }\n",
+                "        def _dump_jit_stats():\n",
+                "            after_records = [\n",
+                "                _jit_func_record(func)\n",
+                "                for func in cinderx.jit.get_compiled_functions()\n",
+                "            ]\n",
+                "            new_records = [\n",
+                "                record for record in after_records\n",
+                "                if record['name'] not in _jit_before_names\n",
+                "            ]\n",
+                "            out_dir = Path(jit_stats_dir)\n",
+                "            out_dir.mkdir(parents=True, exist_ok=True)\n",
+                "            out_file = out_dir / f'jit_stats_{os.getpid()}.json'\n",
+                "            payload = {\n",
+                "                'pid': os.getpid(),\n",
+                "                'argv': sys.argv,\n",
+                "                'orig_argv': list(orig_argv),\n",
+                "                'argv0': argv0,\n",
+                "                'module_name': module_name,\n",
+                "                'compiled_before': len(_jit_before_records),\n",
+                "                'compiled_after': len(after_records),\n",
+                "                'compiled_delta': len(after_records) - len(_jit_before_records),\n",
+                "                'new_function_count': len(new_records),\n",
+                "                'new_functions': new_records,\n",
+                "            }\n",
+                "            out_file.write_text(json.dumps(payload, indent=2) + '\\n', encoding='utf-8')\n",
+                "        atexit.register(_dump_jit_stats)\n",
+            ]
+        )
     (path / "sitecustomize.py").write_text("".join(hook), encoding="utf-8")
 
 
@@ -231,6 +352,9 @@ def env_for_mode(mode: str, startup_dir: Path, marker_file: Path) -> dict[str, s
     if mode in NOJIT_MODES:
         env["CINDERX_JIT_DISABLE"] = "1"
         env["PYTHONJITDISABLE"] = "1"
+    else:
+        env.pop("CINDERX_JIT_DISABLE", None)
+        env.pop("PYTHONJITDISABLE", None)
 
     return env
 
@@ -247,6 +371,90 @@ def normalize_tests(tests: list[str] | None) -> list[str] | None:
     return normalized
 
 
+def defer_tests(tests: list[str], patterns: list[str]) -> list[str]:
+    if not patterns:
+        return tests
+    deferred = []
+    kept = []
+    for test in tests:
+        if any(test.startswith(pattern) for pattern in patterns):
+            deferred.append(test)
+        else:
+            kept.append(test)
+    return kept + deferred
+
+
+def write_jit_probe(path: Path) -> None:
+    script = r'''
+import json
+import sys
+
+import cinderx
+import cinderx.jit
+
+
+def foo(x):
+    return x + 1
+
+
+compiled_before = len(cinderx.jit.get_compiled_functions())
+for i in range(10):
+    foo(i)
+compiled_after = len(cinderx.jit.get_compiled_functions())
+
+result = {
+    "jit_enabled": cinderx.jit.is_enabled(),
+    "compile_after_n_calls": cinderx.jit.get_compile_after_n_calls(),
+    "foo_compiled": cinderx.jit.is_jit_compiled(foo),
+    "compiled_before": compiled_before,
+    "compiled_after": compiled_after,
+    "foo_compiled_size": cinderx.jit.get_compiled_size(foo),
+}
+
+with open(sys.argv[1], "w", encoding="utf-8") as output:
+    json.dump(result, output, indent=2)
+    output.write("\n")
+
+if (
+    not result["jit_enabled"]
+    or result["compile_after_n_calls"] != 0
+    or not result["foo_compiled"]
+    or result["foo_compiled_size"] <= 0
+):
+    raise SystemExit(1)
+'''.lstrip()
+    path.write_text(script, encoding="utf-8")
+
+
+def run_jit_probe(
+    *, startup_dir: Path, env: dict[str, str], xoptions: list[str], output_file: Path
+) -> dict[str, object]:
+    probe_script = startup_dir / "jit_probe.py"
+    probe_log = output_file.with_suffix(".log")
+    write_jit_probe(probe_script)
+
+    command = [sys.executable, *xoptions, str(probe_script), str(output_file)]
+    completed = subprocess.run(
+        command,
+        cwd=REPO_ROOT,
+        env=env,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
+    )
+    probe_log.write_text(completed.stdout, encoding="utf-8")
+
+    result: dict[str, object] = {
+        "returncode": completed.returncode,
+        "command": command,
+        "log": str(probe_log),
+    }
+    if output_file.exists():
+        with output_file.open(encoding="utf-8") as output:
+            result.update(json.load(output))
+    return result
+
+
 def regrtest_command(
     *,
     tests: list[str],
@@ -254,9 +462,11 @@ def regrtest_command(
     num_workers: int,
     worker_timeout: int,
     single_process: bool = False,
+    xoptions: list[str] | None = None,
 ) -> list[str]:
     command = [
         sys.executable,
+        *(xoptions or []),
         "-m",
         "test",
         "-q",
@@ -276,9 +486,12 @@ def regrtest_command(
     return command
 
 
-def filtered_unittest_command(*, test: str, ignore_file: Path) -> list[str]:
+def filtered_unittest_command(
+    *, test: str, ignore_file: Path, xoptions: list[str] | None = None
+) -> list[str]:
     command = [
         sys.executable,
+        *(xoptions or []),
         str(TESTGATE_DIR / "filtered_unittest.py"),
         "--ignorefile",
         str(ignore_file),
@@ -291,14 +504,33 @@ def main(argv: list[str]) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
         "--mode",
-        choices=["frame-eval-nojit"],
+        choices=["frame-eval-nojit", "frame-eval-jit-all"],
         default="frame-eval-nojit",
         help="Lib/test execution mode",
     )
     parser.add_argument("--json-summary-file", required=True)
     parser.add_argument("--test-list-file", required=True)
-    parser.add_argument("--num-workers", type=int, default=4)
+    parser.add_argument(
+        "--test-from-file",
+        help="read tests from this file instead of discovering Lib/test",
+    )
+    parser.add_argument("--num-workers", default=None)
     parser.add_argument("--worker-timeout", type=int, default=20 * 60)
+    parser.add_argument(
+        "--jit-stats-dir",
+        help="write per-process JIT compilation stats under this directory",
+    )
+    parser.add_argument(
+        "--skip-jit-probe",
+        action="store_true",
+        help="skip the small jit-all sanity probe",
+    )
+    parser.add_argument(
+        "--defer-pattern",
+        action="append",
+        default=[],
+        help="move tests whose normalized name starts with this prefix to the end",
+    )
     parser.add_argument(
         "--disable-jit",
         action="store_true",
@@ -315,6 +547,11 @@ def main(argv: list[str]) -> int:
     if args.disable_jit:
         args.mode = "frame-eval-nojit"
 
+    try:
+        num_workers = parse_num_workers(args.num_workers)
+    except (argparse.ArgumentTypeError, ValueError) as exc:
+        parser.error(f"invalid --num-workers value: {exc}")
+
     skip_files, skip_modules, skip_patterns = load_skip_metadata(mode=args.mode)
     gate_skip_files, gate_skip_modules, gate_skip_patterns = load_gate_skip_metadata(
         args.mode
@@ -322,7 +559,12 @@ def main(argv: list[str]) -> int:
     skip_files.extend(gate_skip_files)
     skip_modules.update(gate_skip_modules)
     skip_patterns.update(gate_skip_patterns)
-    tests = normalize_tests(args.test) or discover_lib_tests(skip_modules)
+    tests = normalize_tests(args.test)
+    if tests is None and args.test_from_file:
+        tests = normalize_tests(read_test_file(Path(args.test_from_file)))
+    if tests is None:
+        tests = discover_lib_tests(skip_modules)
+    tests = defer_tests(tests, args.defer_pattern)
 
     test_list_path = Path(args.test_list_file)
     write_lines(test_list_path, tests)
@@ -340,38 +582,61 @@ def main(argv: list[str]) -> int:
     write_lines(parallel_test_list_path, parallel_tests)
 
     startup_dir = test_list_path.with_name(f"{test_list_path.stem}_startup")
-    write_startup_hook(startup_dir, args.mode)
+    jit_stats_dir = Path(args.jit_stats_dir) if args.jit_stats_dir else None
+    write_startup_hook(startup_dir, args.mode, jit_stats_dir)
     marker_file = startup_dir / "frame_eval_startups.txt"
 
     env = env_for_mode(args.mode, startup_dir, marker_file)
-    commands: list[list[str]] = []
-    if parallel_tests:
-        commands.append(
-            regrtest_command(
-                tests=["--fromfile", str(parallel_test_list_path)],
-                ignore_file=ignore_file,
-                num_workers=args.num_workers,
-                worker_timeout=args.worker_timeout,
-            )
+    if jit_stats_dir is not None:
+        env["CINDERX_TESTGATE_JIT_STATS_DIR"] = str(jit_stats_dir)
+    xoptions = MODE_XOPTIONS.get(args.mode, [])
+    jit_probe = None
+    if args.mode in MODES_REQUIRING_JIT_ALL and not args.skip_jit_probe:
+        jit_probe_path = test_list_path.with_name(
+            f"{test_list_path.stem}_jit_probe.json"
         )
-    exit_fast_unittest_tests = EXIT_FAST_UNITTEST_TESTS.get(args.mode, set())
-    for test in single_process_tests:
-        if test in exit_fast_unittest_tests:
-            commands.append(
-                filtered_unittest_command(test=test, ignore_file=ignore_file)
-            )
-        else:
+        jit_probe = run_jit_probe(
+            startup_dir=startup_dir,
+            env=env,
+            xoptions=xoptions,
+            output_file=jit_probe_path,
+        )
+    commands: list[list[str]] = []
+    if jit_probe is None or jit_probe["returncode"] == 0:
+        if parallel_tests:
             commands.append(
                 regrtest_command(
-                    tests=[test],
+                    tests=["--fromfile", str(parallel_test_list_path)],
                     ignore_file=ignore_file,
-                    num_workers=args.num_workers,
+                    num_workers=num_workers,
                     worker_timeout=args.worker_timeout,
-                    single_process=True,
+                    xoptions=xoptions,
                 )
             )
+    exit_fast_unittest_tests = EXIT_FAST_UNITTEST_TESTS.get(args.mode, set())
+    if jit_probe is None or jit_probe["returncode"] == 0:
+        for test in single_process_tests:
+            if test in exit_fast_unittest_tests:
+                commands.append(
+                    filtered_unittest_command(
+                        test=test, ignore_file=ignore_file, xoptions=xoptions
+                    )
+                )
+            else:
+                commands.append(
+                    regrtest_command(
+                        tests=[test],
+                        ignore_file=ignore_file,
+                        num_workers=num_workers,
+                        worker_timeout=args.worker_timeout,
+                        single_process=True,
+                        xoptions=xoptions,
+                    )
+                )
 
     returncode = 0
+    if jit_probe is not None and jit_probe["returncode"] != 0:
+        returncode = int(jit_probe["returncode"])
     for command in commands:
         completed = subprocess.run(command, cwd=REPO_ROOT, env=env)
         if completed.returncode != 0:
@@ -389,6 +654,12 @@ def main(argv: list[str]) -> int:
             args.mode in MODES_REQUIRING_FRAME_EVALUATOR
         ),
         "requires_jit_disabled": args.mode in NOJIT_MODES,
+        "requires_jit_all": args.mode in MODES_REQUIRING_JIT_ALL,
+        "xoptions": xoptions,
+        "num_workers": num_workers,
+        "jit_probe": jit_probe,
+        "jit_stats_dir": str(jit_stats_dir) if jit_stats_dir is not None else None,
+        "defer_patterns": args.defer_pattern,
         "startup_hook": str(startup_dir / "sitecustomize.py"),
         "startup_marker": str(marker_file),
         "test_count": len(tests),

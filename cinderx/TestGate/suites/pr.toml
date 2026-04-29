@@ -13,7 +13,7 @@ ENABLE_XXCLASSLOADER = "1"
 
 [[jobs]]
 name = "lib_test_release_frame_eval_nojit"
-command = "\"{run_dir}/venv/bin/python\" cinderx/TestGate/lib_test_runner.py --mode frame-eval-nojit --num-workers 4 --worker-timeout 1200 --test-list-file \"{run_dir}/lib_test_release_frame_eval_nojit_tests.txt\" --json-summary-file \"{run_dir}/lib_test_release_frame_eval_nojit.json\""
+command = "\"{run_dir}/venv/bin/python\" cinderx/TestGate/lib_test_runner.py --mode frame-eval-nojit --num-workers auto --worker-timeout 1200 --test-list-file \"{run_dir}/lib_test_release_frame_eval_nojit_tests.txt\" --json-summary-file \"{run_dir}/lib_test_release_frame_eval_nojit.json\""
 
 [[jobs]]
 name = "test_cinderx_release"
