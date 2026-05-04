@@ -43,6 +43,12 @@ class BytecodeInstruction {
   int specializedOpcode() const;
   int oparg() const;
 
+  // Read inline cache payload code units that immediately follow this
+  // instruction. Index 0 is the first cache entry after the opcode.
+  uint16_t inlineCacheEntry(std::size_t index) const;
+  uint32_t inlineCacheEntry32(std::size_t index) const;
+  uintptr_t inlineCacheEntryPtr(std::size_t index) const;
+
   // Check if this instruction is a branch, a return, or a general basic block
   // terminator.
   bool isBranch() const;

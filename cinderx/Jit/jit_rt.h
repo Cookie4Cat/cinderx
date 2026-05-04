@@ -196,6 +196,12 @@ PyObject* JITRT_VectorcallTstate(
  */
 LoadMethodResult JITRT_GetMethod(PyObject* obj, PyObject* name);
 
+LoadMethodResult JITRT_LoadAttrMethodNoDict(
+    PyObject* obj,
+    uint32_t type_version,
+    PyObject* descr,
+    PyObject* name);
+
 /*
  * Perform an attribute lookup in a super class
  *
@@ -218,6 +224,13 @@ PyObject* JITRT_GetAttrFromSuper(
     PyObject* self,
     PyObject* name,
     bool no_args_in_super_call);
+
+int JITRT_StoreAttrInstanceValue(
+    PyObject* obj,
+    PyObject* value,
+    uint32_t type_version,
+    uint16_t value_offset,
+    PyObject* name);
 
 /*
  * Mimics the behavior of the UNARY_NOT opcode.

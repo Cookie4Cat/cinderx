@@ -8,6 +8,7 @@
 #include "internal/pycore_pyerrors.h"
 #include "internal/pycore_pystate.h"
 
+#include "cinderx/Common/dict.h"
 #include "cinderx/Common/log.h"
 #include "cinderx/Common/py-portability.h"
 #include "cinderx/Common/ref.h"
@@ -1118,6 +1119,24 @@ LoadMethodResult JITRT_GetMethod(PyObject* obj, PyObject* name) {
   return {method, obj};
 }
 
+LoadMethodResult JITRT_LoadAttrMethodNoDict(
+    PyObject* obj,
+    uint32_t type_version,
+    PyObject* descr,
+    PyObject* name) {
+#if PY_VERSION_HEX >= 0x030E0000 && !defined(Py_GIL_DISABLED)
+  PyTypeObject* tp = Py_TYPE(obj);
+  if (type_version != 0 && tp->tp_version_tag == type_version &&
+      tp->tp_dictoffset == 0 && descr != nullptr &&
+      PyType_HasFeature(Py_TYPE(descr), Py_TPFLAGS_METHOD_DESCRIPTOR)) {
+    Py_INCREF(descr);
+    Py_INCREF(obj);
+    return {descr, obj};
+  }
+#endif
+  return JITRT_GetMethod(obj, name);
+}
+
 static inline PyObject* super_lookup_method_or_attr(
     PyObject* global_super,
     PyTypeObject* type,
@@ -1187,6 +1206,42 @@ PyObject* JITRT_GetAttrFromSuper(
     bool no_args_in_super_call) {
   return super_lookup_method_or_attr(
       global_super, type, self, name, no_args_in_super_call, nullptr);
+}
+
+int JITRT_StoreAttrInstanceValue(
+    PyObject* obj,
+    PyObject* value,
+    uint32_t type_version,
+    uint16_t value_offset,
+    PyObject* name) {
+#if PY_VERSION_HEX >= 0x030E0000 && !defined(Py_GIL_DISABLED)
+  PyTypeObject* tp = Py_TYPE(obj);
+  if (type_version == 0 || tp->tp_version_tag != type_version ||
+      !PyType_HasFeature(tp, Py_TPFLAGS_INLINE_VALUES) ||
+      _PyObject_GetManagedDict(obj) != nullptr) {
+    return PyObject_SetAttr(obj, name, value);
+  }
+
+  PyDictValues* values = _PyObject_InlineValues(obj);
+  if (!values->valid) {
+    return PyObject_SetAttr(obj, name, value);
+  }
+
+  PyObject** value_ptr = reinterpret_cast<PyObject**>(
+      reinterpret_cast<char*>(obj) + value_offset);
+  PyObject* old_value = *value_ptr;
+  *value_ptr = Py_NewRef(value);
+
+  if (old_value == nullptr) {
+    Py_ssize_t index = value_ptr - values->values;
+    _PyDictValues_AddToInsertionOrder(values, index);
+  } else {
+    Py_DECREF(old_value);
+  }
+  return 0;
+#else
+  return PyObject_SetAttr(obj, name, value);
+#endif
 }
 
 PyObject* JITRT_InvokeMethod(

@@ -215,6 +215,18 @@ class SpecializationTests(unittest.TestCase):
         self.assertIn("LOAD_ATTR_MODULE", opnames(f))
         self.assertEqual(f(), sys.argv[0])
 
+    def test_load_attr_method_no_dict(self) -> None:
+        def f(value: str) -> str:
+            return value.upper()
+
+        specialize(f, lambda: f("abc"))
+
+        if sys.version_info >= (3, 14):
+            self.assertNotIn("LOAD_ATTR", opnames(f))
+            self.assertIn("LOAD_ATTR_METHOD_NO_DICT", opnames(f))
+
+        self.assertEqual(f("abc"), "ABC")
+
     def test_store_subscr_dict(self) -> None:
         def f(a: dict[str, str], b: str, c: str) -> None:
             a[b] = c
@@ -227,6 +239,24 @@ class SpecializationTests(unittest.TestCase):
         d = {"a": "b"}
         f(d, "a", "c")
         self.assertEqual(d, {"a": "c"})
+
+    def test_store_attr_instance_value(self) -> None:
+        class C:
+            def __init__(self) -> None:
+                self.x = 0
+
+        def f(obj: C, value: int) -> None:
+            obj.x = value
+
+        obj = C()
+        specialize(f, lambda: f(obj, 1))
+
+        if sys.version_info >= (3, 14):
+            self.assertNotIn("STORE_ATTR", opnames(f))
+            self.assertIn("STORE_ATTR_INSTANCE_VALUE", opnames(f))
+
+        f(obj, 42)
+        self.assertEqual(obj.x, 42)
 
     def test_unpack_sequence_list(self) -> None:
         def f(li: list[str]) -> str:

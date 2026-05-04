@@ -88,6 +88,10 @@ int BytecodeInstruction::specializedOpcode() const {
     case COMPARE_OP_INT:
     case COMPARE_OP_STR:
     case LOAD_ATTR_MODULE:
+#if PY_VERSION_HEX >= 0x030E0000
+    case LOAD_ATTR_METHOD_NO_DICT:
+    case STORE_ATTR_INSTANCE_VALUE:
+#endif
     case STORE_SUBSCR_DICT:
     case UNPACK_SEQUENCE_LIST:
     case UNPACK_SEQUENCE_TUPLE:
@@ -101,6 +105,30 @@ int BytecodeInstruction::specializedOpcode() const {
 int BytecodeInstruction::oparg() const {
   calcOpcodeOffsetAndOparg();
   return extendedOparg_;
+}
+
+uint16_t BytecodeInstruction::inlineCacheEntry(std::size_t index) const {
+  calcOpcodeOffsetAndOparg();
+  JIT_DCHECK(
+      index < static_cast<std::size_t>(
+                  inlineCacheSize(code_, opcodeIndex_.value())),
+      "inline cache index {} out of range",
+      index);
+  return codeUnit(code_)[opcodeIndex_.value() + 1 + index].cache;
+}
+
+uint32_t BytecodeInstruction::inlineCacheEntry32(std::size_t index) const {
+  uint32_t lo = inlineCacheEntry(index);
+  uint32_t hi = inlineCacheEntry(index + 1);
+  return lo | (hi << 16);
+}
+
+uintptr_t BytecodeInstruction::inlineCacheEntryPtr(std::size_t index) const {
+  uintptr_t result = 0;
+  for (std::size_t i = 0; i < sizeof(uintptr_t) / sizeof(uint16_t); i++) {
+    result |= static_cast<uintptr_t>(inlineCacheEntry(index + i)) << (16 * i);
+  }
+  return result;
 }
 
 bool BytecodeInstruction::isBranch() const {
