@@ -1,0 +1,47 @@
+{
+  "schema": 1,
+  "repo_base": "meta/main",
+  "target": {
+    "python": "3.14",
+    "arch": "arm64",
+    "system": "Linux"
+  },
+  "policy": {
+    "hard_gate": "A change should not introduce failures beyond the frozen baseline.",
+    "probe_gate": "A change should record results and should not introduce new crash, hang, or materially worse failures.",
+    "control_gate": "A change should use this to classify JIT-enabled side effects separately from compiled-code failures."
+  },
+  "baselines": [
+    {
+      "name": "adaptive-aware AUTOJIT=50 full module probe",
+      "file": "meta_main_arm64_314_adaptive_aware_50_module_probe.json",
+      "suite": "lib_test_adaptive_aware_50_module_probe",
+      "gate_class": "hard"
+    },
+    {
+      "name": "adaptive-aware AUTOJIT=8 full pressure probe",
+      "file": "meta_main_arm64_314_adaptive_aware_8_full_probe.json",
+      "suite": "lib_test_adaptive_aware_8_pressure_sample",
+      "gate_class": "pressure"
+    },
+    {
+      "name": "adaptive-aware AUTOJIT=1 full pressure probe",
+      "file": "meta_main_arm64_314_adaptive_aware_1_full_probe.json",
+      "suite": "lib_test_adaptive_aware_1_pressure_sample",
+      "gate_class": "pressure"
+    },
+    {
+      "name": "adaptive-aware AUTOJIT=1000000 full JIT-enabled control probe",
+      "file": "meta_main_arm64_314_adaptive_aware_1000000_full_control_probe.json",
+      "suite": "lib_test_adaptive_aware_1000000_control_sample",
+      "gate_class": "control"
+    }
+  ],
+  "pending_baselines": [
+    {
+      "name": "jit-all full module probe",
+      "suite": "lib_test_jit_all_probe",
+      "reason": "The gate exists; move its latest accepted artifact here when freezing the next complete baseline set."
+    }
+  ]
+}

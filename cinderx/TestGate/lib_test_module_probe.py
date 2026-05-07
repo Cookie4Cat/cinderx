@@ -4,7 +4,10 @@
 from __future__ import annotations
 
 import argparse
+import concurrent.futures
 import json
+import os
+import signal
 import subprocess
 import sys
 import time
@@ -12,6 +15,20 @@ from pathlib import Path
 from typing import Any
 
 import lib_test_runner
+
+
+def resolve_num_workers(value: str) -> int:
+    if value == "auto":
+        return min(os.cpu_count() or 1, 64)
+    try:
+        workers = int(value)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError(
+            "--num-workers must be an integer or 'auto'"
+        ) from exc
+    if workers < 1:
+        raise argparse.ArgumentTypeError("--num-workers must be >= 1")
+    return workers
 
 
 def write_lines(path: Path, lines: list[str]) -> None:
@@ -22,9 +39,9 @@ def write_lines(path: Path, lines: list[str]) -> None:
 def classify_result(returncode: int, log_text: str) -> str:
     if returncode == 124:
         return "timeout"
-    if "Result: NO TESTS RAN" in log_text:
-        if "resource_denied=" in log_text:
-            return "resource_denied"
+    if "Result: NO TESTS RAN" in log_text and "resource_denied=" in log_text:
+        return "resource_denied"
+    if returncode == 0 and "Result: NO TESTS RAN" in log_text:
         return "no_tests"
     if returncode == 0:
         return "pass"
@@ -47,6 +64,92 @@ def read_process_stats(stats_dir: Path) -> list[dict[str, Any]]:
         data["path"] = str(path)
         stats.append(data)
     return stats
+
+
+def cleanup_process_group(process: subprocess.Popen[Any]) -> None:
+    if not hasattr(os, "killpg"):
+        return
+    try:
+        os.killpg(process.pid, signal.SIGKILL)
+    except ProcessLookupError:
+        pass
+    except PermissionError:
+        pass
+
+
+def child_pids(pid: int) -> list[int]:
+    children = set()
+    task_dir = Path(f"/proc/{pid}/task")
+    try:
+        tasks = list(task_dir.iterdir())
+    except (FileNotFoundError, ProcessLookupError):
+        return []
+    for task in tasks:
+        children_file = task / "children"
+        try:
+            children.update(int(child) for child in children_file.read_text().split())
+        except (FileNotFoundError, ProcessLookupError, ValueError):
+            pass
+    return sorted(children)
+
+
+def descendant_pids(pid: int) -> list[int]:
+    descendants = []
+    pending = child_pids(pid)
+    while pending:
+        child = pending.pop()
+        descendants.append(child)
+        pending.extend(child_pids(child))
+    return descendants
+
+
+def cleanup_process_tree(process: subprocess.Popen[Any]) -> None:
+    for pid in reversed(descendant_pids(process.pid)):
+        if hasattr(os, "killpg"):
+            try:
+                os.killpg(pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+            except PermissionError:
+                pass
+        try:
+            os.kill(pid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+        except PermissionError:
+            pass
+    cleanup_process_group(process)
+
+
+def process_has_marker(pid: int, marker: str) -> bool:
+    try:
+        environ = Path(f"/proc/{pid}/environ").read_bytes()
+    except (FileNotFoundError, ProcessLookupError, PermissionError):
+        return False
+    return marker.encode() in environ
+
+
+def cleanup_marked_processes(marker: str) -> None:
+    proc_dir = Path("/proc")
+    for path in proc_dir.iterdir():
+        if not path.name.isdigit():
+            continue
+        pid = int(path.name)
+        if not process_has_marker(pid, marker):
+            continue
+        if hasattr(os, "killpg"):
+            try:
+                os.killpg(pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+            except PermissionError:
+                pass
+        try:
+            os.kill(pid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+        except PermissionError:
+            pass
 
 
 def function_name(record: dict[str, Any]) -> str:
@@ -97,6 +200,7 @@ def run_module(
     jit_stats_dir = module_dir / "jit_stats"
     log_file = module_dir / "runner.log"
     write_lines(input_file, [test])
+    marker = f"CINDERX_TESTGATE_MODULE_PROBE={module_dir}"
 
     command = [
         sys.executable,
@@ -117,27 +221,42 @@ def run_module(
         str(jit_stats_dir),
         "--skip-jit-probe",
     ]
+    if args.mode in lib_test_runner.ADAPTIVE_AWARE_MODES:
+        command.extend(
+            [
+                "--adaptive-compile-after",
+                str(args.adaptive_compile_after),
+            ]
+        )
 
     print(f"[{index:4d}/{total}] {test}", flush=True)
     started = time.monotonic()
     with log_file.open("w", encoding="utf-8") as log:
         log.write("$ " + " ".join(command) + "\n\n")
         log.flush()
+        env = os.environ.copy()
+        env["CINDERX_TESTGATE_MODULE_PROBE"] = str(module_dir)
+        process = subprocess.Popen(
+            command,
+            cwd=lib_test_runner.REPO_ROOT,
+            env=env,
+            stdout=log,
+            stderr=subprocess.STDOUT,
+            text=True,
+            start_new_session=hasattr(os, "killpg"),
+        )
         try:
-            completed = subprocess.run(
-                command,
-                cwd=lib_test_runner.REPO_ROOT,
-                stdout=log,
-                stderr=subprocess.STDOUT,
-                text=True,
-                timeout=args.per_module_timeout,
-            )
-            returncode = completed.returncode
+            returncode = process.wait(timeout=args.per_module_timeout)
             timed_out = False
         except subprocess.TimeoutExpired:
+            cleanup_process_tree(process)
+            cleanup_marked_processes(marker)
+            process.wait()
             returncode = 124
             timed_out = True
             log.write(f"\nTimed out after {args.per_module_timeout} seconds\n")
+        else:
+            cleanup_process_group(process)
 
     elapsed = round(time.monotonic() - started, 3)
     log_text = log_file.read_text(encoding="utf-8", errors="replace")
@@ -163,10 +282,15 @@ def run_module(
         "compiled_delta": compiled_delta,
         "compiled_new_count": len(all_new_functions),
         "module_new_count": len(module_new_functions),
-        "compiled_new_functions": all_new_functions,
-        "module_new_functions": module_new_functions,
-        "process_stats": process_stats,
     }
+    if args.include_jit_details:
+        result.update(
+            {
+                "compiled_new_functions": all_new_functions,
+                "module_new_functions": module_new_functions,
+                "process_stats": process_stats,
+            }
+        )
     print(
         f"          {status} rc={returncode} "
         f"delta={compiled_delta} "
@@ -218,14 +342,25 @@ def main(argv: list[str]) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
         "--mode",
-        choices=["frame-eval-jit-all"],
+        choices=["frame-eval-jit-all", "frame-eval-adaptive-aware"],
         default="frame-eval-jit-all",
     )
     parser.add_argument("--test-from-file")
     parser.add_argument("-t", "--test", action="append")
     parser.add_argument("--defer-pattern", action="append", default=[])
+    parser.add_argument(
+        "--num-workers",
+        default="1",
+        help="number of Lib/test modules to probe concurrently, or 'auto'",
+    )
     parser.add_argument("--worker-timeout", type=int, default=20 * 60)
     parser.add_argument("--per-module-timeout", type=int, default=25 * 60)
+    parser.add_argument(
+        "--adaptive-compile-after",
+        type=int,
+        default=lib_test_runner.DEFAULT_ADAPTIVE_AWARE_COMPILE_AFTER,
+        help="AutoJIT threshold for frame-eval-adaptive-aware",
+    )
     parser.add_argument("--output-dir", required=True)
     parser.add_argument("--json-summary-file", required=True)
     parser.add_argument("--tsv-summary-file", required=True)
@@ -234,7 +369,22 @@ def main(argv: list[str]) -> int:
         action="store_true",
         help="always return 0 after writing summaries",
     )
+    parser.add_argument(
+        "--include-jit-details",
+        action="store_true",
+        help="embed per-function JIT details in the JSON summary",
+    )
     args = parser.parse_args(argv)
+    try:
+        adaptive_compile_after = lib_test_runner.adaptive_compile_after_for_mode(
+            args.mode, args.adaptive_compile_after
+        )
+    except argparse.ArgumentTypeError as exc:
+        parser.error(str(exc))
+    try:
+        num_workers = resolve_num_workers(args.num_workers)
+    except argparse.ArgumentTypeError as exc:
+        parser.error(str(exc))
 
     skip_files, skip_modules, _ = lib_test_runner.load_skip_metadata(mode=args.mode)
     gate_skip_files, gate_skip_modules, _ = lib_test_runner.load_gate_skip_metadata(
@@ -255,16 +405,35 @@ def main(argv: list[str]) -> int:
     output_dir.mkdir(parents=True, exist_ok=True)
     write_lines(output_dir / "modules.txt", tests)
 
-    results = [
-        run_module(
-            test=test,
-            index=index,
-            total=len(tests),
-            args=args,
-            output_dir=output_dir,
-        )
-        for index, test in enumerate(tests, 1)
-    ]
+    work_items = list(enumerate(tests, 1))
+    if num_workers == 1:
+        results = [
+            run_module(
+                test=test,
+                index=index,
+                total=len(tests),
+                args=args,
+                output_dir=output_dir,
+            )
+            for index, test in work_items
+        ]
+    else:
+        results = []
+        with concurrent.futures.ThreadPoolExecutor(max_workers=num_workers) as executor:
+            futures = [
+                executor.submit(
+                    run_module,
+                    test=test,
+                    index=index,
+                    total=len(tests),
+                    args=args,
+                    output_dir=output_dir,
+                )
+                for index, test in work_items
+            ]
+            for future in concurrent.futures.as_completed(futures):
+                results.append(future.result())
+        results.sort(key=lambda result: result["index"])
 
     status_counts: dict[str, int] = {}
     for result in results:
@@ -273,6 +442,8 @@ def main(argv: list[str]) -> int:
     summary = {
         "mode": args.mode,
         "returncode": 0,
+        "adaptive_compile_after": adaptive_compile_after,
+        "num_workers": num_workers,
         "test_count": len(tests),
         "status_counts": dict(sorted(status_counts.items())),
         "compiled_new_zero": [

@@ -1,0 +1,116 @@
+{
+  "baseline": "meta/main ARM64 CPython 3.14 adaptive-aware AUTOJIT=50 Lib/test module probe",
+  "date": "2026-04-29",
+  "mode": "frame-eval-adaptive-aware",
+  "adaptive_compile_after": 50,
+  "suite": "lib_test_adaptive_aware_50_module_probe",
+  "test_count": 469,
+  "status_counts": {
+    "pass": 433,
+    "fail": 20,
+    "env_changed": 1,
+    "timeout": 1,
+    "resource_denied": 10,
+    "no_tests": 3,
+    "probe_anomaly": 1
+  },
+  "module_new_count_gt_zero": 189,
+  "notes": [
+    "The original run classified test.test_regrtest as no_tests despite return code 2. An isolated adaptive-aware AUTOJIT=50 rerun passed, so it is tracked as a probe anomaly rather than a confirmed failure.",
+    "resource_denied and no_tests entries are tracked as non-run coverage gaps, not adaptive-aware regressions."
+  ],
+  "probe_anomalies": [
+    "test.test_regrtest"
+  ],
+  "known_non_run": {
+    "resource_denied": [
+      "test.test_curses",
+      "test.test_peg_generator",
+      "test.test_smtpnet",
+      "test.test_socketserver",
+      "test.test_tkinter",
+      "test.test_ttk",
+      "test.test_urllibnet",
+      "test.test_winsound",
+      "test.test_xpickle",
+      "test.test_zipfile64"
+    ],
+    "no_tests_after_filtering": [
+      "test.test__interpchannels",
+      "test.test__interpreters",
+      "test.test_crossinterp"
+    ]
+  },
+  "failure_groups": [
+    {
+      "category": "recursion_protection_and_delayed_autojit_calls",
+      "tests": [
+        "test.test_call",
+        "test.test_exceptions",
+        "test.test_isinstance",
+        "test.test_json",
+        "test.test_opcache",
+        "test.test_pickle",
+        "test.test_support",
+        "test.test_sys",
+        "test.test_traceback"
+      ],
+      "cause": "Recursive call paths fail or crash after compile_after_n_calls(50) installs the AutoJIT entrypoint. The strongest reproducer is a recursive keyword call that reaches JITRT_CallWithKeywordArgs before CPython raises RecursionError."
+    },
+    {
+      "category": "monitoring_tracing_debugger_profiler_events",
+      "tests": [
+        "test.test_cprofile",
+        "test.test_external_inspection",
+        "test.test_monitoring",
+        "test.test_pdb",
+        "test.test_profile",
+        "test.test_sys_settrace"
+      ],
+      "cause": "Event ordering, line reporting, opcode tracing, and frame visibility differ once functions can cross from interpreted/adaptive execution into CinderX JIT."
+    },
+    {
+      "category": "generator_and_frame_locals_semantics",
+      "tests": [
+        "test.test_generators"
+      ],
+      "cause": "Generator frame locals and yield-from behavior diverge under delayed AutoJIT."
+    },
+    {
+      "category": "signals_and_threading",
+      "tests": [
+        "test.test_signal",
+        "test.test_threading"
+      ],
+      "cause": "Signal/KeyboardInterrupt behavior fails and test_threading timed out under compile_after_n_calls(50)."
+    },
+    {
+      "category": "env_changed",
+      "tests": [
+        "test.test_ordered_dict"
+      ],
+      "cause": "ENV CHANGED result, likely related to the existing jit-all generator/finalizer cleanup debt."
+    },
+    {
+      "category": "jit_enabled_interpreter_contract",
+      "tests": [
+        "test.test_capi"
+      ],
+      "cause": "Passes under frame-eval-nojit but fails when CinderX JIT is enabled, even at compile_after_n_calls(1000000) with no recorded compiled functions. Stable failures are Test_Pep523API.test_inlined_binary_subscr, where CPython's PEP 523 eval-frame recorder sees 0 calls instead of 200, and CAPITest.test_is_unique_temporary, where the CPython 3.14 LOAD_FAST_BORROW refcount expectation sees 2 instead of 1."
+    },
+    {
+      "category": "jit_enabled_specialization_disassembly",
+      "tests": [
+        "test.test_dis"
+      ],
+      "cause": "Passes under frame-eval-nojit but fails when CinderX JIT is enabled, even at compile_after_n_calls(1000000) with no recorded compiled functions. test_loop_quicken expects CALL_PY_GENERAL in adaptive disassembly but observes CALL."
+    },
+    {
+      "category": "autojit_threshold_compileall_pyc_hardlink",
+      "tests": [
+        "test.test_compileall"
+      ],
+      "cause": "Passes at compile_after_n_calls(1000000) but fails consistently at compile_after_n_calls(50). Failures are in HardlinkDedupTests*, where .pyc files expected to be hardlinked are not."
+    }
+  ]
+}

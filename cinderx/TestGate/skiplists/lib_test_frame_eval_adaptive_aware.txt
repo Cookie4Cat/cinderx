@@ -1,0 +1,3 @@
+# Adaptive-aware currently has no gate-specific filters beyond official CinderX
+# metadata. Keep this file separate from jit-all because the failure modes are
+# expected to differ.

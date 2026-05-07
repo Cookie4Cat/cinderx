@@ -27,9 +27,17 @@ TESTGATE_DIR = REPO_ROOT / "cinderx" / "TestGate"
 TEST_SCRIPTS_DIR = REPO_ROOT / "cinderx" / "TestScripts"
 TESTGATE_SKIPLIST_DIR = TESTGATE_DIR / "skiplists"
 MAX_WORKERS = 64
+DEFAULT_ADAPTIVE_AWARE_COMPILE_AFTER = 50
 
-MODES_REQUIRING_FRAME_EVALUATOR = {"frame-eval-nojit", "frame-eval-jit-all"}
+ADAPTIVE_AWARE_MODES = {"frame-eval-adaptive-aware"}
+MODES_REQUIRING_FRAME_EVALUATOR = {
+    "frame-eval-nojit",
+    "frame-eval-jit-all",
+    *ADAPTIVE_AWARE_MODES,
+}
 MODES_REQUIRING_JIT_ALL = {"frame-eval-jit-all"}
+MODES_REQUIRING_JIT_ENABLED = MODES_REQUIRING_JIT_ALL | ADAPTIVE_AWARE_MODES
+MODES_RECORDING_JIT_STATS = MODES_REQUIRING_JIT_ENABLED
 NOJIT_MODES = {"frame-eval-nojit"}
 SINGLE_PROCESS_TESTS = {
     "frame-eval-nojit": {
@@ -38,12 +46,18 @@ SINGLE_PROCESS_TESTS = {
     "frame-eval-jit-all": {
         "test.test_code",
     },
+    "frame-eval-adaptive-aware": {
+        "test.test_code",
+    },
 }
 EXIT_FAST_UNITTEST_TESTS = {
     "frame-eval-nojit": {
         "test.test_code",
     },
     "frame-eval-jit-all": {
+        "test.test_code",
+    },
+    "frame-eval-adaptive-aware": {
         "test.test_code",
     },
 }
@@ -177,7 +191,13 @@ def parse_num_workers(value: str | None) -> int:
     return workers
 
 
-def write_startup_hook(path: Path, mode: str, jit_stats_dir: Path | None = None) -> None:
+def write_startup_hook(
+    path: Path,
+    mode: str,
+    *,
+    jit_stats_dir: Path | None = None,
+    adaptive_compile_after: int | None = None,
+) -> None:
     path.mkdir(parents=True, exist_ok=True)
     hook = [
         "import sys\n",
@@ -253,14 +273,31 @@ def write_startup_hook(path: Path, mode: str, jit_stats_dir: Path | None = None)
                 "        raise RuntimeError('CinderX JIT is enabled in nojit mode')\n",
             ]
         )
-    if mode in MODES_REQUIRING_JIT_ALL:
+    if mode in MODES_REQUIRING_JIT_ENABLED:
         hook.extend(
             [
                 "    import cinderx.jit\n",
                 "    if not cinderx.jit.is_enabled():\n",
                 "        raise RuntimeError('CinderX JIT is not enabled')\n",
+            ]
+        )
+    if mode in MODES_REQUIRING_JIT_ALL:
+        hook.extend(
+            [
                 "    if cinderx.jit.get_compile_after_n_calls() != 0:\n",
                 "        raise RuntimeError('CinderX JIT is not in jit-all mode')\n",
+            ]
+        )
+    if mode in ADAPTIVE_AWARE_MODES:
+        hook.extend(
+            [
+                "    adaptive_compile_after = os.environ.get(\n",
+                "        'CINDERX_TESTGATE_ADAPTIVE_COMPILE_AFTER')\n",
+                "    if adaptive_compile_after is not None:\n",
+                "        adaptive_compile_after = int(adaptive_compile_after)\n",
+                "        cinderx.jit.compile_after_n_calls(adaptive_compile_after)\n",
+                "        if cinderx.jit.get_compile_after_n_calls() != adaptive_compile_after:\n",
+                "            raise RuntimeError('CinderX JIT adaptive-aware threshold mismatch')\n",
             ]
         )
     hook.extend(
@@ -271,7 +308,7 @@ def write_startup_hook(path: Path, mode: str, jit_stats_dir: Path | None = None)
             "            marker_file.write(f'{os.getpid()} {argv0}\\n')\n",
         ]
     )
-    if jit_stats_dir is not None and mode in MODES_REQUIRING_JIT_ALL:
+    if jit_stats_dir is not None and mode in MODES_RECORDING_JIT_STATS:
         hook.extend(
             [
                 "    jit_stats_dir = os.environ.get('CINDERX_TESTGATE_JIT_STATS_DIR')\n",
@@ -357,6 +394,18 @@ def env_for_mode(mode: str, startup_dir: Path, marker_file: Path) -> dict[str, s
         env.pop("PYTHONJITDISABLE", None)
 
     return env
+
+
+def adaptive_compile_after_for_mode(mode: str, value: int | None) -> int | None:
+    if mode not in ADAPTIVE_AWARE_MODES:
+        return None
+    if value is None:
+        value = DEFAULT_ADAPTIVE_AWARE_COMPILE_AFTER
+    if value <= 0:
+        raise argparse.ArgumentTypeError(
+            "--adaptive-compile-after must be positive"
+        )
+    return value
 
 
 def normalize_tests(tests: list[str] | None) -> list[str] | None:
@@ -504,7 +553,11 @@ def main(argv: list[str]) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
         "--mode",
-        choices=["frame-eval-nojit", "frame-eval-jit-all"],
+        choices=[
+            "frame-eval-nojit",
+            "frame-eval-jit-all",
+            "frame-eval-adaptive-aware",
+        ],
         default="frame-eval-nojit",
         help="Lib/test execution mode",
     )
@@ -516,6 +569,15 @@ def main(argv: list[str]) -> int:
     )
     parser.add_argument("--num-workers", default=None)
     parser.add_argument("--worker-timeout", type=int, default=20 * 60)
+    parser.add_argument(
+        "--adaptive-compile-after",
+        type=int,
+        default=DEFAULT_ADAPTIVE_AWARE_COMPILE_AFTER,
+        help=(
+            "AutoJIT threshold for frame-eval-adaptive-aware "
+            f"(default: {DEFAULT_ADAPTIVE_AWARE_COMPILE_AFTER})"
+        ),
+    )
     parser.add_argument(
         "--jit-stats-dir",
         help="write per-process JIT compilation stats under this directory",
@@ -551,6 +613,12 @@ def main(argv: list[str]) -> int:
         num_workers = parse_num_workers(args.num_workers)
     except (argparse.ArgumentTypeError, ValueError) as exc:
         parser.error(f"invalid --num-workers value: {exc}")
+    try:
+        adaptive_compile_after = adaptive_compile_after_for_mode(
+            args.mode, args.adaptive_compile_after
+        )
+    except argparse.ArgumentTypeError as exc:
+        parser.error(str(exc))
 
     skip_files, skip_modules, skip_patterns = load_skip_metadata(mode=args.mode)
     gate_skip_files, gate_skip_modules, gate_skip_patterns = load_gate_skip_metadata(
@@ -583,12 +651,21 @@ def main(argv: list[str]) -> int:
 
     startup_dir = test_list_path.with_name(f"{test_list_path.stem}_startup")
     jit_stats_dir = Path(args.jit_stats_dir) if args.jit_stats_dir else None
-    write_startup_hook(startup_dir, args.mode, jit_stats_dir)
+    write_startup_hook(
+        startup_dir,
+        args.mode,
+        jit_stats_dir=jit_stats_dir,
+        adaptive_compile_after=adaptive_compile_after,
+    )
     marker_file = startup_dir / "frame_eval_startups.txt"
 
     env = env_for_mode(args.mode, startup_dir, marker_file)
     if jit_stats_dir is not None:
         env["CINDERX_TESTGATE_JIT_STATS_DIR"] = str(jit_stats_dir)
+    if adaptive_compile_after is not None:
+        env["CINDERX_TESTGATE_ADAPTIVE_COMPILE_AFTER"] = str(
+            adaptive_compile_after
+        )
     xoptions = MODE_XOPTIONS.get(args.mode, [])
     jit_probe = None
     if args.mode in MODES_REQUIRING_JIT_ALL and not args.skip_jit_probe:
@@ -654,7 +731,10 @@ def main(argv: list[str]) -> int:
             args.mode in MODES_REQUIRING_FRAME_EVALUATOR
         ),
         "requires_jit_disabled": args.mode in NOJIT_MODES,
+        "requires_jit_enabled": args.mode in MODES_REQUIRING_JIT_ENABLED,
         "requires_jit_all": args.mode in MODES_REQUIRING_JIT_ALL,
+        "requires_adaptive_aware": args.mode in ADAPTIVE_AWARE_MODES,
+        "adaptive_compile_after": adaptive_compile_after,
         "xoptions": xoptions,
         "num_workers": num_workers,
         "jit_probe": jit_probe,

@@ -1,0 +1,113 @@
+{
+  "baseline": "meta/main ARM64 CPython 3.14 adaptive-aware AUTOJIT=1 Lib/test module probe",
+  "date": "2026-05-07",
+  "mode": "frame-eval-adaptive-aware",
+  "adaptive_compile_after": 1,
+  "suite": "lib_test_adaptive_aware_1_pressure_sample",
+  "num_workers": 8,
+  "test_count": 469,
+  "status_counts": {
+    "pass": 425,
+    "fail": 32,
+    "env_changed": 1,
+    "timeout": 1,
+    "resource_denied": 10
+  },
+  "compiled_delta_gt_zero": 467,
+  "compiled_new_count_gt_zero": 467,
+  "module_new_count_gt_zero": 334,
+  "known_non_run": {
+    "resource_denied": [
+      "test.test_curses",
+      "test.test_peg_generator",
+      "test.test_smtpnet",
+      "test.test_socketserver",
+      "test.test_tkinter",
+      "test.test_ttk",
+      "test.test_urllibnet",
+      "test.test_winsound",
+      "test.test_xpickle",
+      "test.test_zipfile64"
+    ]
+  },
+  "env_changed": [
+    "test.test_ordered_dict"
+  ],
+  "timeouts": [
+    "test.test_threading"
+  ],
+  "failures": [
+    "test.test__interpchannels",
+    "test.test__interpreters",
+    "test.test_bdb",
+    "test.test_call",
+    "test.test_capi",
+    "test.test_compileall",
+    "test.test_cprofile",
+    "test.test_crossinterp",
+    "test.test_descr",
+    "test.test_dis",
+    "test.test_exceptions",
+    "test.test_frame",
+    "test.test_generators",
+    "test.test_inspect.test_inspect",
+    "test.test_isinstance",
+    "test.test_json",
+    "test.test_monitoring",
+    "test.test_opcache",
+    "test.test_patma",
+    "test.test_pdb",
+    "test.test_pickle",
+    "test.test_profile",
+    "test.test_regrtest",
+    "test.test_signal",
+    "test.test_support",
+    "test.test_sys",
+    "test.test_sys_setprofile",
+    "test.test_sys_settrace",
+    "test.test_trace",
+    "test.test_traceback",
+    "test.test_type_cache",
+    "test.test_zipimport"
+  ],
+  "module_new_nonzero_failures": [
+    "test.test__interpchannels",
+    "test.test__interpreters",
+    "test.test_bdb",
+    "test.test_capi",
+    "test.test_compileall",
+    "test.test_crossinterp",
+    "test.test_descr",
+    "test.test_dis",
+    "test.test_frame",
+    "test.test_generators",
+    "test.test_inspect.test_inspect",
+    "test.test_monitoring",
+    "test.test_patma",
+    "test.test_pdb",
+    "test.test_profile",
+    "test.test_regrtest",
+    "test.test_signal",
+    "test.test_support",
+    "test.test_sys_setprofile",
+    "test.test_sys_settrace",
+    "test.test_trace",
+    "test.test_type_cache",
+    "test.test_zipimport"
+  ],
+  "module_new_zero_failures": [
+    "test.test_call",
+    "test.test_cprofile",
+    "test.test_exceptions",
+    "test.test_isinstance",
+    "test.test_json",
+    "test.test_opcache",
+    "test.test_pickle",
+    "test.test_sys",
+    "test.test_traceback"
+  ],
+  "notes": [
+    "This baseline was produced by the full per-module probe with --num-workers auto resolving to 8 on the ARM64 server.",
+    "The summary is intentionally compact; detailed per-process JIT stats stay in each module artifact directory."
+  ]
+}

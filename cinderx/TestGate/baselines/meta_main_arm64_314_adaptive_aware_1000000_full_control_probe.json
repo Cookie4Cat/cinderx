@@ -1,0 +1,57 @@
+{
+  "baseline": "meta/main ARM64 CPython 3.14 adaptive-aware AUTOJIT=1000000 Lib/test control probe",
+  "date": "2026-05-07",
+  "mode": "frame-eval-adaptive-aware",
+  "adaptive_compile_after": 1000000,
+  "suite": "lib_test_adaptive_aware_1000000_control_sample",
+  "num_workers": 8,
+  "test_count": 469,
+  "status_counts": {
+    "pass": 451,
+    "fail": 8,
+    "resource_denied": 10
+  },
+  "compiled_delta_gt_zero": 38,
+  "compiled_new_count_gt_zero": 38,
+  "module_new_count_gt_zero": 1,
+  "known_non_run": {
+    "resource_denied": [
+      "test.test_curses",
+      "test.test_peg_generator",
+      "test.test_smtpnet",
+      "test.test_socketserver",
+      "test.test_tkinter",
+      "test.test_ttk",
+      "test.test_urllibnet",
+      "test.test_winsound",
+      "test.test_xpickle",
+      "test.test_zipfile64"
+    ]
+  },
+  "failures": [
+    "test.test__interpchannels",
+    "test.test__interpreters",
+    "test.test_call",
+    "test.test_capi",
+    "test.test_crossinterp",
+    "test.test_dis",
+    "test.test_external_inspection",
+    "test.test_monitoring"
+  ],
+  "module_new_nonzero_failures": [],
+  "module_new_zero_failures": [
+    "test.test__interpchannels",
+    "test.test__interpreters",
+    "test.test_call",
+    "test.test_capi",
+    "test.test_crossinterp",
+    "test.test_dis",
+    "test.test_external_inspection",
+    "test.test_monitoring"
+  ],
+  "notes": [
+    "This is a JIT-enabled high-threshold control, not a no-JIT run.",
+    "A small amount of compilation still occurs: 38 modules had compiled_delta > 0, mostly asyncio modules plus a few standard modules.",
+    "Failures in this control distinguish JIT-enabled interpreter-contract side effects from compiled-code failures."
+  ]
+}
