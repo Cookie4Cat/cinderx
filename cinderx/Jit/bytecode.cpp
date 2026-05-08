@@ -84,6 +84,11 @@ int BytecodeInstruction::specializedOpcode() const {
     case BINARY_SUBSCR_DICT:
     case BINARY_SUBSCR_LIST_INT:
     case BINARY_SUBSCR_TUPLE_INT:
+#if PY_VERSION_HEX >= 0x030E0000
+    case BINARY_OP_SUBSCR_DICT:
+    case BINARY_OP_SUBSCR_LIST_INT:
+    case BINARY_OP_SUBSCR_TUPLE_INT:
+#endif
     case COMPARE_OP_FLOAT:
     case COMPARE_OP_INT:
     case COMPARE_OP_STR:
