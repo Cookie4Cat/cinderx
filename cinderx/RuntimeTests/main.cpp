@@ -2,7 +2,7 @@
 
 #include <gtest/gtest.h>
 
-#ifdef BUCK_BUILD
+#if defined(BUCK_BUILD) || defined(CINDERX_RUNTIME_TESTS_CMAKE)
 #include "cinderx/_cinderx-lib.h"
 #endif
 
@@ -167,7 +167,7 @@ void register_test(
 
 } // namespace
 
-#ifdef BUCK_BUILD
+#if defined(BUCK_BUILD) || defined(CINDERX_RUNTIME_TESTS_CMAKE)
 PyMODINIT_FUNC PyInit__cinderx() {
   return _cinderx_lib_init();
 }
@@ -196,6 +196,9 @@ void registerCinderX() {
     throw;
   }
 
+#endif
+
+#if defined(BUCK_BUILD) || defined(CINDERX_RUNTIME_TESTS_CMAKE)
   if (PyImport_AppendInittab("_cinderx", PyInit__cinderx) != 0) {
     PyErr_Print();
     throw std::runtime_error{"Could not add cinderx to inittab"};
@@ -205,7 +208,13 @@ void registerCinderX() {
 
 int main(int argc, char* argv[]) {
 #ifdef BAKED_IN_PYTHONPATH
-  setenv("PYTHONPATH", _BAKED_IN_PYTHONPATH, 1);
+  std::string pythonpath = _BAKED_IN_PYTHONPATH;
+  const char* current_pythonpath = getenv("PYTHONPATH");
+  if (current_pythonpath != nullptr && std::strlen(current_pythonpath) > 0) {
+    pythonpath.append(":");
+    pythonpath.append(current_pythonpath);
+  }
+  setenv("PYTHONPATH", pythonpath.c_str(), 1);
 #endif
 
   registerCinderX();
