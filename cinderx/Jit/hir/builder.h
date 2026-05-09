@@ -160,7 +160,14 @@ class HIRBuilder {
   void emitCompareOp(
       TranslationContext& tc,
       const jit::BytecodeInstruction& bc_instr);
-  void emitToBool(TranslationContext& tc);
+  void emitToBool(
+      TranslationContext& tc,
+      const jit::BytecodeInstruction* bc_instr = nullptr);
+  bool emitToBoolPopJumpIf(
+      CFG& cfg,
+      TranslationContext& tc,
+      const jit::BytecodeInstruction& to_bool_instr,
+      const jit::BytecodeInstruction& jump_instr);
   void emitCopyDictWithoutKeys(TranslationContext& tc);
   void emitGetLen(TranslationContext& tc);
   void emitJumpIf(

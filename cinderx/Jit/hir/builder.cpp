@@ -924,7 +924,20 @@ void HIRBuilder::translate(
           break;
         }
         case TO_BOOL: {
-          emitToBool(tc);
+          auto next_bc_it = bc_it;
+          ++next_bc_it;
+          if (next_bc_it != bc_block.end() &&
+              emitToBoolPopJumpIf(irfunc.cfg, tc, bc_instr, *next_bc_it)) {
+            bc_it = next_bc_it;
+            prev_bc_instr = *next_bc_it;
+            BCOffset target_off = next_bc_it->getJumpTarget();
+            BasicBlock* target = getBlockAtOff(target_off);
+            if (target_off <= next_bc_it->baseOffset()) {
+              loop_headers.emplace(target);
+            }
+            break;
+          }
+          emitToBool(tc, &bc_instr);
           break;
         }
         case COPY_DICT_WITHOUT_KEYS: {
@@ -1493,6 +1506,7 @@ void HIRBuilder::translate(
         }
       }
     }
+
     // Insert jumps for blocks that fall through.
     auto last_instr = tc.block->GetTerminator();
     if ((last_instr == nullptr) || !last_instr->IsTerminator()) {
@@ -2590,14 +2604,193 @@ void HIRBuilder::emitCompareOp(
   }
 }
 
-void HIRBuilder::emitToBool(TranslationContext& tc) {
+void HIRBuilder::emitToBool(
+    TranslationContext& tc,
+    const jit::BytecodeInstruction* bc_instr) {
+  FrameState deopt_frame = tc.frame;
   Register* operand = tc.frame.stack.pop();
+
+  if (bc_instr != nullptr && getConfig().specialized_opcodes) {
+    switch (bc_instr->specializedOpcode()) {
+#if PY_VERSION_HEX >= 0x030E0000
+      case TO_BOOL_BOOL:
+        tc.emit<GuardType>(operand, TBool, operand, deopt_frame);
+        tc.emit<UseType>(operand, TBool);
+        tc.frame.stack.push(operand);
+        return;
+      case TO_BOOL_INT: {
+        tc.emit<GuardType>(operand, TLongExact, operand, deopt_frame);
+        tc.emit<UseType>(operand, TLongExact);
+        break;
+      }
+      case TO_BOOL_LIST: {
+        tc.emit<GuardType>(operand, TListExact, operand, deopt_frame);
+        tc.emit<UseType>(operand, TListExact);
+        break;
+      }
+      case TO_BOOL_STR: {
+        tc.emit<GuardType>(operand, TUnicodeExact, operand, deopt_frame);
+        tc.emit<UseType>(operand, TUnicodeExact);
+        break;
+      }
+      case TO_BOOL_ALWAYS_TRUE:
+        // The standalone form needs the interpreter cache's type-version
+        // guard. Keep it generic outside of branch fusion.
+        break;
+#endif
+      default:
+        break;
+    }
+  }
+
   Register* truthy_result = temps_.AllocateStack();
   tc.emit<IsTruthy>(truthy_result, operand, tc.frame);
 
   Register* coerced_result = temps_.AllocateStack();
   tc.emit<PrimitiveBoxBool>(coerced_result, truthy_result);
   tc.frame.stack.push(coerced_result);
+}
+
+bool HIRBuilder::emitToBoolPopJumpIf(
+    CFG& cfg,
+    TranslationContext& tc,
+    const jit::BytecodeInstruction& to_bool_instr,
+    const jit::BytecodeInstruction& jump_instr) {
+#if PY_VERSION_HEX < 0x030E0000
+  return false;
+#else
+  if (!getConfig().specialized_opcodes) {
+    return false;
+  }
+  if (jump_instr.opcode() != POP_JUMP_IF_FALSE &&
+      jump_instr.opcode() != POP_JUMP_IF_TRUE) {
+    return false;
+  }
+
+  const int specialized_opcode = to_bool_instr.specializedOpcode();
+  switch (specialized_opcode) {
+    case TO_BOOL_BOOL:
+    case TO_BOOL_INT:
+    case TO_BOOL_LIST:
+    case TO_BOOL_STR:
+      break;
+    default:
+      return false;
+  }
+
+  BCOffset true_offset, false_offset;
+  if (jump_instr.opcode() == POP_JUMP_IF_FALSE) {
+    true_offset = jump_instr.nextInstrOffset();
+    false_offset = jump_instr.getJumpTarget();
+  } else {
+    true_offset = jump_instr.getJumpTarget();
+    false_offset = jump_instr.nextInstrOffset();
+  }
+  BasicBlock* true_block = getBlockAtOff(true_offset);
+  BasicBlock* false_block = getBlockAtOff(false_offset);
+
+  auto& stack = tc.frame.stack;
+  Register* operand = stack.pop();
+  Register* truthy = temps_.AllocateNonStack();
+  BasicBlock* fast_path = cfg.AllocateBlock();
+  BasicBlock* slow_path = cfg.AllocateBlock();
+  BasicBlock* done_path = cfg.AllocateBlock();
+  auto emit_slow_path = [&]() {
+    tc.block = slow_path;
+    tc.emit<IsTruthy>(truthy, operand, tc.frame);
+    tc.emit<Branch>(done_path);
+  };
+
+  switch (specialized_opcode) {
+    case TO_BOOL_BOOL: {
+      BasicBlock* false_check_path = cfg.AllocateBlock();
+      BasicBlock* false_path = cfg.AllocateBlock();
+      Register* const_true = temps_.AllocateNonStack();
+      Register* is_true = temps_.AllocateNonStack();
+      tc.emit<LoadConst>(const_true, Type::fromObject(Py_True));
+      tc.emit<PrimitiveCompare>(
+          is_true, PrimitiveCompareOp::kEqual, operand, const_true);
+      tc.emit<CondBranch>(is_true, fast_path, false_check_path);
+
+      tc.block = false_check_path;
+      Register* const_false = temps_.AllocateNonStack();
+      Register* is_false = temps_.AllocateNonStack();
+      tc.emit<LoadConst>(const_false, Type::fromObject(Py_False));
+      tc.emit<PrimitiveCompare>(
+          is_false, PrimitiveCompareOp::kEqual, operand, const_false);
+      tc.emit<CondBranch>(is_false, false_path, slow_path);
+
+      tc.block = fast_path;
+      tc.emit<LoadConst>(truthy, Type::fromCBool(true));
+      tc.emit<Branch>(done_path);
+
+      tc.block = false_path;
+      tc.emit<LoadConst>(truthy, Type::fromCBool(false));
+      tc.emit<Branch>(done_path);
+
+      emit_slow_path();
+      break;
+    }
+    case TO_BOOL_INT: {
+      tc.emit<CondBranchCheckType>(operand, TLongExact, fast_path, slow_path);
+
+      tc.block = fast_path;
+      tc.emit<UseType>(operand, TLongExact);
+      Register* lv_tag = temps_.AllocateNonStack();
+      tc.emit<LoadField>(
+          lv_tag,
+          operand,
+          "long_value.lv_tag",
+          offsetof(PyLongObject, long_value.lv_tag),
+          TCUInt64);
+      Register* sign_mask = temps_.AllocateNonStack();
+      tc.emit<LoadConst>(
+          sign_mask, Type::fromCUInt(_PyLong_SIGN_MASK, TCUInt64));
+      Register* sign_bits = temps_.AllocateNonStack();
+      tc.emit<IntBinaryOp>(sign_bits, BinaryOpKind::kAnd, lv_tag, sign_mask);
+      Register* zero_sign = temps_.AllocateNonStack();
+      tc.emit<LoadConst>(zero_sign, Type::fromCUInt(SIGN_ZERO, TCUInt64));
+      tc.emit<PrimitiveCompare>(
+          truthy, PrimitiveCompareOp::kNotEqual, sign_bits, zero_sign);
+      tc.emit<Branch>(done_path);
+      emit_slow_path();
+      break;
+    }
+    case TO_BOOL_LIST: {
+      tc.emit<CondBranchCheckType>(operand, TListExact, fast_path, slow_path);
+
+      tc.block = fast_path;
+      tc.emit<UseType>(operand, TListExact);
+      Register* size = temps_.AllocateNonStack();
+      tc.emit<LoadField>(
+          size, operand, "ob_size", offsetof(PyVarObject, ob_size), TCInt64);
+      tc.emit<CIntToCBool>(truthy, size);
+      tc.emit<Branch>(done_path);
+      emit_slow_path();
+      break;
+    }
+    case TO_BOOL_STR: {
+      tc.emit<CondBranchCheckType>(
+          operand, TUnicodeExact, fast_path, slow_path);
+
+      tc.block = fast_path;
+      tc.emit<UseType>(operand, TUnicodeExact);
+      Register* size = temps_.AllocateNonStack();
+      tc.emit<LoadField>(
+          size, operand, "length", offsetof(PyASCIIObject, length), TCInt64);
+      tc.emit<CIntToCBool>(truthy, size);
+      tc.emit<Branch>(done_path);
+      emit_slow_path();
+      break;
+    }
+    default:
+      JIT_ABORT("unexpected TO_BOOL specialized opcode");
+  }
+
+  tc.block = done_path;
+  tc.emit<CondBranch>(truthy, true_block, false_block);
+  return true;
+#endif
 }
 
 void HIRBuilder::emitCopyDictWithoutKeys(TranslationContext& tc) {
@@ -2656,6 +2849,12 @@ void HIRBuilder::emitJumpIf(
   BasicBlock* false_block = getBlockAtOff(false_offset);
 
   if (check_truthy) {
+    if (var->instr()->IsPrimitiveBoxBool()) {
+      tc.emit<CondBranch>(
+          var->instr()->GetOperand(0), true_block, false_block);
+      return;
+    }
+
     Register* tval = temps_.AllocateNonStack();
     // Registers that hold the result of `IsTruthy` are guaranteed to never be
     // the home of a value left on the stack at the end of a basic block, so we
@@ -3676,6 +3875,12 @@ void HIRBuilder::emitPopJumpIf(
 
   if (bc_instr.opcode() == POP_JUMP_IF_FALSE ||
       bc_instr.opcode() == POP_JUMP_IF_TRUE) {
+    if (var->instr()->IsPrimitiveBoxBool()) {
+      tc.emit<CondBranch>(
+          var->instr()->GetOperand(0), true_block, false_block);
+      return;
+    }
+
     Register* is_true = temps_.AllocateNonStack();
     // In 3.14+ coercion to exactly Py_True or Py_False is performed by earlier
     // instructions. See GH-106008.

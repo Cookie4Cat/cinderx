@@ -4,12 +4,16 @@
 
 #include "cinderx/Jit/codegen/arch.h"
 #include "cinderx/Jit/containers.h"
+#include "cinderx/Jit/hir/hir.h"
 #include "cinderx/Jit/jit_rt.h"
 #include "cinderx/Jit/lir/function.h"
 #include "cinderx/Jit/lir/operand.h"
 #include "cinderx/Jit/lir/printer.h"
 
+#include <algorithm>
+#include <iterator>
 #include <optional>
+#include <unordered_set>
 
 using namespace jit::codegen;
 
@@ -545,9 +549,9 @@ RewriteResult rewriteLoadInstrs(instr_iter_t instr_iter) {
   return kChanged;
 }
 
-// Try to find a compare instruction that defines the CondBranch's input
-// register, with no flag-clobbering instructions in between.
-Instruction* findFusibleCompare(
+// Try to find an instruction that defines the CondBranch's input register and
+// leaves usable flags, with no flag-clobbering instructions in between.
+Instruction* findFusibleCondition(
     instr_iter_t cond_branch_iter,
     BasicBlock* block) {
   auto cond_branch = cond_branch_iter->get();
@@ -559,8 +563,12 @@ Instruction* findFusibleCompare(
     --it;
     auto* candidate = it->get();
 
-    // Check if this is a compare that writes to our input register.
-    if (candidate->isCompare() && candidate->output()->isReg() &&
+    // Check if this is a condition-producing instruction that writes to our
+    // input register. IntToBool lowers to test/cmp + setcc/cset, so the flags
+    // still describe the same truthiness tested by CondBranch.
+    if ((candidate->isCompare() ||
+         candidate->opcode() == Instruction::kIntToBool) &&
+        candidate->output()->isReg() &&
         candidate->output()->getPhyRegister() == input_reg) {
       return candidate;
     }
@@ -588,6 +596,177 @@ Instruction* findFusibleCompare(
   return nullptr;
 }
 
+bool operandUsesPhyReg(const OperandBase* operand, PhyLocation reg) {
+  if (operand == nullptr) {
+    return false;
+  }
+  if (operand->isReg() && operand->getPhyRegister() == reg) {
+    return true;
+  }
+  if (operand->isInd()) {
+    auto mem = operand->getMemoryIndirect();
+    return operandUsesPhyReg(mem->getBaseRegOperand(), reg) ||
+        operandUsesPhyReg(mem->getIndexRegOperand(), reg);
+  }
+  return false;
+}
+
+bool instrUsesPhyReg(const Instruction* instr, PhyLocation reg) {
+  for (size_t i = 0, n = instr->getNumInputs(); i < n; ++i) {
+    if (operandUsesPhyReg(instr->getInput(i), reg)) {
+      return true;
+    }
+  }
+  auto output = instr->output();
+  return output->isInd() && operandUsesPhyReg(output, reg);
+}
+
+bool instrDefinesPhyReg(const Instruction* instr, PhyLocation reg) {
+  auto output = instr->output();
+  return output->isReg() && output->getPhyRegister() == reg;
+}
+
+bool regUsedBeforeDefFromBlock(
+    BasicBlock* block,
+    BasicBlock* pred,
+    PhyLocation reg,
+    std::unordered_set<BasicBlock*>& visited) {
+  if (!visited.emplace(block).second) {
+    return true;
+  }
+
+  for (auto& instr : block->instructions()) {
+    if (instr->opcode() != Instruction::kPhi) {
+      break;
+    }
+    if (operandUsesPhyReg(instr->getOperandByPredecessor(pred), reg)) {
+      return true;
+    }
+  }
+
+  for (auto& instr : block->instructions()) {
+    if (instr->opcode() == Instruction::kPhi) {
+      continue;
+    }
+    if (instrUsesPhyReg(instr.get(), reg)) {
+      return true;
+    }
+    if (instrDefinesPhyReg(instr.get(), reg)) {
+      return false;
+    }
+  }
+
+  for (BasicBlock* succ : block->successors()) {
+    if (regUsedBeforeDefFromBlock(succ, block, reg, visited)) {
+      return true;
+    }
+  }
+  return false;
+}
+
+bool regUsedBeforeDefAfterInstr(
+    instr_iter_t begin,
+    instr_iter_t end,
+    PhyLocation reg) {
+  for (auto it = begin; it != end; ++it) {
+    if (instrUsesPhyReg(it->get(), reg)) {
+      return true;
+    }
+    if (instrDefinesPhyReg(it->get(), reg)) {
+      return false;
+    }
+  }
+  return false;
+}
+
+bool regLiveOut(BasicBlock* block, PhyLocation reg) {
+  for (BasicBlock* succ : block->successors()) {
+    std::unordered_set<BasicBlock*> visited;
+    if (regUsedBeforeDefFromBlock(succ, block, reg, visited)) {
+      return true;
+    }
+  }
+  return false;
+}
+
+bool convertConditionToFlagsOnly(
+    instr_iter_t condition_iter,
+    instr_iter_t cond_branch_iter,
+    BasicBlock* block) {
+  Instruction* condition = condition_iter->get();
+  auto output = condition->output();
+  if (!output->isReg()) {
+    return false;
+  }
+
+  PhyLocation output_reg = output->getPhyRegister();
+  if (regUsedBeforeDefAfterInstr(std::next(condition_iter), cond_branch_iter, output_reg) ||
+      regLiveOut(block, output_reg)) {
+    return false;
+  }
+
+  if (condition->opcode() == Instruction::kIntToBool) {
+    auto input_type = condition->getInput(0)->dataType();
+    condition->setOpcode(Instruction::kCmp);
+    condition->output()->setNone();
+    condition->allocateImmediateInput(0, input_type);
+    return true;
+  }
+
+  if (condition->isCompare()) {
+    condition->setOpcode(Instruction::kCmp);
+    condition->output()->setNone();
+    return true;
+  }
+
+  return false;
+}
+
+RewriteResult preferCondBranchCheckTypeHitFallthrough(Function* function) {
+  auto& blocks = function->basicblocks();
+  bool changed = false;
+
+  for (auto iter = blocks.begin(); iter != blocks.end(); ++iter) {
+    BasicBlock* block = *iter;
+    auto next_iter = std::next(iter);
+    if (next_iter == blocks.end()) {
+      break;
+    }
+
+    auto instr = block->getLastInstr();
+    if (instr == nullptr || !instr->isCondBranch()) {
+      continue;
+    }
+    auto origin = instr->origin();
+    if (origin == nullptr || !origin->IsCondBranchCheckType()) {
+      continue;
+    }
+
+    BasicBlock* true_block = block->getTrueSuccessor();
+    BasicBlock* false_block = block->getFalseSuccessor();
+    if (*next_iter == true_block || *next_iter != false_block) {
+      continue;
+    }
+    if (true_block->section() != block->section()) {
+      continue;
+    }
+    auto& true_preds = true_block->predecessors();
+    if (true_preds.size() != 1 || true_preds.front() != block) {
+      continue;
+    }
+
+    auto true_iter = std::find(next_iter, blocks.end(), true_block);
+    if (true_iter == blocks.end()) {
+      continue;
+    }
+
+    std::rotate(next_iter, true_iter, std::next(true_iter));
+    changed = true;
+  }
+
+  return changed ? kChanged : kUnchanged;
+}
+
 // Convert CondBranch to Test and BranchCC instructions.
 void doRewriteCondBranch(instr_iter_t instr_iter, BasicBlock* next_block) {
   auto instr = instr_iter->get();
@@ -601,20 +780,21 @@ void doRewriteCondBranch(instr_iter_t instr_iter, BasicBlock* next_block) {
   BasicBlock* target_block = nullptr;
   BasicBlock* fallthrough_block = nullptr;
 
-  // Try to fuse with a preceding compare instruction. If we find one, we
-  // can use its flags directly (cmp + jcc) instead of setcc + test + je.
-  Instruction* compare = findFusibleCompare(instr_iter, block);
+  // Try to fuse with a preceding condition-producing instruction. If we find
+  // one, we can use its flags directly instead of setcc/cset + test + jcc.
+  auto condition_iter = block->instructions().end();
+  Instruction* condition = nullptr;
+  if (auto found = findFusibleCondition(instr_iter, block)) {
+    condition = found;
+    condition_iter = block->iterator_to(found);
+  }
   Instruction::Opcode opcode;
-  if (compare != nullptr) {
-    // Use the compare's condition directly for the branch.
-    opcode = Instruction::compareToBranchCC(compare->opcode());
-    // If no instruction between the compare and the CondBranch reads the
-    // compare's output register, we could convert to kCmp to skip emitting the
-    // (now dead) setcc. However, the register allocator may have assigned the
-    // compare's output register to overlap with a value that is live-out from
-    // the block. Converting to kCmp would leave that register unwritten,
-    // causing the live-out value to be stale. A proper fix requires liveness
-    // information from the register allocator.
+  if (condition != nullptr) {
+    // Use the producer's condition directly for the branch.
+    opcode = condition->opcode() == Instruction::kIntToBool
+        ? Instruction::kBranchNZ
+        : Instruction::compareToBranchCC(condition->opcode());
+    convertConditionToFlagsOnly(condition_iter, instr_iter, block);
   } else {
     // No fusible compare found. Insert test Reg, Reg instruction.
     auto size = input->dataType();
@@ -1358,6 +1538,7 @@ RewriteResult optimizeMoveSequence(BasicBlock* basicblock) {
 void PostRegAllocRewrite::registerRewrites() {
   registerOneRewriteFunction(rewriteCallInstrs);
   registerOneRewriteFunction(rewriteBitExtensionInstrs);
+  registerOneRewriteFunction(preferCondBranchCheckTypeHitFallthrough);
   registerOneRewriteFunction(rewriteBranchInstrs);
   registerOneRewriteFunction(rewriteLoadInstrs);
   registerOneRewriteFunction(rewriteCondBranch);

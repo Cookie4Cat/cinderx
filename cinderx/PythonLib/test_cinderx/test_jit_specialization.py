@@ -260,3 +260,125 @@ class SpecializationTests(unittest.TestCase):
         self.assertNotIn("UNPACK_SEQUENCE", opnames(f))
         self.assertIn("UNPACK_SEQUENCE_TWO_TUPLE", opnames(f))
         self.assertEqual(f(("c", "d")), "c")
+
+    @passIf(sys.version_info < (3, 14), "Requires Python 3.14 TO_BOOL specialization")
+    def test_to_bool_bool(self) -> None:
+        def f(x: object) -> int:
+            if x:
+                return 1
+            return 0
+
+        specialize(f, lambda: f(True))
+
+        self.assertIn("TO_BOOL_BOOL", opnames(f))
+        hir_counts = cinderx.jit.get_function_hir_opcode_counts(f)
+        self.assertIsNotNone(hir_counts)
+        self.assertIn("PrimitiveCompare", hir_counts)
+        self.assertNotIn("CondBranchCheckType", hir_counts)
+        self.assertNotIn("PrimitiveBoxBool", hir_counts)
+        self.assertEqual(f(True), 1)
+        self.assertEqual(f(False), 0)
+        self.assertEqual(f(1), 1)
+        self.assertEqual(f(0), 0)
+        self.assertEqual(f(object()), 1)
+
+    @passIf(sys.version_info < (3, 14), "Requires Python 3.14 TO_BOOL specialization")
+    def test_to_bool_int(self) -> None:
+        def f(x: object) -> int:
+            if x:
+                return 1
+            return 0
+
+        specialize(f, lambda: f(1))
+
+        self.assertIn("TO_BOOL_INT", opnames(f))
+        hir_counts = cinderx.jit.get_function_hir_opcode_counts(f)
+        self.assertIsNotNone(hir_counts)
+        self.assertIn("CondBranchCheckType", hir_counts)
+        self.assertIn("LoadField", hir_counts)
+        self.assertIn("IntBinaryOp", hir_counts)
+        self.assertIn("PrimitiveCompare", hir_counts)
+        self.assertNotIn("PrimitiveBoxBool", hir_counts)
+        self.assertEqual(f(1), 1)
+        self.assertEqual(f(0), 0)
+        self.assertEqual(f(2**100), 1)
+        self.assertEqual(f(-(2**100)), 1)
+        self.assertEqual(f(True), 1)
+        self.assertEqual(f(""), 0)
+        self.assertEqual(f(object()), 1)
+
+    @passIf(sys.version_info < (3, 14), "Requires Python 3.14 TO_BOOL specialization")
+    def test_to_bool_list(self) -> None:
+        def f(x: object) -> int:
+            if x:
+                return 1
+            return 0
+
+        specialize(f, lambda: f([1]))
+
+        self.assertIn("TO_BOOL_LIST", opnames(f))
+        hir_counts = cinderx.jit.get_function_hir_opcode_counts(f)
+        self.assertIsNotNone(hir_counts)
+        self.assertIn("CondBranchCheckType", hir_counts)
+        self.assertIn("LoadField", hir_counts)
+        self.assertIn("CIntToCBool", hir_counts)
+        self.assertNotIn("PrimitiveBoxBool", hir_counts)
+        self.assertEqual(f([1]), 1)
+        self.assertEqual(f([]), 0)
+        self.assertEqual(f(()), 0)
+        self.assertEqual(f((1,)), 1)
+        self.assertEqual(f(object()), 1)
+
+    @passIf(sys.version_info < (3, 14), "Requires Python 3.14 TO_BOOL specialization")
+    def test_to_bool_str(self) -> None:
+        def f(x: object) -> int:
+            if x:
+                return 1
+            return 0
+
+        specialize(f, lambda: f("x"))
+
+        self.assertIn("TO_BOOL_STR", opnames(f))
+        hir_counts = cinderx.jit.get_function_hir_opcode_counts(f)
+        self.assertIsNotNone(hir_counts)
+        self.assertIn("CondBranchCheckType", hir_counts)
+        self.assertIn("LoadField", hir_counts)
+        self.assertIn("CIntToCBool", hir_counts)
+        self.assertNotIn("PrimitiveBoxBool", hir_counts)
+        self.assertEqual(f("x"), 1)
+        self.assertEqual(f(""), 0)
+        self.assertEqual(f(b""), 0)
+        self.assertEqual(f(["x"]), 1)
+
+    @passIf(sys.version_info < (3, 14), "Requires Python 3.14 TO_BOOL specialization")
+    def test_to_bool_always_true_not_retained(self) -> None:
+        class AlwaysTrue:
+            pass
+
+        class AlwaysFalse:
+            def __bool__(self) -> bool:
+                return False
+
+        def f(x: object) -> int:
+            if x:
+                return 1
+            return 0
+
+        specialize(f, lambda: f(AlwaysTrue()))
+
+        self.assertEqual(f(AlwaysTrue()), 1)
+        self.assertEqual(f(AlwaysFalse()), 0)
+        AlwaysTrue.__bool__ = lambda self: False
+        self.assertEqual(f(AlwaysTrue()), 0)
+
+    @passIf(sys.version_info < (3, 14), "Requires Python 3.14 TO_BOOL specialization")
+    def test_to_bool_none_not_retained(self) -> None:
+        def f(x: object) -> int:
+            if x:
+                return 1
+            return 0
+
+        specialize(f, lambda: f(None))
+
+        self.assertEqual(f(None), 0)
+        self.assertEqual(f(object()), 1)
