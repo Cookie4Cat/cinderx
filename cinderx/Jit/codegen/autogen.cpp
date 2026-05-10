@@ -2808,6 +2808,10 @@ void AutoTranslator::translateInstr(Environ* env, const Instruction* instr)
     case Instruction::kLoadSecondCallResult:
     case Instruction::kMovConstPool:
     case Instruction::kCondBranch:
+    case Instruction::kBranchCBZ:
+    case Instruction::kBranchCBNZ:
+    case Instruction::kBranchTBZ:
+    case Instruction::kBranchTBNZ:
     case Instruction::kPhi:
     case Instruction::kReturn:
       JIT_ABORT("Unexpected opcode {} in translateInstr", (int)opcode);
@@ -2909,6 +2913,28 @@ void AutoTranslator::translateInstr(Environ* env, const Instruction* instr)
     case Instruction::kBranchNE:
       env->as->b_ne(getLabel(env, instr->getInput(0)));
       return;
+    case Instruction::kBranchCBZ: {
+      auto reg = AT::getGpWiden(instr->getInput(0));
+      env->as->cbz(reg, getLabel(env, instr->getInput(1)));
+      return;
+    }
+    case Instruction::kBranchCBNZ: {
+      auto reg = AT::getGpWiden(instr->getInput(0));
+      env->as->cbnz(reg, getLabel(env, instr->getInput(1)));
+      return;
+    }
+    case Instruction::kBranchTBZ: {
+      auto reg = AT::getGpWiden(instr->getInput(0));
+      auto bit = instr->getInput(1)->getConstant();
+      env->as->tbz(reg, bit, getLabel(env, instr->getInput(2)));
+      return;
+    }
+    case Instruction::kBranchTBNZ: {
+      auto reg = AT::getGpWiden(instr->getInput(0));
+      auto bit = instr->getInput(1)->getConstant();
+      env->as->tbnz(reg, bit, getLabel(env, instr->getInput(2)));
+      return;
+    }
     case Instruction::kGuard:
       TranslateGuard(env, instr);
       return;

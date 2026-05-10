@@ -51,6 +51,36 @@ BB %4 - preds: %1 %2
 
   std::stringstream ss;
   ss << *parsed_func;
+  // On aarch64, `Test reg,reg + BranchNZ/Z` is fused into a single
+  // BranchCBNZ/CBZ that takes the register and label directly.
+#if defined(CINDER_AARCH64)
+  auto expected_lir_str = fmt::format(
+      R"(Function:
+BB %0 - succs: %1 %2
+                   BranchCBNZ {}:Object, BB%1
+
+BB %2 - preds: %0 - succs: %3 %4
+                   BranchCBNZ {}:Object, BB%3
+                   Branch BB%4
+
+BB %1 - preds: %0 - succs: %3 %4
+                   BranchCBZ {}:Object, BB%4
+
+BB %3 - preds: %1 %2
+{:>9}:Object = Move {}:Object
+
+BB %4 - preds: %1 %2
+{:>9}:Object = Move {}:Object
+
+)",
+      PhyLocation{0, 64},
+      PhyLocation{0, 64},
+      PhyLocation{0, 64},
+      PhyLocation{0, 64},
+      PhyLocation{5, 64},
+      PhyLocation{0, 64},
+      PhyLocation{13, 64});
+#else
   auto expected_lir_str = fmt::format(
       R"(Function:
 BB %0 - succs: %1 %2
@@ -83,6 +113,7 @@ BB %4 - preds: %1 %2
       PhyLocation{5, 64},
       PhyLocation{0, 64},
       PhyLocation{13, 64});
+#endif
   ASSERT_EQ(expected_lir_str, ss.str());
   ASSERT_TRUE(verifyPostRegAllocInvariants(parsed_func.get(), std::cout));
 }
@@ -115,6 +146,26 @@ BB %2 - preds: %0
 
   std::stringstream ss;
   ss << *parsed_func;
+#if defined(CINDER_AARCH64)
+  auto expected_lir_str = fmt::format(
+      R"(Function:
+BB %0 - succs: %1 %2
+                   BranchCBZ {}:Object, BB%2
+                   Branch BB%1
+
+BB %1 - preds: %0 - section: .coldtext
+{:>9}:Object = Move {}:Object
+
+BB %2 - preds: %0
+{:>9}:Object = Move {}:Object
+
+)",
+      PhyLocation{0, 64},
+      PhyLocation{0, 64},
+      PhyLocation{13, 64},
+      PhyLocation{0, 64},
+      PhyLocation{5, 64});
+#else
   auto expected_lir_str = fmt::format(
       R"(Function:
 BB %0 - succs: %1 %2
@@ -135,6 +186,7 @@ BB %2 - preds: %0
       PhyLocation{13, 64},
       PhyLocation{0, 64},
       PhyLocation{5, 64});
+#endif
   ASSERT_EQ(expected_lir_str, ss.str());
   ASSERT_TRUE(verifyPostRegAllocInvariants(parsed_func.get(), std::cout));
 }

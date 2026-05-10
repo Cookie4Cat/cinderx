@@ -269,6 +269,10 @@ bool Instruction::isBranchCC() const {
     case kBranchGE:
     case kBranchE:
     case kBranchNE:
+    case kBranchCBZ:
+    case kBranchCBNZ:
+    case kBranchTBZ:
+    case kBranchTBNZ:
       return true;
     default:
       return false;
@@ -318,6 +322,8 @@ Instruction::Opcode Instruction::negateBranchCC(Opcode opcode) {
     CASE_FLIP(kBranchL, kBranchGE)
     CASE_FLIP(kBranchG, kBranchLE)
     CASE_FLIP(kBranchE, kBranchNE)
+    CASE_FLIP(kBranchCBZ, kBranchCBNZ)
+    CASE_FLIP(kBranchTBZ, kBranchTBNZ)
     default:
       JIT_ABORT("Not a conditional branch opcode: {}", kOpcodeNames[opcode]);
   }

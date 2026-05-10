@@ -159,6 +159,14 @@ enum OperandSizeType {
   X(BranchNS)                                                                 \
   X(BranchE)                                                                  \
   X(BranchNE)                                                                 \
+  /* aarch64 fused compare-branches. Each takes a register input and a       */ \
+  /* label input; tbz/tbnz also take an immediate bit-position input.        */ \
+  /* They do NOT consume CPU flags - they read the register directly. They   */ \
+  /* are produced by fuseCompareBranches in postalloc.cpp on aarch64.        */ \
+  X(BranchCBZ)                                                                \
+  X(BranchCBNZ)                                                               \
+  X(BranchTBZ)                                                                \
+  X(BranchTBNZ)                                                               \
   X(BitTest, false, FlagEffects::kSet, kDefault, 1, {1})                      \
   X(Inc, false, FlagEffects::kSet)                                            \
   X(Dec, false, FlagEffects::kSet)                                            \

@@ -882,6 +882,10 @@ RewriteResult rewriteMemoryInputsToReg(instr_iter_t instr_iter) {
     case Instruction::kBranchNS:
     case Instruction::kBranchE:
     case Instruction::kBranchNE:
+    case Instruction::kBranchCBZ:
+    case Instruction::kBranchCBNZ:
+    case Instruction::kBranchTBZ:
+    case Instruction::kBranchTBNZ:
     case Instruction::kCondBranch:
     case Instruction::kPhi:
     case Instruction::kReturn:
@@ -1002,6 +1006,145 @@ RewriteResult rewriteMemoryInputsToReg(instr_iter_t instr_iter) {
         PhyReg{gp_scratch_locs[0], *inc_dec_dt});
   }
 
+  return changed ? kChanged : kUnchanged;
+}
+
+// Fuse `Test Rn,Rn + BranchCC label` and `BitTest Rn,#bit + BranchZ/NZ label`
+// into single ARM compare-branch instructions. Runs after rewriteCondBranch.
+//
+// Patterns recognised (the LIR opcode names map onto aarch64 condition codes):
+//
+//   Test Rn,Rn  + BranchZ /BranchE   -> BranchCBZ  Rn,label    (cbz)
+//   Test Rn,Rn  + BranchNZ/BranchNE  -> BranchCBNZ Rn,label    (cbnz)
+//   Test Rn,Rn  + BranchS            -> BranchTBNZ Rn,#(N-1),label (tbnz #sign)
+//   Test Rn,Rn  + BranchNS           -> BranchTBZ  Rn,#(N-1),label (tbz  #sign)
+//   BitTest Rn,#bit + BranchZ /NZ    -> BranchTBZ /TBNZ Rn,#bit,label
+//
+// `BranchE/NE` set the same flags as `BranchZ/NZ` (b.eq/b.ne), so a self-test
+// followed by either form means "branch if reg == 0 / != 0" which is exactly
+// what cbz/cbnz do without consuming a flag-setter slot.  `BranchS/NS` test
+// the N flag, which `tst Rn,Rn` sets to the value of bit (bitsize-1) of Rn -
+// equivalent to tbnz/tbz on the sign bit.
+//
+// We are conservative about sub-word (8/16-bit) Test inputs because translateTst
+// shifts those into the high bits of a 32-bit register before testing
+// (autogen.cpp). cbz/tbnz on the underlying W register would test a different
+// value, so skip the fusion in that case.
+RewriteResult fuseCompareBranches(function_rewrite_arg_t func) {
+  auto isFusibleBranch = [](Instruction* i) {
+    return i->isBranchZ() || i->isBranchNZ() || i->isBranchE() ||
+        i->isBranchNE() || i->isBranchS() || i->isBranchNS();
+  };
+
+  // Walk every instruction in every block. A fusible BranchCC may be the last
+  // instruction, the second-to-last when rewriteCondBranch appended an
+  // unconditional Branch fallthrough, or in the middle of the block (e.g. the
+  // prologue's `kw_dispatch` block which has Test+BranchZ followed by a Call
+  // and unconditional Branch on the false-fallthrough path).
+  bool changed = false;
+  for (auto& block : func->basicblocks()) {
+    auto& instrs = block->instructions();
+    auto branch_iter = instrs.begin();
+    auto end_iter = instrs.end();
+    while (branch_iter != end_iter) {
+      auto cur = branch_iter++;
+      auto* branch = cur->get();
+      if (!isFusibleBranch(branch)) {
+        continue;
+      }
+      if (cur == instrs.begin()) {
+        continue;
+      }
+      if (branch->getNumInputs() != 1 || !branch->getInput(0)->isLabel()) {
+        continue;
+      }
+      auto compare_iter = std::prev(cur);
+      auto* compare = compare_iter->get();
+
+      // Pattern 1: Test/Test32 Rn,Rn + (BranchZ/NZ/E/NE/S/NS).
+      // kTest32 is a 32-bit-only variant produced by HIR refcount paths
+      // (see makeDecrefGILEnabled in lir/generator.cpp).
+      if ((compare->isTest() || compare->isTest32()) &&
+          compare->getNumInputs() == 2) {
+        auto* in0 = compare->getInput(0);
+        auto* in1 = compare->getInput(1);
+        if (in0->isReg() && in1->isReg() &&
+            in0->getPhyRegister() == in1->getPhyRegister() &&
+            in0->dataType() != OperandBase::k8bit &&
+            in0->dataType() != OperandBase::k16bit) {
+          auto reg = in0->getPhyRegister();
+          // For kTest32 force a 32-bit view regardless of the operand's
+          // declared dataType; this matches what translateTst32 does.
+          auto dt =
+              compare->isTest32() ? OperandBase::k32bit : in0->dataType();
+          bool is_sign_bit_branch =
+              branch->isBranchS() || branch->isBranchNS();
+          bool branch_taken_when_set = branch->isBranchNZ() ||
+              branch->isBranchNE() || branch->isBranchS();
+
+          Instruction::Opcode new_opcode;
+          size_t bit = 0;
+          if (is_sign_bit_branch) {
+            // BranchS/NS test the N (sign) flag. For tst Rn,Rn this is
+            // bit (bitsize-1) of Rn. Emit tbnz/tbz on that bit.
+            bit = bitSize(dt) - 1;
+            new_opcode = branch_taken_when_set ? Instruction::kBranchTBNZ
+                                               : Instruction::kBranchTBZ;
+          } else {
+            // BranchZ/NZ/E/NE on tst Rn,Rn means "is Rn zero / non-zero".
+            new_opcode = branch_taken_when_set ? Instruction::kBranchCBNZ
+                                               : Instruction::kBranchCBZ;
+          }
+
+          auto label_op = branch->releaseInput(0);
+          branch->setOpcode(new_opcode);
+          branch->setNumInputs(0);
+          auto* reg_in = branch->allocatePhyRegisterInput(reg);
+          reg_in->setDataType(dt);
+          if (is_sign_bit_branch) {
+            branch->allocateImmediateInput(bit);
+          }
+          branch->appendInput(std::move(label_op));
+          block->removeInstr(compare_iter);
+          changed = true;
+          continue;
+        }
+      }
+
+      // Pattern 2: BitTest Rn,#bit + BranchZ/NZ/E/NE -> TBZ/TBNZ.
+      if (compare->isBitTest() && compare->getNumInputs() == 2 &&
+          (branch->isBranchZ() || branch->isBranchNZ() ||
+           branch->isBranchE() || branch->isBranchNE())) {
+        auto* in0 = compare->getInput(0);
+        auto* in1 = compare->getInput(1);
+        if (in0->isReg() && in1->isImm()) {
+          auto reg = in0->getPhyRegister();
+          auto dt = in0->dataType();
+          auto bit = in1->getConstant();
+          // tbz/tbnz takes a 6-bit position (0-63). For sub-word inputs the
+          // valid range is 0-31; rewriteSubWordRegMoves widens most sub-word
+          // values to 32-bit anyway, so just guard the range.
+          size_t max_bit = bitSize(dt) <= 32 ? 31 : 63;
+          if (bit > max_bit) {
+            continue;
+          }
+          bool branch_taken_when_set =
+              branch->isBranchNZ() || branch->isBranchNE();
+          auto label_op = branch->releaseInput(0);
+          branch->setOpcode(
+              branch_taken_when_set ? Instruction::kBranchTBNZ
+                                    : Instruction::kBranchTBZ);
+          branch->setNumInputs(0);
+          auto* reg_in = branch->allocatePhyRegisterInput(reg);
+          reg_in->setDataType(dt);
+          branch->allocateImmediateInput(bit);
+          branch->appendInput(std::move(label_op));
+          block->removeInstr(compare_iter);
+          changed = true;
+        }
+      }
+    }
+  }
   return changed ? kChanged : kUnchanged;
 }
 #endif
@@ -1361,7 +1504,15 @@ void PostRegAllocRewrite::registerRewrites() {
   registerOneRewriteFunction(rewriteBranchInstrs);
   registerOneRewriteFunction(rewriteLoadInstrs);
   registerOneRewriteFunction(rewriteCondBranch);
+#if defined(CINDER_X86_64)
+  // x86-64 has destructive 2-operand ALU encodings (`add reg, reg/imm` writes
+  // to the first reg). rewriteBinaryOpInstrs collapses 3-input LIR into the
+  // 2-operand form when the regalloc happens to pick out_reg == in0_reg.
+  // aarch64 ALU is 3-operand (`add Rd, Rn, Rm`), so this rewrite is unneeded
+  // there - skipping it preserves the original input ordering so subsequent
+  // peepholes (like the shifted-register fold) have an easier time matching.
   registerOneRewriteFunction(rewriteBinaryOpInstrs);
+#endif
   registerOneRewriteFunction(removePhiInstructions);
 
 #if defined(CINDER_X86_64)
@@ -1369,6 +1520,7 @@ void PostRegAllocRewrite::registerRewrites() {
 #elif defined(CINDER_AARCH64)
   registerOneRewriteFunction(rewriteSubWordRegMoves);
   registerOneRewriteFunction(rewriteMemoryInputsToReg);
+  registerOneRewriteFunction(fuseCompareBranches);
 #endif
 
   registerOneRewriteFunction(optimizeMoveSequence, 1);

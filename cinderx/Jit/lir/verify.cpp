@@ -17,9 +17,13 @@ bool verifyPostRegAllocInvariants(Function* func, std::ostream& err) {
     std::unordered_set<BasicBlock*> branched_blocks;
     for (auto& instr : block->instructions()) {
       if (instr->isBranch() || instr->isBranchCC()) {
+        // The branch target label is the last input. Most branches have only
+        // one input (the label); aarch64 fused compare-branches (CBZ/CBNZ/
+        // TBZ/TBNZ) carry an additional register input (and TBZ/TBNZ also a
+        // bit-position immediate) before the label.
         JIT_DCHECK(
-            instr->getNumInputs() == 1, "Branch must have a single input.");
-        auto operand = instr->getInput(0);
+            instr->getNumInputs() >= 1, "Branch must have at least one input.");
+        auto operand = instr->getInput(instr->getNumInputs() - 1);
         JIT_DCHECK(
             operand->type() == OperandBase::kLabel,
             "Branch must jump to a label.");
